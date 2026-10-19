@@ -157,7 +157,7 @@ class PipelineBillingTests(unittest.TestCase):
                      pricing=price_snapshot(self.config, "video"))
         core.update_job(self.root, "synthetic-failed", state="submitted", task_id="synthetic-task")
         response = self.video_response(status="failed", usage={"completion_tokens": 0}, content={},
-                                       error={"code": "SYNTHETIC_FAILURE", "message": "SECRET-RAW"})
+                                       error={"code": "SYNTHETIC_FAILURE", "message": "token=SECRET-RAW; duration must be at most 15 seconds."})
         with patch.object(ArkProvider, "_request", return_value=(response, "synthetic-request")), \
              patch.object(ArkProvider, "download") as download:
             with self.assertRaises(core.GateError):
@@ -170,6 +170,7 @@ class PipelineBillingTests(unittest.TestCase):
         self.assertIsNone(state["budget"]["actual_cost"])
         self.assertEqual(state["jobs"]["synthetic-failed"]["state"], "failed")
         self.assertNotIn("SECRET-RAW", (self.root / "project.json").read_text())
+        self.assertIn("duration must be at most 15 seconds", state["jobs"]["synthetic-failed"]["failure"]["provider_message"])
 
 
 if __name__ == "__main__":

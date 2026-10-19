@@ -90,7 +90,7 @@ def _bound_item(intent, seen, message):
     if mentions and identity not in mentions:
         raise ValueError("识别出的对象与你明确提到的对象不一致；请使用准确 ID 重试")
     if not mentions:
-        pending = [(item["kind"], item["id"]) for item in seen["items"] if item.get("status") in {"candidate", "awaiting_review", "review_required"}]
+        pending = [(item["kind"], item["id"]) for item in seen["items"] if item.get("status") in {"candidate", "awaiting_review", "review_required", "generation_failed"}]
         if pending != [identity]:
             raise ValueError("有多个可能的对象，请在修改或审批时明确填写 ID")
     return matches[0]

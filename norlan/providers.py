@@ -26,14 +26,24 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
+from .failures import sanitize_failure
+
 
 class ProviderError(RuntimeError):
     safe_message = True
 
-    def __init__(self, message: str, *, uncertain: bool = False, request_id: str = ""):
-        super().__init__(message)
-        self.uncertain = uncertain
-        self.request_id = request_id
+    def __init__(self, message: str, *, uncertain: bool = False, request_id: str = "",
+                 failure: dict | None = None, stage: str = "local_validation"):
+        detail = dict(failure or {})
+        detail.setdefault("stage", stage)
+        detail.setdefault("message", message)
+        detail["uncertain"] = uncertain or detail.get("uncertain") is True
+        if request_id:
+            detail["request_id"] = request_id
+        self.failure = sanitize_failure(detail)
+        super().__init__(self.failure["message"])
+        self.uncertain = self.failure["uncertain"]
+        self.request_id = self.failure.get("request_id", "")
 
 
 class _NoApiRedirect(HTTPRedirectHandler):
@@ -50,6 +60,30 @@ def _safe_code(value: object) -> str:
     """Do not expose remote messages, signed URLs, prompts or credentials."""
     value = str(value or "unknown")
     return value if re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", value) else "unknown"
+
+
+def _request_id(headers, result: dict | None = None) -> str:
+    headers = headers or {}
+    result = result if isinstance(result, dict) else {}
+    error = result.get("error")
+    error = error if isinstance(error, dict) else {}
+    value = (headers.get("X-Request-Id") or headers.get("x-request-id")
+             or headers.get("X-Tt-Logid") or headers.get("x-tt-logid")
+             or result.get("request_id") or error.get("request_id"))
+    return sanitize_failure({"request_id": value}).get("request_id", "")
+
+
+def _remote_failure(result: object, *, stage: str, message: str, request_id: str = "",
+                    http_status: int | None = None, uncertain: bool = False,
+                    redact: list[str] | None = None) -> dict:
+    result = result if isinstance(result, dict) else {}
+    error = result.get("error")
+    error = error if isinstance(error, dict) else {}
+    return sanitize_failure({"stage": stage, "message": message,
+                             "provider_message": error.get("message"),
+                             "provider_code": error.get("code"), "parameter": error.get("param"),
+                             "request_id": request_id or _request_id({}, result),
+                             "http_status": http_status, "uncertain": uncertain}, redact=redact or ())
 
 
 def _https_url(url: str) -> str:
@@ -146,27 +180,55 @@ class ArkProvider:
             raise ProviderError("参考素材编码后的请求超过 64 MB，请减少或压缩参考图和音频。")
         request = Request(self.base_url + path, data=body, method=method,
                           headers={"Authorization": "Bearer " + self._key(), "Content-Type": "application/json"})
+        stage = "submission" if method == "POST" else "poll"
         request_id = ""
         try:
             with _api_open(request, timeout=self.timeout) as response:
-                request_id = _safe_code(response.headers.get("X-Request-Id", ""))
+                request_id = _request_id(response.headers)
                 raw = response.read(70_000_001)
                 if len(raw) > 70_000_000:
                     raise ValueError("oversized response")
                 result = json.loads(raw)
                 if not isinstance(result, dict):
                     raise ValueError("non-object response")
+                request_id = _request_id(response.headers, result)
                 return result, request_id
         except HTTPError as exc:
             # HTTP 5xx/408 may follow an accepted job. Preserve the reservation.
             uncertain = method == "POST" and (exc.code >= 500 or exc.code == 408)
-            request_id = _safe_code(exc.headers.get("X-Request-Id", ""))
-            exc.close()
-            raise ProviderError(f"Ark 请求失败，HTTP {exc.code}；请在服务控制台核对。",
-                                uncertain=uncertain, request_id=request_id) from None
+            result = {}
+            try:
+                # Never retain the body; only JSON error code/message/param and
+                # request ID can enter the safe failure record below.
+                raw = exc.read(16_384)
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    result = parsed
+            except Exception:
+                # A broken/error body must never overwrite the HTTP status or
+                # change whether the generation may already have been accepted.
+                pass
+            finally:
+                try:
+                    exc.close()
+                except Exception:
+                    pass
+            request_id = _request_id(exc.headers, result)
+            redactions = [self._key()]
+            if isinstance(payload, dict):
+                if isinstance(payload.get("prompt"), str):
+                    redactions.append(payload["prompt"])
+                content = payload.get("content", [])
+                if isinstance(content, list):
+                    redactions.extend(item["text"] for item in content if isinstance(item, dict)
+                                      and item.get("type") == "text" and isinstance(item.get("text"), str))
+            failure = _remote_failure(result, stage=stage, message=f"Ark 请求失败，HTTP {exc.code}。",
+                                      request_id=request_id, http_status=exc.code, uncertain=uncertain,
+                                      redact=redactions)
+            raise ProviderError(failure["message"], failure=failure) from None
         except (URLError, TimeoutError, socket.timeout, ConnectionError, OSError, ValueError, HTTPException):
             raise ProviderError("Ark 请求超时、连接中断或响应无法解析；未自动重发。",
-                                uncertain=method == "POST", request_id=request_id) from None
+                                uncertain=method == "POST", request_id=request_id, stage=stage) from None
 
     def generate_image(self, prompt: str, output: Path, references: list[Path] | None = None,
                        *, on_usage: Callable[[dict], None] | None = None) -> dict:
@@ -217,13 +279,20 @@ class ArkProvider:
             on_usage({"model": reported_model, "usage": metered,
                       "request_id": request_id, "provider_status": provider_status})
         try:
+            if result.get("error"):
+                failure = _remote_failure(result, stage="generation", message="图片生成服务返回失败。",
+                                          request_id=request_id, redact=[prompt, self._key()])
+                raise ProviderError(failure["message"], failure=failure)
             item = result["data"][0]
             if not isinstance(item, dict):
                 raise ValueError("invalid image item")
             if item.get("error"):
                 error = item["error"]
                 code = error.get("code") if isinstance(error, dict) else None
-                raise ProviderError("图片生成服务返回失败：" + _safe_code(code), request_id=request_id)
+                failure = _remote_failure({"error": error}, stage="generation",
+                                          message="图片生成服务返回失败：" + _safe_code(code),
+                                          request_id=request_id, redact=[prompt, self._key()])
+                raise ProviderError(failure["message"], failure=failure)
             if item.get("b64_json"):
                 data = base64.b64decode(item["b64_json"], validate=True)
                 if not data:
@@ -237,10 +306,11 @@ class ArkProvider:
             # Generation has completed even if local download failed; don't regenerate blindly.
             exc.uncertain = True
             exc.request_id = request_id
+            exc.failure = sanitize_failure({**exc.failure, "uncertain": True, "request_id": request_id})
             raise
         except (KeyError, IndexError, TypeError, ValueError, OSError):
             raise ProviderError("图片响应或本地保存失败；需核对已生成结果，禁止直接重发。",
-                                uncertain=True, request_id=request_id) from None
+                                uncertain=True, request_id=request_id, stage="download") from None
         return {"output": str(Path(output)), "request_id": request_id, "usage": result.get("usage", {}),
                 "model": result.get("model"), "provider_status": "succeeded"}
 
@@ -293,7 +363,10 @@ class ArkProvider:
                    "generate_audio": bool(self.config.get("generate_audio", True)), "watermark": True}
         result, request_id = self._request("POST", "/contents/generations/tasks", payload)
         if not isinstance(result.get("id"), str) or not result["id"]:
-            raise ProviderError("视频任务响应缺少 ID；需人工核对，未自动重发。", uncertain=True, request_id=request_id)
+            failure = _remote_failure(result, stage="submission", uncertain=True, request_id=request_id,
+                                      message="视频任务响应缺少 ID；需人工核对，未自动重发。",
+                                      redact=[prompt, self._key()])
+            raise ProviderError(failure["message"], failure=failure)
         return {"id": result["id"], "request_id": request_id}
 
     def video_usage(self, task_id: str) -> dict:
@@ -324,10 +397,12 @@ class ArkProvider:
             # must persist it before reporting a recoverable download problem.
             return {**base, "status": "completed", "url": url}
         if status in {"failed", "cancelled", "expired"}:
-            error = result.get("error")
-            return {**base, "status": "failed", "error": _safe_code(error.get("code", status) if isinstance(error, dict) else status)}
+            failure = _remote_failure(result, stage="generation", request_id=request_id,
+                                      message="供应商未完成本次生成，没有可供审批的视频。")
+            code = failure.setdefault("provider_code", status)
+            return {**base, "status": "failed", "error": code, "failure": failure}
         if status not in {"queued", "running"}:
-            raise ProviderError("未知的视频任务状态；保留任务 ID 等待核对。")
+            raise ProviderError("未知的视频任务状态；保留任务 ID 等待核对。", stage="poll", request_id=request_id)
         return {**base, "status": "pending"}
 
     def download(self, url: str, output: Path) -> None:
@@ -343,16 +418,21 @@ class ArkProvider:
                     while chunk := response.read(1024 * 1024):
                         count += len(chunk)
                         if count > int(self.config.get("max_download_bytes", 1_000_000_000)):
-                            raise ProviderError("下载文件超过本机限制。")
+                            raise ProviderError("下载文件超过本机限制。", stage="download")
                         file.write(chunk)
                     expected = response.headers.get("Content-Length")
                     if not count or (expected is not None and count != int(expected)):
-                        raise ProviderError("下载不完整；请重试下载原任务，勿重新生成。")
+                        raise ProviderError("下载不完整；请重试下载原任务，勿重新生成。", stage="download")
                     file.flush()
                     os.fsync(file.fileno())
             os.replace(tmp, output)
+        except HTTPError as exc:
+            failure = sanitize_failure({"stage": "download", "message": f"下载已有结果失败，HTTP {exc.code}；请重试下载原任务。",
+                                        "http_status": exc.code, "request_id": _request_id(exc.headers)})
+            exc.close()
+            raise ProviderError(failure["message"], failure=failure) from None
         except (OSError, URLError, ValueError, TimeoutError, HTTPException):
-            raise ProviderError("下载失败；原文件保留，请重试下载已完成任务。") from None
+            raise ProviderError("下载失败；原文件保留，请重试下载已完成任务。", stage="download") from None
         finally:
             if tmp and tmp.exists():
                 tmp.unlink()

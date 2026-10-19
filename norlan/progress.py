@@ -149,6 +149,12 @@ def episode_progress(state, episode, *, now=None):
         return finish("paused", label)
     if any(job.get("accounting") == "unknown" or job.get("state") == "uncertain" for job in jobs.values() if isinstance(job, dict)):
         return finish("unknown", "存在结果不明的调用，需核实原任务后继续", waiting=True)
+    failed_shot = next((shot for shot in shots if shot.get("status") == "generation_failed" or
+                       (shot.get("status") == "review_required" and not (shot.get("file") and shot.get("sha256")))), None)
+    if failed_shot:
+        result["current_shot"] = failed_shot.get("id")
+        result["current_shot_index"] = shots.index(failed_shot) + 1
+        return finish("failed", f"片段 {result['current_shot_index']}/{total} 生成失败，没有可审视频；请查看失败原因", waiting=True)
     review_shot = next((shot for shot in shots if shot.get("status") == "review_required"), None)
     if review_shot:
         result["current_shot"] = review_shot.get("id")

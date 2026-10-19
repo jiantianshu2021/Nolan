@@ -155,6 +155,19 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(result["stage"], "review_required")
         self.assertTrue(result["waiting_for_human"])
 
+    def test_failed_generation_without_video_never_asks_for_review(self):
+        state, ep = fixture(2)
+        accept(ep["shots"][0])
+        shot = ep["shots"][1]
+        for status in ("generation_failed", "review_required"):
+            shot.update(status=status, generation_error="synthetic failure")
+            result = episode_progress(state, ep)
+            self.assertEqual(result["stage"], "failed")
+            self.assertEqual(result["current_shot_index"], 2)
+            self.assertIn("没有可审视频", result["label"])
+            self.assertFalse(result["is_working"])
+            self.assertEqual(result["completed_shots"], 1)
+
     def test_download_then_technical_check_then_review_are_distinct(self):
         state, ep = fixture(1)
         shot = ep["shots"][0]

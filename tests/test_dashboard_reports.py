@@ -170,7 +170,7 @@ class ReportRenderingTests(unittest.TestCase):
     def test_reports_stay_below_their_video_and_buttons_never_follow_gpt_verdict(self):
         html = Path(dashboard.__file__).with_name("dashboard.html").read_text()
         sources = []
-        for name in ("el", "mediaURL", "appendPrompt", "shotReview", "advisoryReport", "subshotPlan", "shotCard", "roughCutCard", "appendEpisodeProduction"):
+        for name in ("el", "mediaURL", "appendPrompt", "failureDetails", "shotReview", "advisoryReport", "subshotPlan", "shotCard", "roughCutCard", "appendEpisodeProduction"):
             start = html.index("function " + name + "(")
             sources.append(html[start:html.index("\nfunction ", start + 1)])
         program = r'''
@@ -208,10 +208,20 @@ for(const verdict of ['pass','fail','uncertain']){
  assert.equal(walk(approved).filter(n=>n.className==='advisory-report').length,1);
  assert.equal(walk(approved).some(n=>n.tag==='button'&&n.textContent==='通过本段并继续'),false);
 }
-const failed=shotCard({id:'S1',version:3,status:'review_required',duration:5,generation_error:'生成失败'},0,null);
+const failed=shotCard({id:'S1',version:3,status:'generation_failed',duration:5,generation_error:'生成失败',can_retry:true,failure:{stage:'submission',message:'参数尺寸错误',provider_code:'InvalidParameter',http_status:400,request_id:'synthetic-request-123',parameter:'resolution'}},0,null);
 const nodes=walk(failed),approve=nodes.find(n=>n.tag==='button'&&n.textContent==='通过本段并继续');
-assert.equal(approve.disabled,true);assert.equal(nodes.some(n=>n.tag==='input'),false);
-assert.equal(nodes.some(n=>n.tag==='button'&&n.textContent==='填写意见并重试'),true);
+assert.equal(approve,undefined);assert.equal(nodes.some(n=>n.tag==='input'),false);
+assert.equal(nodes.some(n=>n.className==='advisory-report'),false);
+assert.equal(nodes.some(n=>n.textContent.includes('参数尺寸错误')),true);
+assert.equal(nodes.some(n=>n.textContent.includes('synthetic-request-123')),true);
+nodes.find(n=>n.tag==='button'&&n.textContent==='填写意见并重试一次').listeners.click();assert.equal(revisions.at(-1)[0].id,'S1');
+const unknown=walk(shotCard({id:'S1',version:3,status:'generation_failed',duration:5,can_retry:false,failure:{message:'结果待核实',uncertain:true}},0,null));
+assert.equal(unknown.some(n=>n.tag==='button'),false);assert.equal(unknown.some(n=>n.textContent.includes('禁止重新提交')),true);
+const recovering=walk(shotCard({id:'S1',version:3,status:'generating',duration:5,can_retry:false,failure_recoverable:true,failure:{stage:'download',message:'下载超时'}},0,null));
+assert.equal(recovering.some(n=>n.tag==='button'&&n.textContent.includes('重试')),false);
+recovering.find(n=>n.tag==='button'&&n.textContent==='继续恢复原任务').listeners.click();assert.equal(decisions.at(-1)[0].action,'run');
+const failureHistory=walk(shotCard({id:'S1',version:4,status:'generating',duration:5,failure_history:[{version:3,failure:{message:'之前的失败'}}]},0,null));
+assert.equal(failureHistory.some(n=>n.className==='failure-history'),true);assert.equal(failureHistory.some(n=>n.textContent==='第 3 版 · 历史生成失败'),true);
 const historical=shotCard({id:'S1',version:3,status:'generating',duration:5,history:[{version:2,file:'media/E1/S1-v2.mp4',review:{version:2,verdict:'fail',issues:['历史意见']}}]},0,null);
 const history=walk(historical).find(n=>n.className==='shot-history-version');
 assert.equal(history.children[1].tag,'video');assert.equal(history.children[2].className,'advisory-report');

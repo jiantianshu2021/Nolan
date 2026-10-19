@@ -742,7 +742,7 @@ def reject(root, kind, item_id, version, feedback, shot_ids=None):
             _invalidate_render(item, feedback)
             shot_ids = [shot["id"] for shot in targets]
         elif kind == "shot":
-            if item["status"] not in {"review_required", "accepted"}:
+            if item["status"] not in {"review_required", "accepted", "generation_failed"}:
                 raise GateError("镜头不在人工复核阶段")
             _check_shot_rejection(root, s, item)
             _request_shot_revision(s, item, feedback)

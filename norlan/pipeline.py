@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import core, media
 from .billing import price_snapshot
+from .failures import exception_failure, sanitize_failure
 from .voice import (AuditionSelectionError, audition_duration, audition_profile,
                     audition_selection_key, build_audition_prompt, validate_audition)
 
@@ -141,6 +142,11 @@ def _recover(root):
                             "本次视频生成未得到可用结果。不会自动再次提交；请填写意见后由你决定是否重试。")
                     core.event(s, "stale_candidate_archived", id=shot["id"], version=shot.get("version"))
                 if shot["status"] != "planned" or shot.get("file") or shot.get("job_id"):
+                    job = s["jobs"].get(shot.get("job_id", ""), {})
+                    if (shot.get("status") == "review_required" and not shot.get("file")
+                            and job.get("state") == "failed" and job.get("kind") == "video"
+                            and job.get("item_id") == shot["id"]):
+                        shot["status"] = "generation_failed"
                     continue
                 history = shot.get("history", [])
                 attempts = shot.get("attempts", [])
@@ -198,6 +204,31 @@ def _job_progress(root, job, stage):
         _progress(root, ep["id"], stage, job["item_id"])
 
 
+def _record_video_failure(root, job_id, failure, **updates):
+    """Keep bounded, redacted diagnostics on the exact call, including recovery."""
+    detail = sanitize_failure(failure)
+    with core.transaction(root) as state:
+        job = state["jobs"][job_id]
+        if job.get("failure") != detail:
+            job.setdefault("failure_history", []).append({**detail, "recorded_at": core.now()})
+        job.update(updates, failure=detail, updated_at=core.now())
+        core.event(state, "video_call_failed", id=job_id, stage=detail.get("stage"),
+                   http_status=detail.get("http_status"), provider_code=detail.get("provider_code"))
+
+
+def _shot_generation_failed(root, shot_id):
+    state = core.load_project(root)
+    shot = core._find(state, "shot", shot_id)
+    job = state["jobs"].get(shot.get("job_id", ""), {})
+    if job.get("kind") != "video" or job.get("item_id") != shot_id:
+        job = {}
+    failure = sanitize_failure(job.get("failure")) if job.get("failure") else {}
+    message = failure.get("message") or "旧版本未保存具体失败原因；本次没有可审视频，需要你决定是否重试。"
+    _save_shot(root, shot_id, status="generation_failed", generation_error=message)
+    _set(root, status="generation_failed")
+    return False
+
+
 def _poll_video(root, job_id, output):
     provider = _ark(root)
     started = time.monotonic()
@@ -208,7 +239,11 @@ def _poll_video(root, job_id, output):
             raise core.GateError("视频任务没有供应商 ID，必须先对账")
         if job["state"] != "download_pending":
             _job_progress(root, job, "shot_generation")
-        result = provider.poll_video(job["task_id"])
+        try:
+            result = provider.poll_video(job["task_id"])
+        except Exception as exc:
+            _record_video_failure(root, job_id, exception_failure(exc, "poll"))
+            raise
         if result["status"] == "completed":
             core.record_usage(root, job_id, result)
             # Retain ID before download. An expired/download-failed URL is never
@@ -216,13 +251,20 @@ def _poll_video(root, job_id, output):
             core.update_job(root, job_id, state="download_pending", accounting="spent")
             _job_progress(root, job, "shot_download")
             if not result.get("url"):
+                _record_video_failure(root, job_id, {"stage": "download", "message": "供应商任务已完成，但未返回可下载地址；继续时只查询原任务。", "uncertain": False})
                 raise core.GateError("供应商任务已完成，但未返回可下载地址；用量已保存，继续时只查询原任务。")
-            provider.download(result["url"], output)
-            core.update_job(root, job_id, state="completed", output=_rel(root, output))
+            try:
+                provider.download(result["url"], output)
+            except Exception as exc:
+                _record_video_failure(root, job_id, exception_failure(exc, "download"))
+                raise
+            core.update_job(root, job_id, state="completed", output=_rel(root, output), failure=None)
             return
         if result["status"] == "failed":
             core.record_usage(root, job_id, result)
-            core.update_job(root, job_id, state="failed", accounting="spent")
+            _record_video_failure(root, job_id, result.get("failure") or {
+                "stage": "generation", "message": "供应商报告视频生成失败。", "provider_code": result.get("error"), "uncertain": False},
+                state="failed", accounting="spent")
             raise core.GateError("供应商报告任务失败；预算占用不代表实际扣费，重新生成须由你明确决定。")
         # A pause stops waiting/new submissions; the saved task is polled again
         # after resume. It may continue charging at the provider.
@@ -256,7 +298,8 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
     with core.transaction(root) as current:
         obj = core._find(current, "asset" if kind == "voice" else "shot", item_id)
         obj["job_id"] = job_id
-        obj.setdefault("attempts", []).append({"job_id": job_id, "revision": obj.get("revision", 0), "time": core.now()})
+        obj.setdefault("attempts", []).append({"job_id": job_id, "revision": obj.get("revision", 0),
+                                               "version": obj.get("version", 0), "time": core.now()})
         if kind == "voice":
             current["jobs"][job_id]["audition_profile"] = copy.deepcopy(obj.get("audition_profile", {}))
             current["jobs"][job_id]["duration"] = duration
@@ -271,10 +314,13 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
                                        audio_references=audio_references or [])
     except Exception as exc:
         uncertain = getattr(exc, "uncertain", True)
-        core.update_job(root, job_id, state="uncertain" if uncertain else "failed",
-                        accounting="unknown" if uncertain else "spent")
+        detail = {**exception_failure(exc, "submission"), "uncertain": uncertain}
+        _record_video_failure(root, job_id, detail,
+                              state="uncertain" if uncertain else "failed",
+                              accounting="unknown" if uncertain else "spent")
         raise
-    core.update_job(root, job_id, state="submitted", task_id=result["id"])
+    core.update_job(root, job_id, state="submitted", task_id=result["id"],
+                    request_id=sanitize_failure({"request_id": result.get("request_id")}).get("request_id"), failure=None)
     _poll_video(root, job_id, output)
     return job_id
 
@@ -498,19 +544,21 @@ def _shot(root, ep_id, shot_id, previous):
         _refresh_candidate_preview(root, ep_id)
         _set(root, status="review_required")
         return False
+    active = s["jobs"].get(shot.get("job_id", ""))
+    if active and (active.get("kind") != "video" or active.get("item_id") != shot_id):
+        raise core.GateError("生成任务与当前片段不匹配，请先核对记录；未提交新任务。")
+    if shot["status"] == "generation_failed" or (shot["status"] == "review_required" and not shot.get("file")
+            and active and active.get("state") == "failed"):
+        return _shot_generation_failed(root, shot_id)
     if shot["status"] == "review_required":
         _refresh_candidate_preview(root, ep_id)
         _set(root, status="review_required")
         return False
-    active = s["jobs"].get(shot.get("job_id", ""))
     recovering = bool(active and active["state"] in {"submitted", "download_pending", "completed"})
     attempted = bool(active and active.get("state") == "failed") or any(
         attempt.get("revision", 0) == shot.get("revision", 0) for attempt in shot.get("attempts", []))
     if not recovering and attempted:
-        _save_shot(root, shot_id, status="review_required", generation_error=
-                   "本次视频生成未得到可用结果。不会自动再次提交；请填写意见后由你决定是否重试。")
-        _set(root, status="review_required")
-        return False
+        return _shot_generation_failed(root, shot_id)
     if not recovering:
         _new_work_gate(s)
         _progress(root, ep_id, "shot_preparation", shot_id)
@@ -521,7 +569,7 @@ def _shot(root, ep_id, shot_id, previous):
         else:
             refined = _brain(root, "refine_shot", shot, context, images)
         version = shot.get("version", 0) + 1
-        _save_shot(root, shot_id, refined_prompt=refined, version=version, status="generating",
+        _save_shot(root, shot_id, refined_prompt=refined, version=version, status="generating", generation_error=None,
             reference_manifest={"images": [_rel(root, f) for f in images],
                 "audio": [_rel(root, f) for f in voices], "context": context})
         shot = core._find(core.load_project(root), "shot", shot_id)
@@ -551,10 +599,7 @@ def _shot(root, ep_id, shot_id, previous):
         failed = current["jobs"].get(current_shot.get("job_id", ""), {})
         if failed.get("state") != "failed" or failed.get("accounting") == "unknown":
             raise
-        _save_shot(root, shot_id, status="review_required", generation_error=
-                   "本次视频生成未得到可用结果。不会自动再次提交；请填写意见后由你决定是否重试。")
-        _set(root, status="review_required")
-        return False
+        return _shot_generation_failed(root, shot_id)
     _progress(root, ep_id, "shot_checks", shot_id)
     evidence_dir = Path(root) / "evidence" / f"{shot_id}-v{version}"
     evidence = (media.extract_evidence(out, evidence_dir, subshots=shot["subshots"])
@@ -831,7 +876,6 @@ def _episode(root, ep_id):
     previous = prior["shots"][-1] if prior else None
     for index, original in enumerate(ep["shots"]):
         if not _shot(root, ep_id, original["id"], previous):
-            _set(root, status="review_required")
             return
         fresh = core._find(core.load_project(root), "episode", ep_id)
         previous = fresh["shots"][index]

@@ -76,6 +76,90 @@ class DashboardGenerationTests(unittest.TestCase):
         self.assertTrue(progress["completed"])
         self.assertFalse(progress["accepted"])
 
+    def test_failure_diagnostics_are_bound_sanitized_and_never_become_review(self):
+        shot = self.state["episodes"][0]["shots"][1]
+        shot.update(version=1, status="generation_failed", job_id="failed-one", generation_error="PRIVATE-ERROR",
+                    attempts=[{"job_id": "failed-one", "version": 1}])
+        job = {"kind": "video", "item_id": "S2", "state": "failed", "accounting": "released", "amount": 0,
+               "failure": {"stage": "submission", "message": "合成错误：参数不支持",
+                           "provider_code": "InvalidParameter", "parameter": "resolution", "http_status": 400,
+                           "request_id": "synthetic-request-001", "provider_message": "size exceeds limit; token=synthetic-secret",
+                           "provider_raw": "PRIVATE-RESPONSE"}}
+        self.state["jobs"]["failed-one"] = job
+        self.state["status"] = "generation_failed"
+        before = copy.deepcopy(self.state)
+        result = self.public()
+        public = result["episodes"][0]["shots"][1]
+        self.assertEqual(result["status"], "generation_failed")
+        self.assertEqual(public["progress"]["stage"], "failed")
+        self.assertEqual(result["episodes"][0]["progress"]["stage"], "failed")
+        self.assertEqual(public["failure"]["provider_code"], "InvalidParameter")
+        self.assertEqual(public["failure"]["request_id"], "synthetic-request-001")
+        self.assertTrue(public["can_retry"])
+        self.assertNotIn("review", public)
+        self.assertNotIn("synthetic-secret", json.dumps(result))
+        self.assertNotIn("PRIVATE-", json.dumps(result))
+        self.assertEqual(self.state, before)
+        job.update(state="uncertain", accounting="unknown")
+        public = self.public()["episodes"][0]["shots"][1]
+        self.assertEqual(public["progress"]["stage"], "unknown")
+        self.assertTrue(public["failure"]["uncertain"])
+        self.assertFalse(public["can_retry"])
+
+    def test_legacy_failure_and_new_attempt_keep_diagnostics_separate(self):
+        shot = self.state["episodes"][0]["shots"][1]
+        shot.update(version=1, status="review_required", job_id="failed-one", generation_error="PRIVATE-OLD",
+                    attempts=[{"job_id": "failed-one", "version": 1}])
+        self.state["jobs"]["failed-one"] = {"kind": "video", "item_id": "S2", "state": "failed",
+                                                   "accounting": "released", "amount": 0}
+        self.state["status"] = "review_required"
+        public = self.public()
+        self.assertEqual(public["status"], "generation_failed")
+        current = public["episodes"][0]["shots"][1]
+        self.assertEqual(current["status"], "generation_failed")
+        self.assertIn("旧版本未保存具体失败原因", current["failure"]["message"])
+        self.assertTrue(current["can_retry"])
+        shot.update(version=2, status="generating", job_id="new-one")
+        self.state["jobs"]["new-one"] = {"kind": "video", "item_id": "S2", "state": "submitted",
+                                                "accounting": "reserved", "amount": 0}
+        current = self.public()["episodes"][0]["shots"][1]
+        self.assertNotIn("failure", current)
+        self.assertNotIn("generation_error", current)
+        self.assertEqual(current["progress"]["stage"], "shot_generation")
+        self.assertEqual(current["failure_history"][0]["version"], 1)
+        self.assertIn("旧版本未保存具体失败原因", current["failure_history"][0]["failure"]["message"])
+
+    def test_wrong_shot_job_and_unsettled_job_cannot_authorize_retry(self):
+        shot = self.state["episodes"][0]["shots"][1]
+        shot.update(version=1, status="generation_failed", job_id="failed-one", generation_error="legacy")
+        job = {"kind": "video", "item_id": "OTHER", "state": "failed", "accounting": "released", "amount": 0,
+               "failure": {"message": "OTHER-SHOT-ERROR"}}
+        self.state["jobs"]["failed-one"] = job
+        current = self.public()["episodes"][0]["shots"][1]
+        self.assertFalse(current["can_retry"])
+        self.assertNotIn("OTHER-SHOT-ERROR", json.dumps(current))
+        job["item_id"] = "S2"
+        self.state["jobs"]["unknown-job"] = {"kind": "image", "state": "uncertain", "accounting": "unknown", "amount": 0}
+        self.assertFalse(self.public()["episodes"][0]["shots"][1]["can_retry"])
+
+    def test_known_task_query_or_download_failure_only_allows_recovery(self):
+        shot = self.state["episodes"][0]["shots"][1]
+        shot.update(version=1, status="generating", job_id="recoverable", attempts=[{"job_id": "recoverable", "version": 1}])
+        job = {"kind": "video", "item_id": "S2", "task_id": "synthetic-existing-task", "accounting": "spent", "amount": 0}
+        self.state["jobs"]["recoverable"] = job
+        for stage, status in (("poll", "submitted"), ("download", "download_pending")):
+            job.update(state=status, failure={"stage": stage, "message": "合成测试：恢复原任务暂时失败"})
+            public = self.public()["episodes"][0]["shots"][1]
+            self.assertEqual(public["failure"]["stage"], stage)
+            self.assertTrue(public["failure_recoverable"])
+            self.assertFalse(public["can_retry"])
+            self.assertNotEqual(public["status"], "generation_failed")
+            self.assertTrue(public["progress"]["has_active_task"])
+        job.update(state="completed", failure_history=[job["failure"]], failure=None)
+        public = self.public()["episodes"][0]["shots"][1]
+        self.assertNotIn("failure", public)
+        self.assertEqual(public["failure_history"][0]["failure"]["stage"], "download")
+
     def test_subshot_schedule_and_proposal_are_public_without_private_metadata(self):
         episode = self.state["episodes"][0]
         episode["shots"][0].update(duration=10, subshots=[

@@ -114,6 +114,78 @@ def _current_shot_artifact(shot):
     return file_version is None or file_version == _version(shot.get("version"))
 
 
+def _bound_shot_job(state, shot):
+    job = state.get("jobs", {}).get(shot.get("job_id"), {})
+    if not isinstance(job, dict) or job.get("kind") != "video" or job.get("item_id") != shot.get("id"):
+        return {}
+    version = _file_version(shot, job.get("output"))
+    return job if version is None or version == _version(shot.get("version")) else {}
+
+
+def _public_shot_failures(state, shot):
+    """Expose only sanitized diagnostics, bound to the current attempt or history."""
+    from .failures import sanitize_failure
+    job = _bound_shot_job(state, shot)
+    unknown = job.get("state") == "uncertain" or job.get("accounting") == "unknown"
+    recoverable = bool(not unknown and job.get("task_id") and job.get("state") in {"submitted", "download_pending"}
+                       and isinstance(job.get("failure"), dict) and job["failure"])
+    no_video = not _current_shot_artifact(shot)
+    failed = no_video and (shot.get("status") == "generation_failed" or
+                          shot.get("status") == "review_required" or
+                          job.get("state") == "failed")
+
+    def diagnostic(value, uncertain=False):
+        result = sanitize_failure(value) if isinstance(value, dict) and value else {}
+        if not result or not result.get("message"):
+            result = {"stage": "unknown", "message": "旧版本未保存具体失败原因。", "uncertain": uncertain}
+        if uncertain:
+            result["uncertain"] = True
+        return result
+
+    result = {}
+    if unknown or failed or recoverable:
+        result["failure"] = diagnostic(job.get("failure"), unknown)
+        result["failure_recoverable"] = recoverable
+        if unknown and not job.get("failure"):
+            result["failure"]["message"] = "调用结果尚未核实，不能再次提交。请先核实原任务结果。"
+        unsettled = any(isinstance(item, dict) and (item.get("accounting") in {"reserved", "unknown"}
+                        or item.get("state") in {"submitting", "submitted", "download_pending", "uncertain"})
+                        for item in state.get("jobs", {}).values())
+        result["can_retry"] = bool(failed and shot.get("generation_error") and job.get("state") == "failed"
+                                   and job.get("accounting") in {"spent", "released"}
+                                   and not result["failure"].get("uncertain") and not unsettled
+                                   and _version(shot.get("version")) > 0)
+        result["generation_error"] = "本次没有可审视频。不会自动再次提交；请查看失败原因后决定是否重试一次。"
+        if recoverable:
+            result["generation_error"] = "原任务暂未恢复完成。请查看错误详情；继续操作只恢复原任务，不会重新生成。"
+    history, seen = [], set()
+    for attempt in shot.get("attempts", []):
+        if not isinstance(attempt, dict):
+            continue
+        job_id = attempt.get("job_id")
+        if not isinstance(job_id, str) or job_id in seen:
+            continue
+        seen.add(job_id)
+        previous = state.get("jobs", {}).get(job_id, {})
+        if (not isinstance(previous, dict) or previous.get("kind") != "video"
+                or previous.get("item_id") != shot.get("id")):
+            continue
+        version = _file_version(shot, previous.get("output")) or _version(attempt.get("version"))
+        details = [value for value in previous.get("failure_history", []) if isinstance(value, dict)]
+        if not details and previous.get("state") in {"failed", "uncertain"}:
+            details = [previous.get("failure")]
+        for value in details:
+            detail = diagnostic(value, previous.get("state") == "uncertain")
+            if job_id == shot.get("job_id") and detail == result.get("failure"):
+                continue
+            row = {"failure": detail, **_public_timestamps(previous)}
+            if version:
+                row["version"] = version
+            history.append(row)
+    result["failure_history"] = history
+    return result
+
+
 def _public_shot_report(record, version):
     """Only publish an advisory report bound to this exact video's hash."""
     review = record.get("review")
@@ -225,8 +297,7 @@ def _shot_progress(state, episode, shot, episode_status, stamp):
     version = _version(shot.get("version"))
     artifact = _current_shot_artifact(shot)
     status = shot.get("status")
-    job = state.get("jobs", {}).get(shot.get("job_id"), {})
-    job = job if isinstance(job, dict) and job.get("kind") == "video" and job.get("item_id") == shot.get("id") else {}
+    job = _bound_shot_job(state, shot)
     hint = episode.get("progress_stage", {})
     hint = hint if isinstance(hint, dict) and hint.get("shot_id") == shot.get("id") else {}
     phase = hint.get("stage")
@@ -242,13 +313,12 @@ def _shot_progress(state, episode, shot, episode_status, stamp):
               "is_working": False, "waiting_for_human": False, "has_active_task": active}
     if status == "accepted" and artifact:
         result.update(stage="accepted", label="已生成，已通过")
-    elif status == "review_required":
-        result.update(stage="review_required", label="已生成，等待你审批" if artifact else "未取得可审视频，等待你决定重试",
-                      waiting_for_human=True)
     elif job.get("state") == "uncertain" or job.get("accounting") == "unknown":
         result.update(stage="unknown", label="调用结果待核实", waiting_for_human=True)
-    elif job.get("state") == "failed":
+    elif status == "generation_failed" or (status == "review_required" and not artifact) or job.get("state") == "failed":
         result.update(stage="failed", label="生成失败，等待处理", waiting_for_human=True)
+    elif status == "review_required":
+        result.update(stage="review_required", label="已生成，等待你审批", waiting_for_human=True)
     else:
         if status == "reviewing" and artifact:
             phase = "shot_review"
@@ -333,8 +403,7 @@ def public_state(state: dict) -> dict:
                 entry["subshots"] = [_pick(part, ("start", "end", "prompt"))
                                      for part in shot["subshots"] if isinstance(part, dict)]
             entry["version"] = _version(shot.get("version"))
-            if shot.get("generation_error"):
-                entry["generation_error"] = "本次视频生成未得到可用结果。不会自动再次提交；请填写意见后由你决定是否重试。"
+            entry.update(_public_shot_failures(state, shot))
             if shot.get("continuity_review"):
                 entry["continuity_review"] = "前段已返工，请重新审看片段接续。当前视频保留，由你决定是否需要重做。"
             if not _current_shot_artifact(shot):
@@ -344,10 +413,15 @@ def public_state(state: dict) -> dict:
                 if report:
                     entry["review"] = report
             entry["progress"] = _shot_progress(state, episode, shot, item["progress"], stamp)
+            if entry["progress"]["stage"] == "failed":
+                entry["status"] = "generation_failed"
             entry["history"] = _public_shot_history(shot)
             item["shots"].append(entry)
         episodes.append(item)
     result["episodes"] = episodes
+    if result.get("status") in {"review_required", "generation_failed"} and any(
+            episode["progress"]["stage"] == "failed" for episode in episodes):
+        result["status"] = "generation_failed"
     return result
 
 
