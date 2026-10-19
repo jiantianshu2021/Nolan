@@ -133,6 +133,18 @@ PLAN_SCHEMA = _object({"title": STRING, "style": STRING,
                                                    "music_prompt": STRING,
                                                    "shots": _array(SHOT_SCHEMA, minItems=1, maxItems=30)}), minItems=1, maxItems=100)})
 REFINE_SCHEMA = _object({"prompt": STRING, "dialogue": STRING, "continuity_notes": STRING})
+TIMING_PROPOSAL_SCHEMA = _object({
+    "subshots": _array(SUBSHOT_SCHEMA, minItems=1, maxItems=3),
+    "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "audio_windows": _array(_object({"start": {"type": "number", "minimum": 0, "maximum": 15},
+                                     "end": {"type": "number", "minimum": 0, "maximum": 15},
+                                     "speaker": {"type": "string", "minLength": 1},
+                                     "text": {"type": "string", "minLength": 1}}), maxItems=30),
+})
+# Providers receive a strict required nullable field. The call boundary accepts
+# old saved/fake three-field responses without rewriting their returned shape.
+REFINE_SCHEMA["properties"]["timing_proposal"] = {"anyOf": [TIMING_PROPOSAL_SCHEMA, {"type": "null"}]}
+REFINE_SCHEMA["required"].append("timing_proposal")
 AUDITION_SCHEMA = _object({"audition_text": STRING, "audition_reason": STRING, "audition_source": STRING})
 REVISION_ASSET_SCHEMA = _object({**ASSET_SCHEMA["properties"],
                                  "voice_only": {"type": "boolean"}, "audition_speaker": STRING})
@@ -280,16 +292,19 @@ INTERNAL_VOICE_SOURCE_RULES = (
 
 CROSS_SHOT_AUDIO_RULES = (
     "subshots 的切点是摄影镜头边界，不是声音必须停止或重新开始的边界。"
-    "同一句已安排的对白或系统播报可以按已批准规划在该生成片段内跨镜连续说完，切镜不重复、不截断、不改变音色；"
-    "需要改变既定声音起止或系统界面出现时点时，必须采用用户已明确选择的安排。"
-    "在现有总时长和原切点内提出新的跨镜声音方案，不等于改变片段时长或重分集。"
-    "如果需要提前系统界面出现或改变已定播报开始时点，只能先提出可供选择的安排并说明余量；"
-    "用户未明确选择前，不得把建议、未答复的问题、继续或恢复当作同意，也不得默认提前到某一秒。"
-    "用户明确选择后，才可在待确认的最终提示词中采用该安排；仍须等待用户点击确认提示词后才提交一次视频。"
-    "未获授权时保持原有时长、subshot 切点、动作顺序和对白原句，不能加速、截断、重写或删除台词消除冲突。"
-    "只在原有安排确实放不下且尚未收到明确选择时说明阻塞及可选方案；"
+    "同一句已安排的对白或系统播报可以在同一生成片段内跨镜连续说完，切镜不重复、不截断、不改变音色。"
+    "准备未批准的提示词草稿时，可在原片段总时长、摄影start/end、动作顺序、原对白及资产引用不变的范围内，"
+    "自行提出合理的系统界面出现和声音起止时点，不要求用户先亲自指定秒数。"
+    "用户说‘交给GPT准备提示词’、‘由GPT决定’或‘无意见，保持原来的’时，按其委托先完成合理草稿；"
+    "保持原来的默认保留剧情、台词、时长与摄影切点，不应把旧声音时窗变成不可调整的摄影边界。"
+    "即使没有明确委托，也可先提出这样的未批准草稿供最终审阅，不能因尚未选择具体秒点而阻塞准备候选。"
+    "在草稿中写清跨镜声音/UI的新时窗、余量及对旧声音文字的替代，不能宣称已执行或已获批准。"
+    "不得把建议、未答复的问题、继续或恢复当作同意生成；不能把“增强科技感”推断为同意提前播音已经执行。"
+    "用户已有明确的具体声音/UI时点要求时优先遵守；存在明确禁止变动的要求也须遵守。"
+    "始终等待用户点击确认提示词后才提交一次视频；最终候选确认是执行许可，不增加要求用户先确认秒点的关卡。"
+    "仅当整个片段在正常语速和合理停顿下确实放不下，或必须改变总时长、摄影切点、动作/对白内容、资产时才报告真实阻塞。"
+    "不能加速、截断、重写或删除台词消除冲突；不能仅因旧子镜声音窗口过短或一句话跨摄影切点就判整段不可容纳。"
     "收到新的人工补充意见后重新评估，旧阻塞报告不是永久规则。"
-    "用户明确选择的声音或界面出现时点可覆盖旧提示中相冲突的声音或界面时点，但不能覆盖摄影切点或省略动作。"
 )
 
 
@@ -566,7 +581,12 @@ class Brain:
         if len(user) > int(self.config.get("max_input_chars", 200000)):
             raise BrainError("本次 GPT 任务上下文超过本地输入上限；请求尚未提交。需要精简任务上下文或分批规划，不能静默截断原文。")
         result = self._codex(user, schema, images) if self.provider == "codex" else self._openai(user, schema, images)
-        _validate(result, schema)
+        # Older transports/fixtures can return the original three refine
+        # fields. The wire schema requires nullable timing metadata for new
+        # models, while local compatibility must not invent an adjustment.
+        checked = ({**result, "timing_proposal": None}
+                   if schema is REFINE_SCHEMA and isinstance(result, dict) and "timing_proposal" not in result else result)
+        _validate(checked, schema)
         return result
 
     def _codex(self, user: str, schema: dict, images: list[Path]) -> dict:
@@ -731,10 +751,11 @@ additions 每项含 id、kind、name、prompt、character_id、voice_only、audi
 如果没有合格原句则保留空 text/source、reason 说明缺口，同时在 blockers 写明须补充或选择原文，不能先提交生成。
 shot_updates 仅使用 {{id,add_asset_ids,prompt,dialogue,continuity_notes}}，只添加实际需要的引用，保留原有全部引用。
 当前片段及其后尚未生成的相关片段可更新；已有成片的其他片段不变，也不安排它们重新生成。
-严格保留全部片段 duration、scene_id、subshots 的数量、顺序、start/end 和既有镜头提示；不得通过输出字段偷偷改动时间表。
+严格保留全部片段 duration、scene_id、subshots 的数量、顺序、start/end 和既有画面动作；不得通过输出字段偷偷改动摄影时间表。
+旧子镜中声音/UI的起止文字可在同段内提出合理替代草稿，以便完整自然播报，摄影切点与动作因果不变。
 {CROSS_SHOT_AUDIO_RULES}
 以最新明确的人工意见为准；旧 revision_analysis 或其历史只是先前诊断，不是新的人工要求，
-不能把已采用资产方案中的历史反馈再次当作新增资产授权，也不能把“增强科技感”推断为同意提前播音。
+不能把已采用资产方案中的历史反馈再次当作新增资产授权，也不能把“增强科技感”推断为同意提前播音已经执行；同段内合理草稿仍可先准备待审。
 新规划每集约60秒的默认值不适用于本次返修，不能据此重新分集、改变已批准的整集总时长或压缩对白；
 例如已经批准的130秒第一集继续保持130秒，新增声音或资产不能成为裁短旧集、删剧情或加速台词的理由。
 prompt 写清新声源仅画外、具体逐字播报内容及其在既有动作中的位置，去掉旧 prompt 中“系统无配音/不念任务框”等与用户要求相冲突的限制。
@@ -743,12 +764,16 @@ continuity_notes 注明新播报规则覆盖旧内部镜头里相冲突的无配
 将系统框文字变为播报时，dialogue 中明确写“系统播报员：逐字内容”，与主角对白分别标明归属。
 按正常语速约每秒4个汉字并留标点停顿，核对实际声音起止时窗和整段时长；不能因一句话跨摄影切点就认定超时。
 同一批准试音原句的已知实测时长可辅助排布，不能把估算当作实测，也不能把裁短的声音参考长度当作完整台词时长。
-尚未获得安排选择且原时窗无法容纳时，blockers 具体说明冲突和可选方案，summary 说明需要用户选择；不能擅自延长或截断。
+旧子镜声音时窗不足时先评估本生成片段的全部可用时长，合理安排跨切镜播报并提出草稿；无需用户先填秒点。
+若可在既定总时长、切点、动作及对白不变下容纳，blockers=[]，summary说明将准备含明确声音/UI时窗的未批准提示词，等待最终提示词确认。
+只有整个片段确实无法容纳或须改变上述固定内容/新增资产时，blockers才说明真实冲突；不能擅自延长或截断。
 未来每次系统框/任务框弹出都播报的明确要求，写入 audio_policy.system_broadcast：enabled=true、character_id、voice_id、instruction，
 instruction 说明复用同一已审批声线、逐字播本次原文系统内容、画外播报、保持其他对白、无配乐和不额外生成字幕。
 为尚未生成且出现该系统框的后续片段添加同一逻辑声源和 voice 引用、具体内容；不能把所有无系统框的片段都塞入播报。
 已有 audio_policy 未被用户要求修改时原样保留；尚未设置且本次无相关要求时 enabled=false，其余三字段空字符串。
-summary 简洁说明新增或复用什么、先回到资产人工确认再返修；只需用户选择、试听和审批真正的声音，不要求另批内部画外角色定义。
+summary 简洁说明新增或复用什么；新增/变更资产时先回到资产人工确认再返修，已批准资产的复用及声音/UI草稿不增加独立审批步骤。
+有明确新增资产方案时用needs_assets/additions进入既有资产审批；不因资产尚待审批本身写blockers，只有缺原文或其他无法规划的真实缺口才写阻塞。
+用户只需选择、试听和审批真正的声音，不要求另批内部画外角色定义。
 blockers=[] 表示没有已知规划阻塞，不表示批准。needs_assets 必须与 additions 是否非空一致。
 实际资产候选均待人工审批；后台内部声源不参与独立审批，不能宣称已生成、已听过、已人工通过或保证一致性。""",
                             {"shot": model_shot, "context": model_context, "feedback": feedback}, REVISION_SCHEMA)
@@ -904,10 +929,10 @@ kind 必须为 plan/asset/episode/shot/none，对应 id 在 context 中查找，
         return [{**old, "text": new["text"]} for old, new in zip(segments, corrected)]
 
     def refine_shot(self, shot: dict, context: dict, images: list[Path]) -> dict:
-        return self._call(f"""根据已批准的原始生成片段、已批准资产和实际前片段观察，生成这一整段的最终视频提示词。
+        result = self._call(f"""根据已批准的原始生成片段、已批准资产和实际前片段观察，准备这一整段尚未批准的最终视频提示词候选。
 shot 是一次视频 API 任务，subshots 是其内部镜头时间表。保持 subshots 的数量、顺序、start/end 和 duration 完全不变，
 不得自行新增、删去、合并镜头或改变切点；按原时间表逐段写景别、运镜、人物方位、动作起止及衔接，输出 prompt 中保留原时间标记。
-返工意见若要求改变既定时间结构，应留待修改规划，不能在细化提示词时偷偷更改。
+返工意见若要求改变既定摄影切点或片段总时长，应留待修改规划，不能在细化提示词时偷偷更改。
 {CROSS_SHOT_AUDIO_RULES}
 新规划每集约60秒的默认值不适用于本次细化；已批准的整集总时长、片段时长和切点保持原样。
 例如已经批准的130秒第一集继续保持130秒，不重新分集、不裁短、不删剧情，也不加速或压缩原对白来凑一分钟。
@@ -941,10 +966,26 @@ voice_only=true 的 character 是后台内部画外声源，不出镜、没有�
 把原文系统文字播报与另行生成字幕区分：不生成额外画面字幕不等于禁止读出剧情中系统/任务框内容。
 本段确有系统框且已在资产引用中包含 policy.voice_id 时，按 audio_references 的真实编号使用该声线，
 逐字保留 shot.dialogue 里批准的播报内容及归属；不把其他角色台词交给播报员，不加未规划播报，不省略原角色对白。
-若已批准系统播报与既定时间表无法同时容纳，应在 continuity_notes 明确冲突、等待人工调整，不擅自加速或截断。
+若旧子镜声音窗口过短，先在整个生成片段内合理安排声音/UI起止并跨切镜连续播报；这属于待审草稿，不要求用户先亲自填秒点。
+只有整个生成片段确实无法容纳，或须改变原时长、摄影切点、动作/对白内容或资产，才在 continuity_notes 说明真实冲突；不擅自加速或截断。
 整段对白按时间表连续进行，切镜不重说台词、不重做已经完成的动作；同场景环境底声连续，动作音效只触发一次。
-不生成字幕、不生成配乐，配乐在整集后期连续编排，不在切镜或分段处重播。输出 prompt、dialogue、continuity_notes。""",
+需要调整声音/UI安排时，输出 timing_proposal={{subshots:[{{start,end,prompt}}],summary,audio_windows:[{{start,end,speaker,text}}]}}。
+proposal.subshots必须逐项保持原shot.subshots的数量、顺序和start/end，完整保留原画面动作与摄影内容；
+仅调整声音/UI时窗、跨镜连续播报及相冲突的旧声音文字，不能改台词、切点、动作因果或新增资产。
+summary具体说明草稿如何安排、余量和为何替代旧声音/UI时点，明确尚待最终提示词审批，不能声称已执行。
+audio_windows列出本段全部原对白，不只列改动部分；speaker逐字对应shot.dialogue的说话人标记，text逐字保留完整台词，
+每个窗口0<=start<end<=本段duration，同说话人的分窗按时序拼接必须与其原对白完全相同，不能漏字、重复或替换说话人。
+声音窗口可以跨越摄影切点；保持自然语速与停顿，不让系统声盖过人物对白，不把试音原句自动加进剧情。
+prompt及proposal.subshots同步使用同一声音/UI安排，不能一处提前、另一处仍要求原来的5秒才开始；dialogue保持原文。
+没有此类调整或旧项目无subshots时timing_proposal=null，不擅自增设镜头。
+不生成字幕、不生成配乐，配乐在整集后期连续编排，不在切镜或分段处重播。输出 prompt、dialogue、continuity_notes、timing_proposal。""",
                           {"shot": _model_shot(shot), "context": refinement_task_context(shot, context)}, REFINE_SCHEMA, images)
+        from . import core, prompt_gate
+        try:
+            prompt_gate.validate_timing_proposal(shot, result)
+        except core.GateError as exc:
+            raise BrainError(str(exc)) from None
+        return result
 
     def review(self, context: dict, images: list[Path]) -> dict:
         if not images:

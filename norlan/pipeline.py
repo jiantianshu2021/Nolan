@@ -181,6 +181,18 @@ def _shot_review_target(shot):
             "file": shot["file"], "video_job_id": shot["job_id"]}
 
 
+def _review_shot_summary(shot):
+    """Compare actual frames against this version's approved delivery draft."""
+    refined = shot.get("refined_prompt")
+    effective = prompt_gate.effective_shot(shot, refined if isinstance(refined, dict) else {})
+    if isinstance(refined, dict) and refined.get("timing_proposal") is not None:
+        # The source prompt can still describe the superseded UI/audio onset.
+        # Review the executed draft together with its effective subshots.
+        effective["prompt"] = refined["prompt"]
+        effective["continuity_notes"] = refined.get("continuity_notes", "")
+    return task_shot_summary(effective)
+
+
 def _cut_review_target(episode_id, cut):
     return {"kind": "rough_cut", "id": episode_id, "key": cut["key"],
             "sha256": cut["sha256"], "file": cut["file"]}
@@ -785,8 +797,7 @@ def _observation_images(root, context, images, previous):
 def _final_shot_prompt(state, shot, refined, context):
     prompt = refined["prompt"]
     if "subshots" in shot:
-        from .segments import timeline_prompt
-        prompt += "\n" + timeline_prompt(shot)
+        prompt += "\n" + prompt_gate.candidate_timeline_prompt(shot, refined)
     if shot.get("dialogue"):
         prompt += "\n必须使用的原定对白：" + shot["dialogue"]
     prompt += "\n不添加画面字幕，不添加背景配乐。"
@@ -967,7 +978,7 @@ def _shot(root, ep_id, shot_id, previous):
         prompt = candidate["prompt"]
         manifest = {"images": [_rel(root, f) for f in images], "audio": [_rel(root, f) for f in voices],
                     "context": context, "observations": [_rel(root, f) for f in observations]}
-        actual_hash = prompt_gate._hash(prompt_gate.specification(core.load_project(root), shot, prompt, manifest))
+        actual_hash = prompt_gate._hash(prompt_gate.specification(core.load_project(root), shot, prompt, manifest, refined=refined))
         if actual_hash != candidate["request_hash"]:
             prompt_gate.invalidate(root, shot_id)
             raise core.GateError("实际生成素材与已确认提示词不一致，请重新准备提示词。")
@@ -1028,7 +1039,7 @@ def _shot(root, ep_id, shot_id, previous):
                           for item in context.get("observation_images", []) if isinstance(item, dict))
     prior_scope = ("含前段实际尾帧参考。" if has_prior_frame else "未提供前段实际画面，不能核实跨段画面衔接。")
     current_shot = core._find(core.load_project(root), "shot", shot_id)
-    review_context = {**task_context_summary(context), "shot": task_shot_summary(current_shot), "actual": relative, "advisory_target": _shot_review_target(current_shot),
+    review_context = {**task_context_summary(context), "shot": _review_shot_summary(current_shot), "actual": relative, "advisory_target": _shot_review_target(current_shot),
         "current_frame_image_indices": list(range(len(observations) + 1, len(review_images) + 1)),
         "current_frame_samples": [{"image_index": len(observations) + index + 1, "time_seconds": instant}
                                   for index, instant in enumerate(evidence.get("sample_times", []))],
@@ -1308,7 +1319,7 @@ def _episode(root, ep_id):
             try:
                 review = ({"verdict": "pass", "issues": [], "observed_end_state": "Synthetic demo",
                            "repair_prompt": ""} if s["mode"] == "demo" else
-                          _brain(root, "review", {"episode": ep_id, "shots": [task_shot_summary(item) for item in fresh["shots"][:count]],
+                          _brain(root, "review", {"episode": ep_id, "shots": [_review_shot_summary(item) for item in fresh["shots"][:count]],
                               "advisory_target": _cut_review_target(ep_id, rough_cut),
                               "scope": "分段粗剪抽帧检查；听觉未评估，运动过程未完整评估。",
                               "evidence": _relative_evidence(root, ev)}, [Path(f) for f in ev["frames"]]))

@@ -217,11 +217,35 @@ def _public_shot_continuity(state, episode, shot):
     return result
 
 
-def _public_prompt_candidate(value):
+def _public_timing_proposal(value, shot):
+    """Project the candidate schedule without exposing its request internals."""
+    if not isinstance(value, dict) or not isinstance(shot, dict):
+        return None
+    proposal = value.get("timing_proposal")
+    if not isinstance(proposal, dict):
+        return None
+    safe = _pick(proposal, ("summary",))
+    for key, fields in (("subshots", ("start", "end", "prompt")),
+                        ("audio_windows", ("start", "end", "speaker", "text"))):
+        rows = proposal.get(key)
+        if (not isinstance(rows, list) or len(rows) > (3 if key == "subshots" else 30)
+                or not all(isinstance(row, dict) for row in rows)):
+            return None
+        safe[key] = [_pick(row, fields) for row in rows]
+    from .prompt_gate import validate_timing_proposal
+    try:
+        return validate_timing_proposal(shot, {"dialogue": value.get("dialogue"), "timing_proposal": safe})
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return None
+
+
+def _public_prompt_candidate(value, shot=None):
     """Expose the exact human-review prompt, never request config or URLs."""
     if not isinstance(value, dict):
         return None
     result = _pick(value, ("id", "version", "revision", "prompt", "dialogue", "continuity_notes", "request_hash", "duration"))
+    if "timing_proposal" in value:
+        result["timing_proposal"] = _public_timing_proposal(value, shot)
     manifest = value.get("reference_manifest")
     context = manifest.get("context", manifest) if isinstance(manifest, dict) else {}
     context = context if isinstance(context, dict) else {}
@@ -711,7 +735,7 @@ def public_state(state: dict) -> dict:
                                     for value in state.get("asset_amendments", []) if isinstance(value, dict)):
                 entry["asset_amendment_pending"] = True
             if shot.get("status") == "awaiting_prompt_approval":
-                candidate = _public_prompt_candidate(shot.get("prompt_candidate"))
+                candidate = _public_prompt_candidate(shot.get("prompt_candidate"), shot)
                 if candidate:
                     entry["prompt_candidate"] = candidate
             entry.update(_public_shot_failures(state, shot))
