@@ -76,6 +76,26 @@ class DashboardGenerationTests(unittest.TestCase):
         self.assertTrue(progress["completed"])
         self.assertFalse(progress["accepted"])
 
+    def test_subshot_schedule_and_proposal_are_public_without_private_metadata(self):
+        episode = self.state["episodes"][0]
+        episode["shots"][0].update(duration=10, subshots=[
+            {"start": 0, "end": 5, "prompt": "DEMO 全景", "provider_raw": "SECRET-SUBSHOT"},
+            {"start": 5, "end": 10, "prompt": "DEMO 近景"}])
+        episode["segment_proposal"] = {"id": "proposal-one", "status": "candidate", "source_ids": ["S2"],
+            "base_hash": "SECRET-BASE", "shots": [{"id": "G1", "duration": 10, "prompt": "DEMO", "dialogue": "",
+            "source_shot_ids": ["S2"], "private": "SECRET-PROPOSED", "subshots": [
+                {"start": 0, "end": 10, "prompt": "DEMO 单镜", "private": "SECRET-SCHEDULE"}]}]}
+        result = self.public()["episodes"][0]
+        self.assertEqual(result["progress"]["total_segments"], 2)
+        self.assertEqual(result["progress"]["completed_segments"], 1)
+        self.assertEqual(result["progress"]["planned_camera_shots"], 3)
+        self.assertEqual(result["progress"]["stage"], "awaiting_segment_plan")
+        self.assertEqual(result["shots"][0]["subshots"][0], {"start": 0, "end": 5, "prompt": "DEMO 全景"})
+        self.assertEqual(result["segment_proposal"]["shots"][0]["source_shot_ids"], ["S2"])
+        self.assertNotIn("SECRET-", json.dumps(result))
+        episode["segment_proposal"]["status"] = "approved"
+        self.assertNotIn("segment_proposal", self.public()["episodes"][0])
+
     def test_previous_version_is_history_not_mislabelled_as_new_generation(self):
         shot = self.state["episodes"][0]["shots"][1]
         shot.update(version=2, file="media/E1/S2-v1.mp4", sha256="b" * 64, history=[

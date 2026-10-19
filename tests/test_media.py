@@ -79,6 +79,51 @@ class MediaTests(unittest.TestCase):
         self.assertAlmostEqual(result["duration"], 0.6, delta=0.04)
         self.assertTrue(probe(Path(result["output"]))["has_audio"])
 
+    def test_subshot_samples_cover_planned_cuts_and_actual_last_frame(self):
+        source = self.root / "three-subshots.mp4"
+        subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                        "color=c=blue:s=160x120:r=30:d=15", "-vf",
+                        "drawbox=x=0:y=0:w=iw:h=ih:color=red:t=fill:enable='eq(n,449)'",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
+                       capture_output=True, check=True)
+        subshots = [{"start": 0, "end": 5, "prompt": "合成子镜一"},
+                    {"start": 5, "end": 10, "prompt": "合成子镜二"},
+                    {"start": 10, "end": 15, "prompt": "合成子镜三"}]
+        evidence = extract_evidence(source, self.root / "subshot-evidence", subshots=subshots)
+        times = evidence["sample_times"]
+        self.assertEqual(len(times), 9)
+        self.assertEqual(times, sorted(set(times)))
+        self.assertEqual(times[0], 0)
+        self.assertAlmostEqual(times[-1], 449 / 30, places=5)
+        for midpoint in (2.5, 7.5, 12.5):
+            self.assertLess(min(abs(value - midpoint) for value in times), 1 / 30)
+        for cut in (5, 10):
+            self.assertTrue(any(cut - 0.2 < value < cut for value in times))
+            self.assertTrue(any(cut < value < cut + 0.2 for value in times))
+        self.assertEqual(evidence["frame_indices"][-1], 449)
+        self.assertEqual(evidence["tail_frame"], evidence["frames"][-1])
+        pixel = subprocess.run(["ffmpeg", "-v", "error", "-i", evidence["tail_frame"],
+                                "-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                               capture_output=True, check=True).stdout
+        self.assertGreater(pixel[0], 200)
+        self.assertLess(pixel[2], 40)  # Only the actual final frame is red.
+        self.assertIn("不代表已检测", evidence["sampling_note"])
+
+    def test_subshot_samples_clip_to_short_actual_stream(self):
+        source = self.clip("short-subshot-result.mp4", duration=0.4)
+        subshots = [{"start": 0, "end": 5, "prompt": "合成子镜一"},
+                    {"start": 5, "end": 10, "prompt": "合成子镜二"},
+                    {"start": 10, "end": 15, "prompt": "合成子镜三"}]
+        evidence = extract_evidence(source, self.root / "short-subshot-evidence", subshots=subshots)
+        self.assertGreaterEqual(len(evidence["frames"]), 2)
+        self.assertLessEqual(len(evidence["frames"]), 9)
+        self.assertTrue(all(0 <= time < evidence["metadata"]["duration"] for time in evidence["sample_times"]))
+        self.assertEqual(evidence["sample_times"], sorted(set(evidence["sample_times"])))
+        self.assertAlmostEqual(evidence["sample_times"][-1], 11 / 30, places=5)
+        with self.assertRaises(MediaError):
+            extract_evidence(source, self.root / "invalid-subshot-evidence",
+                             subshots=[{"start": 0, "end": float("nan"), "prompt": "合成"}])
+
     def test_demo_media_and_bad_inputs(self):
         image = synthetic_asset(self.root / "asset.png", "仅演示：%{text} $(touch unsafe)", "#234567")
         self.assertTrue(probe(image)["has_video"])

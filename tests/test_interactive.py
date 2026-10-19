@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from norlan.brain import BrainError
 from norlan.interactive import _CONFIG_HEADER, launch, native_home, prepare_launch
+from norlan.segments import SEGMENT_PLAN_RULES
 
 
 class InteractiveTests(unittest.TestCase):
@@ -73,6 +74,7 @@ class InteractiveTests(unittest.TestCase):
         self.assertNotIn("resume", argv)
         self.assertNotIn("--last", argv)
         self.assertNotIn("DEMO", config["developer_instructions"])
+        self.assertIn(SEGMENT_PLAN_RULES, config["developer_instructions"])
         for name in ("shell_tool", "unified_exec", "apps", "plugins", "hooks", "browser_use", "computer_use"):
             self.assertFalse(config["features"][name])
         self.assertTrue(config["features"]["code_mode"])
@@ -83,6 +85,8 @@ class InteractiveTests(unittest.TestCase):
         self.assertTrue(config["features"]["skip_host_skill_discovery"])
         self.assertNotIn("approve", config["mcp_servers"]["norlan"]["enabled_tools"])
         self.assertNotIn("budget", config["mcp_servers"]["norlan"]["enabled_tools"])
+        self.assertIn("propose_segments", config["mcp_servers"]["norlan"]["enabled_tools"])
+        self.assertNotIn("approve_segments", config["mcp_servers"]["norlan"]["enabled_tools"])
         mcp_args = config["mcp_servers"]["norlan"]["args"]
         production_workspace = Path(mcp_args[mcp_args.index("--workspace") + 1])
         self.assertIn(str(production_workspace / "projects"), config["developer_instructions"])

@@ -29,7 +29,8 @@ def plan():
                         "audition_text": "", "audition_reason": "", "audition_source": ""}],
             "episodes": [{"id": "E001", "title": "开端", "summary": "寻找信封", "music_prompt": "钢琴淡入",
                           "shots": [{"id": "S001", "duration": 5, "prompt": "向右走", "dialogue": "找到你了。",
-                                     "asset_ids": ["hero"], "scene_id": "room", "continuity_notes": "右手拿信封"}]}]}
+                                     "asset_ids": ["hero"], "scene_id": "room", "continuity_notes": "右手拿信封",
+                                     "subshots": [{"start": 0, "end": 5, "prompt": "中景向右跟拍，右手拿信封走到门边。"}]}]}]}
 
 
 class ProviderTests(unittest.TestCase):

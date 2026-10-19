@@ -46,10 +46,21 @@ def _gate(root):
     return state
 
 
+def _pending_segment_plan(state):
+    return any(episode.get("segment_proposal", {}).get("status") == "candidate"
+               for episode in state.get("episodes", []))
+
+
+def _new_work_gate(state):
+    if _pending_segment_plan(state):
+        raise core.GateError("剩余生成段方案等待人工批准；批准前不会提交新的付费调用。")
+
+
 def _brain(root, method, *args, **kwargs):
     from .brain import Brain
     from .connection import production_brain_config
     s = _gate(root)
+    _new_work_gate(s)
     if s["mode"] == "demo":
         raise core.GateError("演示项目不调用在线模型；请新建 live 项目进行真实制作")
     config = production_brain_config(s["settings"]["brain"])
@@ -185,6 +196,7 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
             return old_job
         if job["accounting"] == "unknown":
             raise core.GateError("未知任务必须先核实，不能再次提交")
+    _new_work_gate(s)
     provider = _ark(root) if s["mode"] == "live" else None
     if provider:
         provider.preflight("video")
@@ -277,6 +289,7 @@ def _assets(root):
             if any(a["status"] != "approved" for a in s["assets"] if a["kind"] != "voice"):
                 continue
         if not recovering:
+            _new_work_gate(s)
             total_attempts = sum(j["item_id"] == asset["id"] and j["kind"] in {"voice", "image"} for j in s["jobs"].values())
             if total_attempts >= s["settings"]["max_attempts"]:
                 raise core.GateError("资产已达到尝试上限；请调整方案或显式提高上限：" + asset["id"])
@@ -416,6 +429,9 @@ def _shot(root, ep_id, shot_id, previous):
         s = _gate(root)
         ep = core._find(s, "episode", ep_id)
         shot = core._find(s, "shot", shot_id)
+        if "subshots" in shot:
+            from .segments import validate_subshots
+            validate_subshots(shot)
         if shot["status"] == "accepted":
             core._check_artifact(root, shot)
             return True
@@ -430,6 +446,7 @@ def _shot(root, ep_id, shot_id, previous):
                 _save_shot(root, shot_id, status="review_required")
             raise core.GateError("自动返工达到上限，请人工审查：" + shot_id)
         if not recovering:
+            _new_work_gate(s)
             _progress(root, ep_id, "shot_preparation", shot_id)
         context, images, voices = _shot_context(root, ep, shot, previous)
         if not recovering:
@@ -445,6 +462,9 @@ def _shot(root, ep_id, shot_id, previous):
         version = shot["version"]
         out = Path(root) / "media" / ep_id / f"{shot_id}-v{version}.mp4"
         prompt = shot["refined_prompt"]["prompt"]
+        if "subshots" in shot:
+            from .segments import timeline_prompt
+            prompt += "\n" + timeline_prompt(shot)
         # Refined text must not be treated as approved story changes.
         if shot.get("dialogue"):
             prompt += "\n必须使用的原定对白：" + shot["dialogue"]
@@ -452,14 +472,23 @@ def _shot(root, ep_id, shot_id, previous):
         _video(root, "video", shot_id, out, shot["duration"], prompt, images, voices,
                old_job=shot.get("job_id") if recovering else None)
         _progress(root, ep_id, "shot_checks", shot_id)
-        evidence = media.extract_evidence(out, Path(root) / "evidence" / f"{shot_id}-v{version}")
+        evidence_dir = Path(root) / "evidence" / f"{shot_id}-v{version}"
+        evidence = (media.extract_evidence(out, evidence_dir, subshots=shot["subshots"])
+                    if "subshots" in shot else media.extract_evidence(out, evidence_dir))
         relative = _relative_evidence(root, evidence)
         _save_shot(root, shot_id, file=_rel(root, out), sha256=core.digest(out), evidence=relative, status="reviewing")
         # Review the seam too: prior tail + current sampled frames, tied to hashes.
         review_images = images + [Path(f) for f in evidence["frames"]]
         review_context = {**context, "shot": shot, "actual": relative,
             "current_frame_image_indices": list(range(len(images) + 1, len(review_images) + 1)),
+            "current_frame_samples": [{"image_index": len(images) + index + 1, "time_seconds": instant}
+                                      for index, instant in enumerate(evidence.get("sample_times", []))],
             "review_scope": "当前镜头首/中/尾抽样画面与前镜实际尾帧。没有审听音频；不可宣称整段动作或音色已核实。"}
+        if "subshots" in shot:
+            review_context.update(
+                review_scope="按计划子镜中点及切点前后采样，包含实测首帧、最后一帧与前段实际尾帧参考。"
+                             "只是计划点抽样，未检测或确认实际切镜；未审听音频，不可宣称完整动作、口型或音色已核实。",
+                repair_unit="一个生成段对应一次视频任务；任何子镜有问题均返工整个生成段，不能仅替换段内某一子镜。")
         _progress(root, ep_id, "shot_review", shot_id)
         review = ({"verdict": "pass", "issues": [], "observed_end_state": "Synthetic demo only",
                    "repair_prompt": "", "scope": "synthetic smoke test"} if s["mode"] == "demo"
@@ -481,9 +510,11 @@ def _shot(root, ep_id, shot_id, previous):
             return False
         with core.transaction(root) as current:
             sh = core._find(current, "shot", shot_id)
-            sh.setdefault("history", []).append({"file": sh["file"], "sha256": sh["sha256"], "review": review})
+            sh.setdefault("history", []).append({key: sh[key] for key in
+                ("file", "sha256", "version", "evidence", "review") if key in sh})
             sh.update(status="planned", feedback=review.get("repair_prompt") or "；".join(review.get("issues", [])))
-            sh.pop("job_id", None)
+            for key in ("file", "sha256", "evidence", "review", "refined_prompt", "job_id"):
+                sh.pop(key, None)
 
 
 def _soundtrack(root, ep):
@@ -520,6 +551,7 @@ def _soundtrack(root, ep):
     out.parent.mkdir(parents=True, exist_ok=True)
     job = s["jobs"].get(ep.get("music_job_id", ""))
     if not job:
+        _new_work_gate(s)
         job_id = "music-" + ep["id"] + "-" + uuid.uuid4().hex[:8]
         cap = music_cfg.get("call_cap", 0)
         core.reserve(root, job_id, "music", ep["id"], cap)
@@ -608,6 +640,7 @@ def _captions(root, ep):
     if not evidence.get("audio"):
         raise core.GateError("成片没有实际音轨，不能生成对白字幕")
     job_id = f"asr-{ep['id']}-{uuid.uuid4().hex[:8]}"
+    _new_work_gate(s)
     core.reserve(root, job_id, "transcription", ep["id"], config.get("call_cap", 0))
     core.update_job(root, job_id, fingerprint=fingerprint, result_file=_rel(root, output))
     try:
@@ -744,6 +777,10 @@ def run(root):
             _recover(root)
             s = _gate(root)
             _set(root, last_error=None)
+            if _pending_segment_plan(s) and not any(
+                    job.get("state") in {"submitted", "download_pending"} for job in s["jobs"].values()):
+                _set(root, status="awaiting_segment_plan")
+                return core.load_project(root)
             if s["plan"]["status"] in {"pending", "rejected"}:
                 novel = (root / "source/novel.txt").read_text(encoding="utf-8")
                 if s["settings"].get("creative_brief"):
@@ -767,7 +804,9 @@ def run(root):
     except core.GateError as exc:
         if not acquired:
             return core.load_project(root)
-        _set(root, status="paused" if core.load_project(root)["paused"] else "blocked", last_error=str(exc))
+        current = core.load_project(root)
+        status = "paused" if current["paused"] else "awaiting_segment_plan" if _pending_segment_plan(current) else "blocked"
+        _set(root, status=status, last_error=str(exc))
     except Exception as exc:
         # Adapters sanitize provider errors; avoid leaking credentials in reprs.
         message = str(exc) if getattr(exc, "safe_message", False) or isinstance(exc, (ValueError, FileNotFoundError)) else type(exc).__name__ + "：执行失败，请检查配置和本地文件"

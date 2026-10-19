@@ -16,6 +16,7 @@ import tempfile
 import tomllib
 
 from .brain import BrainError, resolve_codex
+from .segments import SEGMENT_PLAN_RULES
 
 
 _MARKER = ".norlan-managed"
@@ -27,7 +28,7 @@ _MCP_TOOLS = (
     "project_status", "list_projects", "read_novel", "create_project", "save_plan",
     "run_production", "pause_production", "request_revision", "correct_captions",
     "set_voice_audition", "get_costs",
-    "open_review", "set_creative_brief",
+    "open_review", "set_creative_brief", "propose_segments",
 )
 _SERVICE_ENV = (
     "ARK_API_KEY", "OPENAI_API_KEY", "VOLC_ACCESS_KEY_ID", "VOLC_SECRET_ACCESS_KEY",
@@ -51,6 +52,14 @@ _DIRECTOR_INSTRUCTIONS = """你是 Nolan，用户在终端里的 GPT 对话伙�
 先讨论创作目标、风格、角色、分集和时长；用 set_creative_brief 保存确认的创作要求。
 save_plan 保存待用户审批的完整分集、资产、分镜与声画方案。逐镜参考已批准人物/场景/声音资产，
 以实际上一镜头尾帧与动作状态续接，维护空间、服装、道具、对白、环境声和配乐衔接。
+恢复旧项目先调用 project_status，保留所有已生成或已提交片段。若有 submitted/仍在生成的原任务，
+先按原任务恢复查询和下载，不能重新提交、重跑资产或用 save_plan/install_plan 替换原计划。
+只有已暂停且没有在途任务时，才用 propose_segments 提出尚未启动连续尾部的重分组，等待用户在网页确认。
+groups 必须按原顺序完整覆盖该尾部的全部 ID；保留不适合合并的项时也须使用单项组，不能漏项或跳序。
+只合并同 scene_id、动作与对白连贯的相邻片段，总时长10–15秒且总内部镜头不超过3个；
+引用资产取真实并集，不超过8张视觉参考和3条声音参考，为上一段实际尾帧保留一个图片位置。
+复杂动作、独白、关键口型或转场宁可保留单项，不能为了凑长段损伤节奏。模型不能批准重分组，
+不能改动已生成/已提交片段、替换资产或自动安装新计划；网页确认前现行计划保持原样，不能按提案启动生成。
 首次生成资产前必须先在网页由用户选择“由 GPT 自己决定”或“我来描述”（可粘贴参考图）；
 等待资产创作选择时提供审片页，让用户选择，不能用聊天内容代替网页上的选择或直接生成。
 声音资产必须绑定角色；画外声音也需要声源角色，并在镜头提示词明确该角色不出镜。
@@ -68,7 +77,7 @@ run_production 遵守项目预算、版本/文件哈希审批、未知提交禁�
 遇到审批、预算、密钥或供应商能力不足，说明当前状态与具体下一步。不要编造已生成的视频或声画检验结果。
 抽帧检查只支持已观察的画面，不能声称已听过音频或保证动作、口型、声音一致。
 启动时不自动读取或继续演示项目。普通对话的上下文由当前会话保存；/resume 恢复本连接下 Nolan 对话。
-"""
+""" + "\n" + SEGMENT_PLAN_RULES
 
 
 def _data_root() -> Path:

@@ -12,7 +12,7 @@ import math
 
 _ACTIVE_JOB_STATES = frozenset({"submitting", "submitted", "download_pending"})
 _SHOT_STAGES = {
-    "shot_preparation": "整理已批准参考并编写镜头提示词",
+    "shot_preparation": "整理已批准参考并编写片段提示词",
     "shot_submission": "正在提交视频生成请求",
     "shot_generation": "等待视频引擎生成",
     "shot_download": "视频已生成，正在下载",
@@ -107,6 +107,9 @@ def episode_progress(state, episode, *, now=None):
         "current_shot_index": current_index,
         "completed_shots": completed,
         "total_shots": total,
+        "completed_segments": completed,
+        "total_segments": total,
+        "planned_camera_shots": sum(len(shot.get("subshots") or [None]) for shot in shots),
         "completed_duration": round(completed_duration, 3),
         "total_duration": round(total_duration, 3),
         "elapsed_seconds": _elapsed(start, now),
@@ -115,7 +118,7 @@ def episode_progress(state, episode, *, now=None):
         "has_active_task": bool(active_jobs),
         "is_working": False,
         "updated_at": updated_at,
-        "basis": "按已验收镜头的计划时长及后期步骤计算；不代表视频引擎的内部进度或剩余时间。",
+        "basis": "按已验收片段的计划时长及后期步骤计算；不代表视频引擎的内部进度或剩余时间。",
     }
 
     def finish(stage, label, *, waiting=False, working=False, value=None):
@@ -131,6 +134,8 @@ def episode_progress(state, episode, *, now=None):
 
     if state.get("plan", {}).get("status") != "approved":
         return finish("awaiting_plan", "等待分集与分镜规划审批", waiting=True)
+    if episode.get("segment_proposal", {}).get("status") == "candidate":
+        return finish("awaiting_segment_plan", "等待你确认剩余内容的分段调整方案", waiting=True)
     episodes = state.get("episodes", [])
     index = next((index for index, item in enumerate(episodes) if item.get("id") == episode.get("id")), 0)
     if any(item.get("status") != "approved" for item in episodes[:index]):
@@ -148,11 +153,11 @@ def episode_progress(state, episode, *, now=None):
     if review_shot:
         result["current_shot"] = review_shot.get("id")
         result["current_shot_index"] = shots.index(review_shot) + 1
-        return finish("review_required", f"镜头 {result['current_shot_index']}/{total} 需要人工复核", waiting=True)
+        return finish("review_required", f"片段 {result['current_shot_index']}/{total} 需要人工复核", waiting=True)
     if state.get("status") == "blocked":
         return finish("blocked", "制作暂时停止，请查看错误说明后继续", waiting=True)
     if active_job.get("state") == "failed":
-        return finish("failed", f"镜头 {current_index}/{total} 生成失败，等待处理", waiting=True)
+        return finish("failed", f"片段 {current_index}/{total} 生成失败，等待处理", waiting=True)
 
     stage = hint.get("stage", "")
     if all_complete:
@@ -163,7 +168,7 @@ def episode_progress(state, episode, *, now=None):
             return finish(stage, "拼接分段粗剪，准备检查镜头衔接", working=True)
         if stage == "batch_review":
             return finish(stage, "检查分段粗剪的抽样画面与镜头衔接", working=True)
-        return finish("postproduction", "镜头已全部验收，等待整集后期合成", working=episode.get("status") == "generating")
+        return finish("postproduction", "片段已全部验收，等待整集后期合成", working=episode.get("status") == "generating")
     if stage in {"batch_assembly", "batch_review"}:
         label = "拼接已完成镜头的分段粗剪" if stage == "batch_assembly" else "检查分段粗剪的抽样画面与镜头衔接"
         return finish(stage, label, working=True)
@@ -181,5 +186,5 @@ def episode_progress(state, episode, *, now=None):
     elif stage not in _SHOT_STAGES or hint.get("shot_id") not in {None, current.get("id") if current else None}:
         stage = "shot_preparation" if current and current.get("status") == "generating" else "queued"
     if stage in _SHOT_STAGES:
-        return finish(stage, f"镜头 {current_index}/{total}：{_SHOT_STAGES[stage]}", working=True)
+        return finish(stage, f"片段 {current_index}/{total}：{_SHOT_STAGES[stage]}", working=True)
     return result

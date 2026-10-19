@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from norlan import core, pipeline
+from norlan import core, dashboard, pipeline
 from norlan.billing import IMAGE_MODEL
 from norlan.progress import episode_progress
 from test_asset_inputs import data_url, png_data
@@ -126,6 +126,54 @@ class PipelineIntakeTests(unittest.TestCase):
         provider.assert_not_called()
         brain.assert_not_called()
         reserve.assert_not_called()
+
+    def test_automatic_retry_moves_failed_clip_to_history_before_next_refinement(self):
+        with fake_media():
+            choose_gpt_assets(self.root)
+            state = pipeline.run(self.root)
+            for asset in state["assets"]:
+                core.approve(self.root, "asset", asset["id"], asset["version"])
+            self.make_live()
+            provider = Mock()
+            provider.submit_video.return_value = {"id": "synthetic-failed-clip"}
+            provider.poll_video.return_value = {"status": "completed", "url": "https://example.test/clip"}
+            provider.download.side_effect = lambda url, output: write(output, b"SYNTHETIC FAILED CLIP")
+            refinements = []
+            initial = core.load_project(self.root)["episodes"][0]["shots"][0]
+
+            def brain(root, method, *args, **kwargs):
+                if method == "review":
+                    return {"verdict": "fail", "issues": ["合成测试：人物位置不对"],
+                            "observed_end_state": "synthetic", "repair_prompt": "修正人物位置"}
+                self.assertEqual(method, "refine_shot")
+                refinements.append(args[0].get("version", 0))
+                if len(refinements) == 2:
+                    current = core.load_project(root)
+                    shot = current["episodes"][0]["shots"][0]
+                    for field in ("file", "sha256", "evidence", "review", "refined_prompt", "job_id"):
+                        self.assertNotIn(field, shot)
+                    self.assertEqual(shot.get("revision", 0), initial.get("revision", 0))
+                    self.assertEqual(shot["feedback"], "修正人物位置")
+                    history = shot["history"][0]
+                    self.assertEqual(history["version"], 1)
+                    self.assertIn("evidence", history)
+                    self.assertEqual(history["review"]["verdict"], "fail")
+                    self.assertEqual(core.digest(self.root / history["file"]), history["sha256"])
+                    public = dashboard.public_state(current)["episodes"][0]["shots"][0]
+                    self.assertNotIn("file", public)
+                    self.assertFalse(public["progress"]["completed"])
+                    self.assertEqual(public["progress"]["stage"], "shot_preparation")
+                    self.assertEqual(public["progress"]["target_version"], 2)
+                    self.assertEqual(public["history"], [{"file": history["file"], "version": 1}])
+                    raise core.GateError("Synthetic stop before second submission")
+                return {"prompt": "SYNTHETIC VIDEO", "dialogue": "", "continuity_notes": "synthetic"}
+
+            with patch.object(pipeline, "_ark", return_value=provider), \
+                 patch.object(pipeline, "_brain", side_effect=brain), \
+                 self.assertRaisesRegex(core.GateError, "Synthetic stop before second submission"):
+                pipeline._shot(self.root, "E001", "E001-S001", None)
+            self.assertEqual(refinements, [0, 1])
+            provider.submit_video.assert_called_once()
 
     def test_live_episode_writes_observable_generation_and_postproduction_phases(self):
         with fake_media():

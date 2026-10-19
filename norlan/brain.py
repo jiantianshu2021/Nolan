@@ -22,6 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .providers import ProviderError, _api_open, _data_uri, _https_url
+from .segments import SEGMENT_PLAN_RULES, validate_subshots
 from .voice import VOICE_PLAN_RULES
 
 
@@ -112,9 +113,13 @@ ID = {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"}
 ASSET_SCHEMA = _object({"id": ID, "kind": {"type": "string", "enum": ["character", "location", "prop", "voice"]},
                         "name": STRING, "prompt": STRING, "character_id": STRING,
                         "audition_text": STRING, "audition_reason": STRING, "audition_source": STRING})
+SUBSHOT_SCHEMA = _object({"start": {"type": "number", "minimum": 0, "maximum": 15},
+                          "end": {"type": "number", "minimum": 0, "maximum": 15},
+                          "prompt": {"type": "string", "minLength": 1, "maxLength": 2000}})
 SHOT_SCHEMA = _object({"id": ID, "duration": {"type": "integer", "minimum": 4, "maximum": 15},
                        "prompt": STRING, "dialogue": STRING, "asset_ids": _array(ID, minItems=1, maxItems=12),
-                       "scene_id": ID, "continuity_notes": STRING})
+                       "scene_id": ID, "continuity_notes": STRING,
+                       "subshots": _array(SUBSHOT_SCHEMA, minItems=1, maxItems=3)})
 PLAN_SCHEMA = _object({"title": STRING, "style": STRING,
                        "ratio": {"type": "string", "enum": ["16:9", "9:16", "1:1"]},
                        "assets": _array(ASSET_SCHEMA, minItems=1, maxItems=100),
@@ -165,7 +170,7 @@ def _validate(value, schema: dict, path: str = "output") -> None:
         for i, entry in enumerate(value):
             _validate(entry, schema["items"], f"{path}[{i}]")
     elif kind == "string":
-        if len(value) > 100000 or ("pattern" in schema and not re.fullmatch(schema["pattern"], value)):
+        if not schema.get("minLength", 0) <= len(value) <= schema.get("maxLength", 100000) or ("pattern" in schema and not re.fullmatch(schema["pattern"], value)):
             raise BrainError(f"GPT 输出字段 {path} 格式不合规。")
     elif kind in {"integer", "number"}:
         if not math.isfinite(value) or not schema.get("minimum", -math.inf) <= value <= schema.get("maximum", math.inf):
@@ -196,6 +201,10 @@ def validate_plan(plan: dict) -> dict:
         if sum(shot["duration"] for shot in episode["shots"]) > 180:
             raise BrainError("单集超过 180 秒，请缩短分集，避免一次大额生成。")
         for shot in episode["shots"]:
+            try:
+                validate_subshots(shot)
+            except ValueError as exc:
+                raise BrainError(str(exc)) from None
             if shot["id"] in seen:
                 raise BrainError("分镜 ID 重复。")
             seen.add(shot["id"])
@@ -322,7 +331,8 @@ class Brain:
         if not isinstance(novel, str) or not novel.strip():
             raise BrainError("小说正文不能为空。")
         result = self._call(f"""把小说改编为可逐集制作的 AI 漫剧，保留主要因果关系并策划分集悬念。
-默认每集约 45–60 秒，按剧情自然断点划分，不把整部小说塞进一集；每镜头整数 4–15 秒。
+默认每集约 45–60 秒，按剧情自然断点划分，不把整部小说塞进一集。
+{SEGMENT_PLAN_RULES}
 每个角色/场景/关键道具建立唯一 ASCII ID，复用资产 ID；asset_ids 必须引用列表中的资产。
 为有对白的主要角色创建独立 voice 资产，character_id 必须填写该声音对应的 character 资产 ID；其他资产的 character_id 填空字符串。
 声音资产名称明确对应角色。{VOICE_PLAN_RULES}
@@ -405,12 +415,17 @@ kind 必须为 plan/asset/episode/shot/none，对应 id 在 context 中查找，
         return [{**old, "text": new["text"]} for old, new in zip(segments, corrected)]
 
     def refine_shot(self, shot: dict, context: dict, images: list[Path]) -> dict:
-        return self._call("""根据原始分镜、已批准资产和实际前镜头观察，生成这一镜的最终视频提示词。
+        return self._call("""根据已批准的原始生成片段、已批准资产和实际前片段观察，生成这一整段的最终视频提示词。
+shot 是一次视频 API 任务，subshots 是其内部镜头时间表。保持 subshots 的数量、顺序、start/end 和 duration 完全不变，
+不得自行新增、删去、合并镜头或改变切点；按原时间表逐段写景别、运镜、人物方位、动作起止及衔接，输出 prompt 中保留原时间标记。
+返工意见若要求改变既定时间结构，应留待修改规划，不能在细化提示词时偷偷更改。
+旧项目没有 subshots 时保留原单段结构，不擅自拆镜或增加任务。整段失败整段返工，不能声称能单独重做内镜头。
 图片顺序必须对应 context 中的引用清单，明确哪些锁人物/场景，哪些是实际尾帧；不能凭空声称有参考视频。
 承接动作的起点、人物相对位置、视线和道具持握；禁止把上一镜的失败内容当作固定设定。
 尊重用户返工意见，只有意见明确要求时才改对白；无意见时保留原文。不要增加人物、剧情、预算或时长。
 对白音色参照已批准声音资产，写清角色对应音频编号；不要声称能保证音色一致。
-不生成字幕、不生成配乐，保留对白和必要环境声。输出 prompt、dialogue、continuity_notes。""",
+整段对白按时间表连续进行，切镜不重说台词、不重做已经完成的动作；同场景环境底声连续，动作音效只触发一次。
+不生成字幕、不生成配乐，配乐在整集后期连续编排，不在切镜或分段处重播。输出 prompt、dialogue、continuity_notes。""",
                           {"shot": shot, "context": context}, REFINE_SCHEMA, images)
 
     def review(self, context: dict, images: list[Path]) -> dict:

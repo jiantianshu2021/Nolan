@@ -298,8 +298,56 @@ def synthetic_clip(path: Path, label: str, duration: float, index: int = 0) -> P
     return path
 
 
-def extract_evidence(video: Path, outdir: Path) -> dict:
-    """Extract three sampled frames and the audio; this is evidence, not a review."""
+def _subshot_frame_samples(video, metadata, subshots):
+    """Map planned sample points to decoded frame indices and actual times."""
+    from .segments import validate_subshots
+    try:
+        planned_duration = subshots[-1]["end"]
+        validate_subshots({"duration": planned_duration, "subshots": subshots})
+    except (ValueError, TypeError, KeyError, IndexError):
+        raise MediaError("子镜采样计划无效；请检查连续时间范围与总时长。") from None
+    data = json.loads(_run([
+        "ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe",
+        "-select_streams", "v:0", "-show_frames", "-show_entries",
+        "frame=best_effort_timestamp_time", "-of", "json", str(video),
+    ], timeout=60))
+    try:
+        timestamps = [float(frame["best_effort_timestamp_time"]) for frame in data["frames"]]
+        if not timestamps or any(not math.isfinite(value) for value in timestamps):
+            raise ValueError
+        timestamps = [value - timestamps[0] for value in timestamps]
+        if timestamps != sorted(timestamps) or timestamps[-1] > metadata["duration"] + 0.1:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise MediaError("无法核实视频帧时间，不能用计划时间冒充实测尾帧。") from None
+    tail_time = timestamps[-1]
+    desired = [0.0, tail_time]
+    desired += [(item["start"] + item["end"]) / 2 for item in subshots]
+    cuts = [item["end"] for item in subshots[:-1]]
+    for index, cut in enumerate(cuts):
+        # Keep samples on each planned side, even for a short subshot. These
+        # positions are not a claim that the generated video cuts here.
+        left = subshots[index]["end"] - subshots[index]["start"]
+        right = subshots[index + 1]["end"] - subshots[index + 1]["start"]
+        margin = min(0.12, left / 4, right / 4)
+        desired.extend((cut - margin, cut + margin))
+    desired = sorted({max(0.0, min(float(value), tail_time)) for value in desired})
+    # Exact frame-index selection avoids an output seek returning a different
+    # frame than the time reported here, including variable-frame-rate video.
+    indices = {0, len(timestamps) - 1}
+    for instant in desired:
+        indices.add(min(range(len(timestamps)), key=lambda index: abs(timestamps[index] - instant)))
+    indices = sorted(indices)
+    return [(index, timestamps[index]) for index in indices], cuts, planned_duration
+
+
+def extract_evidence(video: Path, outdir: Path, *, subshots=None) -> dict:
+    """Extract bounded sampled frames and audio; this is evidence, not a review.
+
+    Legacy two-argument calls retain three samples. A subshot plan samples each
+    planned middle and both sides of planned cuts, plus the actual first/last
+    decoded frames. Three subshots produce at most nine images.
+    """
     video = _local(video)
     metadata = probe(video)
     if not metadata["has_video"] or metadata["duration"] <= 0:
@@ -307,16 +355,27 @@ def extract_evidence(video: Path, outdir: Path) -> dict:
     outdir = Path(outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     duration = metadata["duration"]
-    # Stay a little inside the stream: seeking exactly to duration often gives no frame.
-    times = [0.0, duration / 2, max(0.0, duration - min(0.10, duration / 4))]
+    if subshots is None:
+        # Preserve existing projects' first/middle/near-tail sampling behavior.
+        times = [0.0, duration / 2, max(0.0, duration - min(0.10, duration / 4))]
+        frame_indices = [None] * 3
+        names = ["first", "middle", "tail"]
+    else:
+        samples, planned_cuts, planned_duration = _subshot_frame_samples(video, metadata, subshots)
+        frame_indices = [index for index, _ in samples]
+        times = [instant for _, instant in samples]
+        names = ["first" if index == 0 else f"sample-{index:02}" for index in range(len(times))]
+        names[-1] = "tail"
     frames: list[str] = []
-    for name, instant in zip(("first", "middle", "tail"), times):
+    for name, instant, frame_index in zip(names, times, frame_indices, strict=True):
         target = outdir / f"{name}.png"
-        _ffmpeg([
-            "-protocol_whitelist", "file,pipe", "-i", str(video), "-ss", f"{instant:.6f}",
-            "-frames:v", "1", "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease",
-            "-update", "1", str(target),
-        ])
+        args = ["-protocol_whitelist", "file,pipe", "-i", str(video)]
+        scaling = "scale=1280:1280:force_original_aspect_ratio=decrease"
+        if frame_index is None:
+            args += ["-ss", f"{instant:.6f}", "-vf", scaling]
+        else:
+            args += ["-vf", f"select=eq(n\\,{frame_index})," + scaling]
+        _ffmpeg(args + ["-frames:v", "1", "-update", "1", str(target)])
         if not target.is_file():
             raise MediaError(f"未能提取 {name} 帧；不能把缺失证据当作通过。")
         frames.append(str(target))
@@ -329,11 +388,17 @@ def extract_evidence(video: Path, outdir: Path) -> dict:
             "-c:a", "pcm_s16le", str(audio),
         ])
         audio_path = str(audio)
-    return {
+    result = {
         "frames": frames, "tail_frame": frames[-1], "audio": audio_path,
         "metadata": metadata, "sha256": _sha256(video), "sample_times": times,
         "sampling_note": "仅抽取首、中、尾三个画面；尾帧为片尾附近采样。抽帧不能证明完整动作、口型或声音连续性；音轨须另行听审。",
     }
+    if subshots is not None:
+        result.update(sampling_mode="planned_subshot_samples", planned_duration=planned_duration,
+                      planned_cut_points=planned_cuts, frame_indices=frame_indices,
+                      sampling_note="按计划子镜中点及计划切点前后抽样，并保留实测首帧和最后一帧；时间已截取到实际视频范围。"
+                                    "这些只是计划点采样，不代表已检测或确认实际切镜。抽帧不能证明完整动作、口型或声音连续性；音轨须另行听审。")
+    return result
 
 
 def _srt_time(seconds: float) -> str:

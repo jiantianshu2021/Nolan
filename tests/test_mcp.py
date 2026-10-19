@@ -48,7 +48,7 @@ class MCPTests(unittest.TestCase):
             self.assertEqual(self.initialize(protocol)["result"]["protocolVersion"], protocol)
         self.assertEqual(self.initialize("future")["result"]["protocolVersion"], "2025-06-18")
         tools = self.server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})["result"]["tools"]
-        self.assertEqual(len(tools), 13)
+        self.assertEqual(len(tools), 14)
         self.assertTrue(all(t["inputSchema"]["additionalProperties"] is False for t in tools))
         self.assertEqual(self.server.handle({"jsonrpc": "2.0", "id": 4, "method": "ping"})["result"], {})
         self.assertIsNone(self.server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
@@ -86,13 +86,13 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         responses = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([response["id"] for response in responses], [1, 2])
-        self.assertEqual(len(responses[1]["result"]["tools"]), 13)
+        self.assertEqual(len(responses[1]["result"]["tools"]), 14)
         self.assertEqual(result.stderr, "")
 
     def test_unknown_and_privileged_tools_are_not_exposed(self):
         self.create()
         before = (self.root / "project.json").read_bytes()
-        for name in ("approve", "configure", "reconcile", "shell", "write_file", "increase_budget"):
+        for name in ("approve", "approve_segments", "configure", "reconcile", "shell", "write_file", "increase_budget"):
             self.assertNotIn(name, mcp_server.TOOL_MAP)
             self.assertTrue(self.call(name, project=str(self.root))["isError"])
         self.assertEqual((self.root / "project.json").read_bytes(), before)
@@ -379,6 +379,88 @@ class MCPTests(unittest.TestCase):
             self.value(self.call("correct_captions", project=str(self.root), id="E001", version=7, correction="改一个错字"))
         request.assert_called_once_with(self.root, "E001", 7, "改一个错字")
         self.assertEqual(self.server.workers, {})
+
+    def _synthetic_segment_proposal(self, root, episode_id, groups):
+        with core.transaction(root) as state:
+            episode = core._find(state, "episode", episode_id)
+            episode["segment_proposal"] = {
+                "id": "synthetic-proposal", "status": "candidate",
+                "source_ids": [identity for group in groups for identity in group],
+                "created_at": core.now(), "shots": [], "private": "SYNTHETIC-PRIVATE-PROPOSAL",
+            }
+
+    def test_segment_proposal_opens_review_without_installing_plan_or_generating(self):
+        self.create()
+        self.save_plan()
+        core.set_paused(self.root, True)
+        before = core.load_project(self.root)
+        groups = [["E001-S001", "E001-S002"]]
+
+        def open_saved(root):
+            self.assertEqual(core.load_project(root)["episodes"][0]["segment_proposal"]["status"], "candidate")
+
+        with patch("norlan.regroup.propose_segments", side_effect=self._synthetic_segment_proposal) as propose, \
+             patch.object(self.server, "_open_review", side_effect=open_saved) as review, \
+             patch.object(core, "install_plan") as install, patch.object(pipeline, "run") as run:
+            result = self.value(self.call("propose_segments", project=str(self.root), episode_id="E001", groups=groups))
+        propose.assert_called_once_with(self.root, "E001", groups)
+        review.assert_called_once_with(self.root)
+        install.assert_not_called()
+        run.assert_not_called()
+        proposal = result["episodes"][0]["segment_proposal"]
+        self.assertEqual(proposal["status"], "candidate")
+        self.assertNotIn("SYNTHETIC-PRIVATE-PROPOSAL", json.dumps(result))
+        self.assertIn("用户本人", result["message"])
+        after = core.load_project(self.root)
+        for key in ("assets", "jobs", "budget", "plan"):
+            self.assertEqual(after[key], before[key])
+        self.assertEqual(after["episodes"][0]["shots"], before["episodes"][0]["shots"])
+        self.assertTrue(after["paused"])
+        self.assertEqual(self.server.workers, {})
+
+    def test_segment_proposal_review_failure_preserves_saved_candidate_and_allows_retry(self):
+        self.create()
+        self.save_plan()
+        with patch("norlan.regroup.propose_segments", side_effect=self._synthetic_segment_proposal) as propose, \
+             patch.object(self.server, "_open_review", side_effect=RuntimeError("SYNTHETIC-PRIVATE-ERROR")):
+            result = self.value(self.call("propose_segments", project=str(self.root), episode_id="E001",
+                                          groups=[["E001-S001"], ["E001-S002"]]))
+        self.assertEqual(propose.call_count, 1)
+        self.assertEqual(result["episodes"][0]["segment_proposal"]["status"], "candidate")
+        self.assertEqual(result["review_error"], mcp_server.REVIEW_ERROR_MESSAGE)
+        self.assertIn("open_review", result["operator_actions"]["review_retry"])
+        self.assertIsNone(result["background"]["error"])
+        self.assertNotIn("SYNTHETIC-PRIVATE-ERROR", json.dumps(result))
+
+    def test_invalid_segment_proposal_does_not_open_browser_or_bypass_core_gate(self):
+        self.create()
+        before = (self.root / "project.json").read_bytes()
+        with patch("norlan.regroup.propose_segments", side_effect=core.GateError("尚有调用在执行")) as propose, \
+             patch.object(self.server, "_open_review") as review:
+            result = self.call("propose_segments", project=str(self.root), episode_id="E001", groups=[["S1", "S2"]])
+            self.assertTrue(result["isError"])
+            self.assertEqual(propose.call_count, 1)
+            for groups in ([], [[]], [["S1", "S2", "S3", "S4"]], ["S1"], [["../secret"]]):
+                self.assertTrue(self.call("propose_segments", project=str(self.root), episode_id="E001", groups=groups)["isError"])
+            self.assertEqual(propose.call_count, 1)
+            review.assert_not_called()
+        self.assertEqual((self.root / "project.json").read_bytes(), before)
+
+    def test_pending_segment_proposal_cannot_be_resumed_or_generated_by_model(self):
+        self.create()
+        self.save_plan()
+        core.set_paused(self.root, True)
+        self._synthetic_segment_proposal(self.root, "E001", [["E001-S001", "E001-S002"]])
+        before = (self.root / "project.json").read_bytes()
+        with patch.object(core, "set_paused") as pause, patch.object(pipeline, "run") as run:
+            result = self.call("run_production", project=str(self.root))
+            self.assertTrue(result["isError"])
+            self.assertIn("open_review", result["content"][0]["text"])
+            pause.assert_not_called()
+            run.assert_not_called()
+        self.assertEqual(self.server.workers, {})
+        self.assertEqual((self.root / "project.json").read_bytes(), before)
+        self.assertTrue(core.load_project(self.root)["paused"])
 
     def test_background_run_returns_once_pause_and_close_preserve_project(self):
         self.create()

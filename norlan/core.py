@@ -29,7 +29,7 @@ _PLAN_ERRORS = {
     "ratio_invalid": ("不支持的画面比例。", "ratio 使用 16:9、9:16、1:1、4:3、3:4 或 21:9。"),
     "assets_required": ("规划必须包含资产。", "assets 使用非空资产列表。"),
     "episodes_required": ("规划必须包含分集。", "episodes 使用非空分集列表。"),
-    "too_many_items": ("一次规划的条目过多。", "每次最多 200 个资产、100 集，每集最多 100 个镜头；请拆分规划。"),
+    "too_many_items": ("一次规划的条目过多。", "每次最多 200 个资产、100 集，每集最多 100 个生成片段；请拆分规划。"),
     "item_type": ("规划条目必须为对象。", "使用符合工具 schema 的对象。"),
     "id_invalid": ("规划 ID 不合法或重复。", "ID 必须全局唯一，使用 1–64 位字母、数字、下划线或连字符，并以字母或数字开头。"),
     "asset_kind_invalid": ("资产类型不合法。", "kind 使用 character、location、prop 或 voice。"),
@@ -38,12 +38,13 @@ _PLAN_ERRORS = {
     "nonvoice_character_forbidden": ("非声音资产不能绑定 character_id。", "仅 voice 填写 character_id；其他资产省略此字段或填空字符串，角色自身也不例外。"),
     "voice_selection_invalid": ("试音选句或来源不符合要求。", "为 voice 填写原文连续台词 audition_text、选句依据 audition_reason 和含说话人归属的原文摘录 audition_source。无合适句时 text/source 留空并在 reason 说明；非 voice 填空。"),
     "episode_title_required": ("每集必须包含标题。", "填写非空字符串 title。"),
-    "shots_required": ("每集必须包含分镜。", "shots 使用非空分镜列表。"),
-    "duration_invalid": ("单镜时长必须为 4–15 秒整数。", "duration 填写 4 至 15 的整数秒数。"),
-    "shot_prompt_required": ("分镜缺少提示词。", "prompt 填写非空字符串。"),
-    "asset_references_invalid": ("分镜引用的资产不存在、重复或格式不正确。", "asset_ids 使用非空列表，只引用 assets 中已定义的 ID，且不能重复。"),
-    "scene_required": ("分镜缺少 scene_id。", "填写 scene_id，以维护空间与剪辑连续性。"),
-    "voice_character_not_referenced": ("镜头引用声音时缺少其绑定角色。", "在本镜 asset_ids 中加入该 voice 的 character_id。若声音来自画外，在 prompt 中明确该角色仅作为声源、不出现在画面中。"),
+    "shots_required": ("每集必须包含生成片段。", "shots 使用非空生成片段列表，每项对应一条视频 API 任务。"),
+    "duration_invalid": ("生成片段时长必须为 4–15 秒整数。", "duration 填写 4 至 15 的整数秒数；默认优先 10–15 秒。"),
+    "shot_prompt_required": ("生成片段缺少提示词。", "prompt 填写非空字符串。"),
+    "subshots_invalid": ("生成片段的内部镜头时间表不合法。", "subshots 可省略；若提供须为1–3项，每项仅含有限数字 start/end 和非空 prompt（最多2000字）；从0秒连续覆盖 duration，不得留空、间隙或重叠。"),
+    "asset_references_invalid": ("生成片段引用的资产不存在、重复或格式不正确。", "asset_ids 使用非空列表，只引用 assets 中已定义的 ID，须包含内部镜头需要的全部实际参考，且不能重复。"),
+    "scene_required": ("生成片段缺少 scene_id。", "填写 scene_id，以维护空间与剪辑连续性。"),
+    "voice_character_not_referenced": ("生成片段引用声音时缺少其绑定角色。", "在本生成片段 asset_ids 中加入该 voice 的 character_id。若声音来自画外，在 prompt 中明确该角色仅作为声源、不出现在画面中。"),
 }
 
 
@@ -259,6 +260,11 @@ def validate_plan(plan):
                 raise PlanValidationError("duration_invalid", path + ".duration")
             if not isinstance(shot.get("prompt"), str) or not shot["prompt"].strip():
                 raise PlanValidationError("shot_prompt_required", path + ".prompt")
+            from .segments import validate_subshots
+            try:
+                validate_subshots(shot)
+            except ValueError:
+                raise PlanValidationError("subshots_invalid", path + ".subshots") from None
             refs = shot.get("asset_ids")
             if (not isinstance(refs, list) or not refs
                     or not all(isinstance(ref, str) for ref in refs)

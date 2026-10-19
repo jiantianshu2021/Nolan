@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from .regroup import PUBLIC_ERRORS as SEGMENT_ERRORS
+
 
 MAX_BODY = 32_768
 MAX_REFERENCE_BODY = 12 * 1024 * 1024
@@ -32,6 +34,7 @@ INPUT_ERRORS = frozenset({
     "请填写资产描述，或提供至少一张参考图片。",
     "资产输入已更新，请刷新网页后重新确认。",
     "尚有在途或结果不明的调用，请等待落盘或完成对账后再修改资产输入。",
+    "请先批准新的分段方案，或选择保留原分段，再继续制作。",
 })
 MEDIA_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".m4v", ".mov", ".webm", ".wav", ".mp3", ".m4a", ".ogg", ".srt", ".vtt"})
 
@@ -260,9 +263,21 @@ def public_state(state: dict) -> dict:
         item["has_subtitles"] = bool(episode.get("render_manifest", {}).get("subtitles"))
         item["progress"] = episode_progress(state, episode, now=stamp)
         item["rough_cuts"] = _public_rough_cuts(episode)
+        proposal = episode.get("segment_proposal")
+        if isinstance(proposal, dict) and proposal.get("status") == "candidate":
+            item["segment_proposal"] = _pick(proposal, ("id", "status", "source_ids", "created_at"))
+            item["segment_proposal"]["shots"] = []
+            for proposed in proposal.get("shots", []):
+                entry = _pick(proposed, ("id", "duration", "prompt", "dialogue", "source_shot_ids"))
+                if isinstance(proposed.get("subshots"), list):
+                    entry["subshots"] = [_pick(part, ("start", "end", "prompt")) for part in proposed["subshots"]]
+                item["segment_proposal"]["shots"].append(entry)
         item["shots"] = []
         for shot in episode.get("shots", []):
             entry = _pick(shot, ("id", "status", "file", "prompt", "duration", "review"))
+            if isinstance(shot.get("subshots"), list):
+                entry["subshots"] = [_pick(part, ("start", "end", "prompt"))
+                                     for part in shot["subshots"] if isinstance(part, dict)]
             entry["version"] = _version(shot.get("version"))
             if not _current_shot_artifact(shot):
                 entry.pop("file", None)
@@ -390,6 +405,11 @@ class _Context:
         with self.lock:
             if self.running:
                 return False
+            state = _core().load_project(self.project_dir)
+            if any(isinstance(episode.get("segment_proposal"), dict)
+                   and episode["segment_proposal"].get("status") == "candidate"
+                   for episode in state.get("episodes", [])):
+                raise ValueError("请先批准新的分段方案，或选择保留原分段，再继续制作。")
             self.running = True
             self.worker_error = None
         try:
@@ -572,6 +592,15 @@ class _Handler(BaseHTTPRequestHandler):
                         raise ValueError
                     _core().set_remaining_asset_inputs_gpt(context.project_dir, version)
                     return self._json(200, context.state())
+                if action == "segment_plan":
+                    from .regroup import decide_segments
+                    item_id, proposal_id, approve = data.get("id"), data.get("proposal_id"), data.get("approve")
+                    if (not isinstance(item_id, str) or not 0 < len(item_id) <= 64
+                            or not isinstance(proposal_id, str) or not 0 < len(proposal_id) <= 64
+                            or type(approve) is not bool):
+                        raise ValueError
+                    decide_segments(context.project_dir, item_id, proposal_id, approve)
+                    return self._json(200, context.state())
                 if action == "sync_costs":
                     if not context.launch_cost_sync():
                         return self._error(409, "费用正在同步，请稍候，无需重复启动。")
@@ -609,7 +638,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, context.state())
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             message = str(exc)
-            self._error(409, message if message in INPUT_ERRORS else "状态已变化或参数无效，请刷新后重试。")
+            self._error(409, message if message in INPUT_ERRORS or message in SEGMENT_ERRORS else "状态已变化或参数无效，请刷新后重试。")
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception:
