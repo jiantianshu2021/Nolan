@@ -36,6 +36,7 @@ def draft():
     shot = source()
     return {"prompt": "保持15秒与第5秒摄影切点。楚阳0–1.3秒问原句，系统界面1.5秒出现，女声跨第5秒切镜连续读至14.8秒。",
             "dialogue": shot["dialogue"], "continuity_notes": "声音/UI安排仅为待审草稿，尚未执行。",
+            "broadcast_proposal": None,
             "timing_proposal": {
                 "summary": "保留摄影切点与动作，界面和播报1.5秒开始，连续至14.8秒；最终提示词待人工确认。",
                 "subshots": [{"start": 0, "end": 5, "prompt": "中景，楚阳放下工具并问原句；系统界面1.5秒出现且女声开始，声音跨切镜继续。"},

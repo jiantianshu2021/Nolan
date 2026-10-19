@@ -145,6 +145,15 @@ TIMING_PROPOSAL_SCHEMA = _object({
 # old saved/fake three-field responses without rewriting their returned shape.
 REFINE_SCHEMA["properties"]["timing_proposal"] = {"anyOf": [TIMING_PROPOSAL_SCHEMA, {"type": "null"}]}
 REFINE_SCHEMA["required"].append("timing_proposal")
+BROADCAST_PROPOSAL_SCHEMA = _object({
+    "speaker": {"type": "string", "minLength": 1, "maxLength": 60},
+    "source_text": {"type": "string", "minLength": 1, "maxLength": 12000},
+    "spoken_text": {"type": "string", "minLength": 1, "maxLength": 12000},
+    "display_text": {"type": "string", "minLength": 1, "maxLength": 12000},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+})
+REFINE_SCHEMA["properties"]["broadcast_proposal"] = {"anyOf": [BROADCAST_PROPOSAL_SCHEMA, {"type": "null"}]}
+REFINE_SCHEMA["required"].append("broadcast_proposal")
 AUDITION_SCHEMA = _object({"audition_text": STRING, "audition_reason": STRING, "audition_source": STRING})
 REVISION_ASSET_SCHEMA = _object({**ASSET_SCHEMA["properties"],
                                  "voice_only": {"type": "boolean"}, "audition_speaker": STRING})
@@ -303,9 +312,32 @@ CROSS_SHOT_AUDIO_RULES = (
     "用户已有明确的具体声音/UI时点要求时优先遵守；存在明确禁止变动的要求也须遵守。"
     "始终等待用户点击确认提示词后才提交一次视频；最终候选确认是执行许可，不增加要求用户先确认秒点的关卡。"
     "仅当整个片段在正常语速和合理停顿下确实放不下，或必须改变总时长、摄影切点、动作/对白内容、资产时才报告真实阻塞。"
-    "不能加速、截断、重写或删除台词消除冲突；不能仅因旧子镜声音窗口过短或一句话跨摄影切点就判整段不可容纳。"
+    "不能加速、截断、重写或删除台词消除冲突；已明确授权的系统播报关键内容选摘按专项规则处理，其他角色对白不变。"
+    "不能仅因旧子镜声音窗口过短或一句话跨摄影切点就判整段不可容纳。"
     "收到新的人工补充意见后重新评估，旧阻塞报告不是永久规则。"
 )
+
+SYSTEM_BROADCAST_EDITORIAL_RULES = (
+    "context.audio_policy.system_broadcast.editorial_mode=key_points 且 enabled=true 时，"
+    "用户已授权 GPT 决定系统播报内容取舍及声音/UI时间安排。此专项规则覆盖旧提示词、旧声音政策中要求系统通知全文逐字朗读的文字。"
+    "系统/任务框出现时复用同一已批准画外声线，只播对当前动作、任务触发、关键结果或奖励不可缺少的短句；"
+    "优先一条简短提示，通常约2–5秒，按实际剧情与正常语速判断，不强设秒数门槛，也不强行占满片段。"
+    "从本段原系统文字中选取关键原句或忠实压缩为自然短句；不得增加信息、改变数字、否定、条件、奖励与因果关系。"
+    "其余完整详细规则原文保留在剧情内的系统界面上，并规划足够阅读时间；这是剧情内界面文字，不是另加对白字幕。"
+    "人物原对白逐字保持、说话人不变，不能把人物对白交给系统声线，也不能把试音台词加进剧情。"
+    "内容取舍和起止时点由 GPT 先拟为未批准草稿，不为常规选句、跨镜或具体秒数增加人工选择步骤；"
+    "全部实际将读出的台词、保留在界面的详细规则和时间安排必须进入完整最终提示词，仍等用户确认后才提交一次视频。"
+    "此规则适用于后续尚未生成片段；不修改已生成成片或其审批，不因更新规则自动重做视频。"
+)
+
+
+def _editorial_audio_policy_context(context, source_context=None):
+    """Project the effective policy, without retaining contradictory old prose."""
+    from .broadcast import policy_for
+    projected = copy.deepcopy(context)
+    if isinstance(projected.get("audio_policy"), dict) and "system_broadcast" in projected["audio_policy"]:
+        projected["audio_policy"]["system_broadcast"] = policy_for(source_context if source_context is not None else context)
+    return projected
 
 
 def _task_fields(record, fields):
@@ -524,7 +556,7 @@ def revision_task_context(shot, context):
     summary["episodes"] = selected_episodes
     if "previous_actual" in context:
         summary["previous_actual"] = _previous_actual_task(context["previous_actual"])
-    return summary
+    return _editorial_audio_policy_context(summary, context)
 
 
 def refinement_task_context(shot, context):
@@ -538,7 +570,7 @@ def refinement_task_context(shot, context):
         summary["assets"] = _selected_assets(shot, _context_records(context, "assets"))
     if "previous_actual" in context:
         summary["previous_actual"] = _previous_actual_task(context["previous_actual"])
-    return summary
+    return _editorial_audio_policy_context(summary, context)
 
 
 def review_task_context(context):
@@ -582,10 +614,10 @@ class Brain:
             raise BrainError("本次 GPT 任务上下文超过本地输入上限；请求尚未提交。需要精简任务上下文或分批规划，不能静默截断原文。")
         result = self._codex(user, schema, images) if self.provider == "codex" else self._openai(user, schema, images)
         # Older transports/fixtures can return the original three refine
-        # fields. The wire schema requires nullable timing metadata for new
+        # fields. The wire schema requires nullable proposal metadata for new
         # models, while local compatibility must not invent an adjustment.
-        checked = ({**result, "timing_proposal": None}
-                   if schema is REFINE_SCHEMA and isinstance(result, dict) and "timing_proposal" not in result else result)
+        checked = ({"timing_proposal": None, "broadcast_proposal": None, **result}
+                   if schema is REFINE_SCHEMA and isinstance(result, dict) else result)
         _validate(checked, schema)
         return result
 
@@ -689,7 +721,10 @@ voice.audition_speaker 填原文实际归属，如“系统”，非 voice 为�
 分镜引用 voice 时必须同时引用其绑定的 character ID。
 画风以漫画/动画为主，禁止在角色形象提示词里强行使用真人摄影风格。
 镜头 prompt 写构图、人物站位、左右方向、光线、动作起止、运镜、精确对白、环境声；不内嵌字幕、不生成配乐。
-对白能在时长内自然说完。continuity_notes 写轴线/视线/道具/情绪/动作承接。
+系统任务框属于剧情内可见界面，不属于额外对白字幕：其详细规则原文完整保留在 prompt/subshots 的画面要求中。
+初始规划的 dialogue 保留完整原系统内容，供本地绑定来源；不要先删掉详细规则。最终细化时按系统播报规则选择关键短句，完整详细规则仍须留在界面。
+{SYSTEM_BROADCAST_EDITORIAL_RULES}
+人物对白及系统必要短播应能在时长内自然说完；canonical完整系统文字是细化来源，不代表必须全文朗读。continuity_notes 写轴线/视线/道具/情绪/动作承接。
 每集 music_prompt 单独写无歌词配乐的情绪、乐器、节拍、起承转折与淡入淡出，音乐最终统一混合。
 可见人物、场景、声音等实际资产只提出待审批候选，不得宣称已批准；内部画外声源由后台登记，不单独请求审批。输出完整计划。""", {"novel": novel}, PLAN_SCHEMA)
         return validate_plan(result)
@@ -754,21 +789,23 @@ shot_updates 仅使用 {{id,add_asset_ids,prompt,dialogue,continuity_notes}}，�
 严格保留全部片段 duration、scene_id、subshots 的数量、顺序、start/end 和既有画面动作；不得通过输出字段偷偷改动摄影时间表。
 旧子镜中声音/UI的起止文字可在同段内提出合理替代草稿，以便完整自然播报，摄影切点与动作因果不变。
 {CROSS_SHOT_AUDIO_RULES}
+{SYSTEM_BROADCAST_EDITORIAL_RULES}
 以最新明确的人工意见为准；旧 revision_analysis 或其历史只是先前诊断，不是新的人工要求，
 不能把已采用资产方案中的历史反馈再次当作新增资产授权，也不能把“增强科技感”推断为同意提前播音已经执行；同段内合理草稿仍可先准备待审。
 新规划每集约60秒的默认值不适用于本次返修，不能据此重新分集、改变已批准的整集总时长或压缩对白；
 例如已经批准的130秒第一集继续保持130秒，新增声音或资产不能成为裁短旧集、删剧情或加速台词的理由。
-prompt 写清新声源仅画外、具体逐字播报内容及其在既有动作中的位置，去掉旧 prompt 中“系统无配音/不念任务框”等与用户要求相冲突的限制。
+prompt 写清新声源仅画外、系统原文与其在既有动作中的位置，去掉旧 prompt 中“系统无配音/不念任务框”等与用户要求相冲突的限制。
 continuity_notes 注明新播报规则覆盖旧内部镜头里相冲突的无配音文字，但原切点和动作不变。
-只有用户明确要求才修改或添加对白；非目标角色原对白逐字保留，不能为省时删减、改写或加速。
-将系统框文字变为播报时，dialogue 中明确写“系统播报员：逐字内容”，与主角对白分别标明归属。
+非目标角色原对白逐字保留，不能为省时删减、改写或加速；系统短播的内容取舍按以上项目专项规则由 GPT 决定，无须再次征求逐句/秒数选择。
+将系统框文字变为播报时，canonical dialogue 中明确写“系统播报员：完整原文”，与主角对白分别标明归属；
+完整系统来源保留到最终细化，由 broadcast_proposal 选择短播、保留完整界面规则，不能在返修规划中先丢掉系统来源。
 按正常语速约每秒4个汉字并留标点停顿，核对实际声音起止时窗和整段时长；不能因一句话跨摄影切点就认定超时。
 同一批准试音原句的已知实测时长可辅助排布，不能把估算当作实测，也不能把裁短的声音参考长度当作完整台词时长。
 旧子镜声音时窗不足时先评估本生成片段的全部可用时长，合理安排跨切镜播报并提出草稿；无需用户先填秒点。
-若可在既定总时长、切点、动作及对白不变下容纳，blockers=[]，summary说明将准备含明确声音/UI时窗的未批准提示词，等待最终提示词确认。
-只有整个片段确实无法容纳或须改变上述固定内容/新增资产时，blockers才说明真实冲突；不能擅自延长或截断。
+若人物原对白与选定的必要系统短播可在既定总时长、切点和动作不变下容纳，blockers=[]，summary说明将准备含明确声音/UI时窗的未批准提示词，等待最终提示词确认。
+只有人物原对白及必要系统信息在整个片段确实无法容纳或须改变上述固定内容时，blockers才说明真实冲突；不能因系统来源全文较长就判必须人工改句或确认秒点，也不能擅自延长或截断。
 未来每次系统框/任务框弹出都播报的明确要求，写入 audio_policy.system_broadcast：enabled=true、character_id、voice_id、instruction，
-instruction 说明复用同一已审批声线、逐字播本次原文系统内容、画外播报、保持其他对白、无配乐和不额外生成字幕。
+instruction 说明复用同一已审批声线、仅画外短播关键内容、详细规则原文留在系统界面、GPT决定内容及时间、保持人物对白、无配乐和不额外生成对白字幕。
 为尚未生成且出现该系统框的后续片段添加同一逻辑声源和 voice 引用、具体内容；不能把所有无系统框的片段都塞入播报。
 已有 audio_policy 未被用户要求修改时原样保留；尚未设置且本次无相关要求时 enabled=false，其余三字段空字符串。
 summary 简洁说明新增或复用什么；新增/变更资产时先回到资产人工确认再返修，已批准资产的复用及声音/UI草稿不增加独立审批步骤。
@@ -860,9 +897,29 @@ blockers=[] 表示没有已知规划阻塞，不表示批准。needs_assets 必�
                 raise BrainError("返修片段提示词不能为空。")
             referenced.update(refs)
             if update["dialogue"] != original.get("dialogue", ""):
-                # The model checks individual subshot capacity; this catches an
-                # obviously impossible total without changing approved timing.
-                spoken = re.sub(r"(?:^|\n)[^：:\n]{1,30}[：:]", "", update["dialogue"])
+                # Canonical system text is a source, not a commitment to read
+                # all of it. Its exact brief delivery is drafted at refinement.
+                # Character dialogue still gets the conservative capacity test.
+                from .broadcast import policy_for
+                capacity_policy = result.get("audio_policy", {})
+                proposed_broadcast = capacity_policy.get("system_broadcast", {})
+                if (proposed_broadcast.get("enabled") is False
+                        and not any(proposed_broadcast.get(key) for key in ("character_id", "voice_id", "instruction"))):
+                    # A no-change response can leave the nullable-style policy
+                    # placeholder empty. The established project voice remains
+                    # the relevant delivery rule for this local capacity test.
+                    capacity_policy = context.get("audio_policy") or capacity_policy
+                candidate_policy = policy_for({"audio_policy": capacity_policy,
+                                               "assets": list(all_assets.values())})
+                system_labels = (set(candidate_policy.get("speaker_labels", []))
+                                 if candidate_policy.get("enabled") is True
+                                 and candidate_policy.get("voice_id") in combined else set())
+                lines = []
+                for line in update["dialogue"].splitlines():
+                    label = re.match(r"\s*([^：:\n]{1,60})[：:]", line)
+                    if not label or label.group(1).strip() not in system_labels:
+                        lines.append(line)
+                spoken = re.sub(r"(?:^|\n)[^：:\n]{1,60}[：:]", "", "\n".join(lines))
                 units = sum(2 if token[0].isascii() and token[0].isalpha() else len(token)
                             for token in re.findall(r"[\u3400-\u9fff]|[A-Za-z]+(?:'[A-Za-z]+)?|\d+", spoken))
                 seconds = units / 4 + len(re.findall(r"[，,。；;！？!?…]", spoken)) * .25 + .5
@@ -934,6 +991,7 @@ shot 是一次视频 API 任务，subshots 是其内部镜头时间表。保持 
 不得自行新增、删去、合并镜头或改变切点；按原时间表逐段写景别、运镜、人物方位、动作起止及衔接，输出 prompt 中保留原时间标记。
 返工意见若要求改变既定摄影切点或片段总时长，应留待修改规划，不能在细化提示词时偷偷更改。
 {CROSS_SHOT_AUDIO_RULES}
+{SYSTEM_BROADCAST_EDITORIAL_RULES}
 新规划每集约60秒的默认值不适用于本次细化；已批准的整集总时长、片段时长和切点保持原样。
 例如已经批准的130秒第一集继续保持130秒，不重新分集、不裁短、不删剧情，也不加速或压缩原对白来凑一分钟。
 旧项目没有 subshots 时保留原单段结构，不擅自拆镜或增加任务。一次人工返工仅生成一个新版本，之后重新等待人工审批。
@@ -953,7 +1011,7 @@ accepted_deviations 保留该版本原报告的疑点，用户接受版本不等
 不要把疑点当成必须纠正的事实。已人工通过的实际前段是连续性基准，即使旧 GPT 报告曾判 fail。
 在该接续范围内保留已接受的摆位、朝向等实际状态，不擅自纠正，也不把原有已接受偏差重新列为必须修复项。
 没有人工接受证据时不能自行推定已批准；未被接受的失败候选不得取代当前参考。用户明确提出新的修改要求时再按意见调整。
-尊重用户返工意见，只有意见明确要求时才改对白；无意见时保留原文。不要增加人物、剧情、预算或时长。
+尊重用户返工意见，人物对白无明确修改要求时保留原文；已启用系统关键内容播报时，系统声音按专项规则选句，完整规则保留画面。不要增加人物、剧情、预算或时长。
 提示词只能描述本次整段生成目标，不能假定已有局部编辑、遮罩修补、精确文字排版或纸面透视跟踪工具。
 若问题适合后期处理但上下文没有可执行工具，应说明“建议另行后期处理，尚未执行”，不能把这类操作写成已落实的修复能力。
 后期建议写入 continuity_notes；prompt 只包含本次生成能够直接尝试实现的画面与声音目标。
@@ -963,25 +1021,35 @@ context.audio_policy.system_broadcast.enabled=true 时，系统/任务框按项�
 旧 subshots 中相冲突的声音禁令已被新规则覆盖，不能借保持原时间表再次取消播报。切点、动作和时长仍保持不变。
 voice_only=true 的 character 是后台内部画外声源，不出镜、没有形象参考，也不要求生成或上传人物图；
 内部登记不是独立资产候选或人工批准，用户只需选择、试听和审批对应真正的 voice 声音。
-把原文系统文字播报与另行生成字幕区分：不生成额外画面字幕不等于禁止读出剧情中系统/任务框内容。
+把原文系统文字播报与另行生成字幕区分：不生成额外画面字幕不等于禁止读出剧情中系统/任务框内容，也不禁止保留剧情内完整规则界面。
 本段确有系统框且已在资产引用中包含 policy.voice_id 时，按 audio_references 的真实编号使用该声线，
-逐字保留 shot.dialogue 里批准的播报内容及归属；不把其他角色台词交给播报员，不加未规划播报，不省略原角色对白。
+按关键播报规则选择本段系统原文中的重要信息，保留系统说话归属；不把其他角色台词交给播报员，不加未规划播报，不省略原角色对白。
+若 policy.enabled 不是 true 或 editorial_mode 不是 key_points，broadcast_proposal=null，dialogue保持原文。
+短播必须输出 broadcast_proposal={{speaker,source_text,spoken_text,display_text,summary}}：speaker逐字对应shot.dialogue原系统说话人标签，
+只能选 policy.speaker_labels 中已绑定到批准声音的说话人，不凭“系统”两个字推断任意人物都可改写；没有实际匹配时不要猜。
+source_text 是该系统说话人全部原文，逐字完整保留；display_text 必须与 source_text 完全相同，完整详细规则在剧情内系统界面可见。
+spoken_text 是依据同一来源选择或忠实压缩的关键短播，不编造规则或数字；dialogue仅将该系统说话人的原文替换为spoken_text，其他说话人的对白逐字不变。
+summary 简述为什么只读这些信息、哪些细则留在界面、为动作/反应留下多少空间；不能宣称已经人工批准、已生成或已听过。
+prompt 与 proposal.subshots 明确逐字写出实际短播及全部display_text，标记界面为剧情内系统规则展示，不把全文再次写成声音要求。
 若旧子镜声音窗口过短，先在整个生成片段内合理安排声音/UI起止并跨切镜连续播报；这属于待审草稿，不要求用户先亲自填秒点。
-只有整个生成片段确实无法容纳，或须改变原时长、摄影切点、动作/对白内容或资产，才在 continuity_notes 说明真实冲突；不擅自加速或截断。
+先选必要短播并为人物对白、动作和反应留出空间，不能先把系统全文固定为声音再以超时要求人工删句或确认秒数。
+只有人物对白及必要系统信息在整个生成片段确实无法容纳，或须改变原时长、摄影切点、动作或资产，才在 continuity_notes 说明真实冲突；不擅自加速或截断。
 整段对白按时间表连续进行，切镜不重说台词、不重做已经完成的动作；同场景环境底声连续，动作音效只触发一次。
 需要调整声音/UI安排时，输出 timing_proposal={{subshots:[{{start,end,prompt}}],summary,audio_windows:[{{start,end,speaker,text}}]}}。
 proposal.subshots必须逐项保持原shot.subshots的数量、顺序和start/end，完整保留原画面动作与摄影内容；
-仅调整声音/UI时窗、跨镜连续播报及相冲突的旧声音文字，不能改台词、切点、动作因果或新增资产。
+仅调整声音/UI时窗、跨镜连续播报及相冲突的旧声音文字；系统选句须同时由broadcast_proposal说明，不能改其他角色台词、切点、动作因果或新增资产。
 summary具体说明草稿如何安排、余量和为何替代旧声音/UI时点，明确尚待最终提示词审批，不能声称已执行。
-audio_windows列出本段全部原对白，不只列改动部分；speaker逐字对应shot.dialogue的说话人标记，text逐字保留完整台词，
-每个窗口0<=start<end<=本段duration，同说话人的分窗按时序拼接必须与其原对白完全相同，不能漏字、重复或替换说话人。
+audio_windows列出本段全部原对白，系统短播时改为列出本次dialogue的全部实际声音，不只列改动部分；speaker逐字对应shot.dialogue的说话人标记，text逐字保留本次台词，
+每个窗口0<=start<end<=本段duration，同说话人的分窗按时序拼接必须与本次dialogue完全相同，不能漏字、重复或替换说话人。
 声音窗口可以跨越摄影切点；保持自然语速与停顿，不让系统声盖过人物对白，不把试音原句自动加进剧情。
-prompt及proposal.subshots同步使用同一声音/UI安排，不能一处提前、另一处仍要求原来的5秒才开始；dialogue保持原文。
-没有此类调整或旧项目无subshots时timing_proposal=null，不擅自增设镜头。
-不生成字幕、不生成配乐，配乐在整集后期连续编排，不在切镜或分段处重播。输出 prompt、dialogue、continuity_notes、timing_proposal。""",
+prompt及proposal.subshots同步使用同一声音/UI安排，不能一处提前、另一处仍要求原来的5秒才开始；除授权的系统短播外dialogue保持原文。
+原shot有subshots且broadcast_proposal非null时必须提供timing_proposal，即使摄影切点无变化也要同步完整声音/UI安排。
+没有此类调整或旧项目无subshots时timing_proposal=null，不擅自增设镜头；旧项目短播仍在prompt中明确声音/UI时窗和完整显示规则。
+不生成额外对白字幕、不生成配乐，配乐在整集后期连续编排，不在切镜或分段处重播。输出 prompt、dialogue、continuity_notes、timing_proposal、broadcast_proposal。""",
                           {"shot": _model_shot(shot), "context": refinement_task_context(shot, context)}, REFINE_SCHEMA, images)
         from . import core, prompt_gate
         try:
+            prompt_gate.validate_broadcast_proposal(shot, result, context)
             prompt_gate.validate_timing_proposal(shot, result)
         except core.GateError as exc:
             raise BrainError(str(exc)) from None

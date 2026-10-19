@@ -217,6 +217,22 @@ def _public_shot_continuity(state, episode, shot):
     return result
 
 
+def _public_broadcast_proposal(value, shot):
+    """Expose the validated editorial choice, never model/request internals."""
+    if not isinstance(value, dict) or not isinstance(shot, dict):
+        return None
+    proposal = value.get("broadcast_proposal")
+    if not isinstance(proposal, dict):
+        return None
+    safe = _pick(proposal, ("speaker", "source_text", "spoken_text", "display_text", "summary"))
+    from .prompt_gate import validate_broadcast_proposal
+    try:
+        return validate_broadcast_proposal(shot, {"dialogue": value.get("dialogue"),
+            "broadcast_proposal": safe, "timing_proposal": value.get("timing_proposal")})
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return None
+
+
 def _public_timing_proposal(value, shot):
     """Project the candidate schedule without exposing its request internals."""
     if not isinstance(value, dict) or not isinstance(shot, dict):
@@ -234,7 +250,11 @@ def _public_timing_proposal(value, shot):
         safe[key] = [_pick(row, fields) for row in rows]
     from .prompt_gate import validate_timing_proposal
     try:
-        return validate_timing_proposal(shot, {"dialogue": value.get("dialogue"), "timing_proposal": safe})
+        broadcast = _public_broadcast_proposal(value, shot)
+        if value.get("broadcast_proposal") is not None and broadcast is None:
+            return None
+        return validate_timing_proposal(shot, {"dialogue": value.get("dialogue"),
+            "timing_proposal": safe, "broadcast_proposal": broadcast})
     except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
         return None
 
@@ -244,6 +264,8 @@ def _public_prompt_candidate(value, shot=None):
     if not isinstance(value, dict):
         return None
     result = _pick(value, ("id", "version", "revision", "prompt", "dialogue", "continuity_notes", "request_hash", "duration"))
+    if "broadcast_proposal" in value:
+        result["broadcast_proposal"] = _public_broadcast_proposal(value, shot)
     if "timing_proposal" in value:
         result["timing_proposal"] = _public_timing_proposal(value, shot)
     manifest = value.get("reference_manifest")

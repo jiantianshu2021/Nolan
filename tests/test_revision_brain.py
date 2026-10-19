@@ -135,10 +135,36 @@ class RevisionBrainTests(unittest.TestCase):
         result, _ = self.call(response)
         self.assertIn("先人工补充", " ".join(result["blockers"]))
 
-    def test_impossible_spoken_duration_blocks_instead_of_truncating_or_extending(self):
+    def test_full_system_source_is_kept_for_refinement_without_assuming_full_read_duration(self):
         result, _ = self.call(target=shot(duration=4))
-        self.assertIn("超过既定 4 秒", " ".join(result["blockers"]))
+        self.assertEqual(result["blockers"], [])
         self.assertEqual(result["shot_updates"][0]["dialogue"], "系统播报员：" + SYSTEM_TEXT)
+
+    def test_impossible_character_dialogue_still_blocks_instead_of_being_cut(self):
+        response = revision()
+        long_line = "这是角色必须完整说出的原句，不能因为系统采用简播就删掉角色自己的任何对白。"
+        response["shot_updates"][0]["dialogue"] = "测试角色：" + long_line + "\n系统播报员：" + SYSTEM_TEXT
+        result, _ = self.call(response, target=shot(duration=4))
+        self.assertIn("超过既定 4 秒", " ".join(result["blockers"]))
+        self.assertIn(long_line, result["shot_updates"][0]["dialogue"])
+
+    def test_existing_system_policy_is_used_for_capacity_when_no_change_response_is_empty(self):
+        response, data = revision(), context()
+        data["assets"].extend(copy.deepcopy(response["additions"]))
+        data["audio_policy"] = copy.deepcopy(response["audio_policy"])
+        target = shot(duration=4, asset_ids=["hero", "room", "announcer", "system_voice"])
+        data["episodes"][0]["shots"][0] = target
+        response.update(needs_assets=False, additions=[])
+        response["audio_policy"] = {"system_broadcast": {"enabled": False, "character_id": "", "voice_id": "", "instruction": ""}}
+        for line, expects_blocker in (("系统播报员：" + SYSTEM_TEXT, False),
+                                      ("测试角色：" + "人物对白必须完整保留，不得借用系统简播规则删减。" * 3 + "\n系统播报员：" + SYSTEM_TEXT, True)):
+            with self.subTest(expects_blocker=expects_blocker):
+                output = copy.deepcopy(response)
+                output["shot_updates"][0]["dialogue"] = line
+                result, _ = self.call(output, target=target, data=data, feedback="保持原声线，系统短播由GPT安排。")
+                self.assertEqual(bool(result["blockers"]), expects_blocker)
+                self.assertEqual(result["shot_updates"][0]["dialogue"], line)
+                self.assertEqual(result["audio_policy"], response["audio_policy"])
 
     def test_voice_bindings_and_offscreen_source_types_are_validated(self):
         mutations = [lambda r: r["additions"][1].update(character_id="room"),

@@ -11,6 +11,9 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   retried. Persist the provider ID before polling or downloading.
 - Do not claim sampled frames establish audio, lip-sync or full-motion quality.
 - Never replace actual references with prose while claiming references were sent.
+- GPT selects concise system broadcasts and their timing; retain full rules in
+  the on-screen system UI and preserve character dialogue. Keep a single human
+  approval for the complete final prompt; do not add a seconds-selection gate.
 - Keep keys out of project state, logs, tests and version control.
 - Use argv for subprocesses, never shell commands from GPT output.
 - Keep original media immutable and decisions bound to version and file hash.

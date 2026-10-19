@@ -39,19 +39,83 @@ def _dialogue_by_speaker(dialogue):
     return speakers
 
 
+def replace_broadcast_dialogue(dialogue, speaker, spoken_text):
+    """Replace only the bound system speaker; preserve other lines verbatim."""
+    lines, inserted = [], False
+    for line in dialogue.splitlines():
+        matched = re.fullmatch(r"\s*([^：:\n]{1,60})[：:]\s*(.+?)\s*", line)
+        if matched and matched.group(1).strip() == speaker:
+            if not inserted:
+                lines.append(f"{speaker}：{spoken_text}")
+                inserted = True
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def validate_broadcast_proposal(shot, refined, context=None):
+    """Check source/visual retention and protect all non-system dialogue.
+
+    A trusted project context additionally verifies the designated voice. A
+    model's semantic summary remains a draft for final human prompt approval;
+    these structural checks cannot prove semantic faithfulness.
+    """
+    proposal = refined.get("broadcast_proposal") if isinstance(refined, dict) else None
+    if proposal is None:
+        return None
+    fields = {"speaker", "source_text", "spoken_text", "display_text", "summary"}
+    if not isinstance(proposal, dict) or set(proposal) != fields:
+        raise core.GateError("系统简播方案须包含说话人、来源全文、播报内容、画面全文和取舍说明。")
+    for key in fields:
+        _timing_text(proposal[key], key, 60 if key == "speaker" else 12000)
+    speaker = proposal["speaker"]
+    original = _dialogue_by_speaker(shot.get("dialogue", ""))
+    if original.get(speaker) != proposal["source_text"]:
+        raise core.GateError("系统简播来源必须等于原计划中该说话人的完整原文，不能编造或漏掉规则。")
+    if proposal["display_text"] != proposal["source_text"]:
+        raise core.GateError("系统详细规则须在画面上完整保留，不能随播报一并删去。")
+    if "\n" in proposal["spoken_text"] or "\r" in proposal["spoken_text"]:
+        raise core.GateError("系统简播内容须为单一说话人的文本，不能夹带其他对白行。")
+    source_numbers = set(re.findall(r"\d+(?:\.\d+)?", proposal["source_text"]))
+    spoken_numbers = set(re.findall(r"\d+(?:\.\d+)?", proposal["spoken_text"]))
+    if spoken_numbers - source_numbers:
+        raise core.GateError("系统简播不得增加或改动原文数值。")
+    expected = replace_broadcast_dialogue(shot.get("dialogue", ""), speaker, proposal["spoken_text"])
+    if refined.get("dialogue") != expected:
+        raise core.GateError("只能调整指定系统声源的播报内容，其他角色对白及顺序须逐字保留。")
+    if shot.get("subshots") and refined.get("timing_proposal") is None:
+        raise core.GateError("系统简播须同时提供一致的摄影与声音安排，不能保留冲突的旧完整播报时窗。")
+    if context is not None:
+        from .broadcast import policy_for
+        policy = policy_for(context)
+        assets = context.get("assets", context.get("plan", {}).get("assets", []))
+        by_id = {asset.get("id"): asset for asset in assets if isinstance(asset, dict)}
+        voice = by_id.get(policy.get("voice_id"), {})
+        character = by_id.get(policy.get("character_id"), {})
+        if (policy.get("enabled") is not True or policy.get("editorial_mode") != "key_points"
+                or speaker not in policy.get("speaker_labels", [])
+                or policy.get("voice_id") not in shot.get("asset_ids", [])
+                or voice.get("kind") != "voice" or character.get("kind") != "character"
+                or voice.get("character_id") != character.get("id")):
+            raise core.GateError("简播仅适用于项目指定且已引用的系统声源，不能改写人物台词。")
+    return copy.deepcopy(proposal)
+
+
 def validate_timing_proposal(shot, refined):
     """Validate a draft delivery schedule without changing the approved plan.
 
     Camera cuts and total duration remain canonical. Only subshot text and the
     continuous, explicitly attributed audio schedule are proposed for the one
-    final-prompt confirmation; the original dialogue stays byte-for-byte fixed.
+    final-prompt confirmation. Character dialogue stays byte-for-byte fixed;
+    a separately validated system editorial draft can select key information.
     """
     if not isinstance(refined, dict):
         raise core.GateError("最终提示词候选须为对象。")
+    broadcast = validate_broadcast_proposal(shot, refined)
     proposal = refined.get("timing_proposal")
     if proposal is None:
         return None
-    if set(refined) - {"prompt", "dialogue", "continuity_notes", "timing_proposal"}:
+    if set(refined) - {"prompt", "dialogue", "continuity_notes", "timing_proposal", "broadcast_proposal"}:
         raise core.GateError("时间安排不能添加时长、资产引用或其他计划字段。")
     if not isinstance(proposal, dict) or set(proposal) != {"subshots", "summary", "audio_windows"}:
         raise core.GateError("时间安排仅能包含内部镜头文字、调整说明和声音时窗。")
@@ -73,9 +137,9 @@ def validate_timing_proposal(shot, refined):
            for before, after in zip(original, proposed)):
         raise core.GateError("时间安排不能改变摄影镜头的起止时间或切点。")
     _timing_text(proposal["summary"], "调整说明", 4000)
-    if refined.get("dialogue") != shot.get("dialogue", ""):
+    if broadcast is None and refined.get("dialogue") != shot.get("dialogue", ""):
         raise core.GateError("时间安排不能改写、增加或省略原定对白。")
-    expected = _dialogue_by_speaker(shot.get("dialogue", ""))
+    expected = _dialogue_by_speaker(refined["dialogue"] if broadcast else shot.get("dialogue", ""))
     windows = proposal["audio_windows"]
     if not isinstance(windows, list) or len(windows) > 30:
         raise core.GateError("声音时窗须为不超过30项的列表。")
@@ -106,15 +170,23 @@ def effective_shot(shot, refined):
     effective = copy.deepcopy(shot)
     if proposal is not None:
         effective["subshots"] = copy.deepcopy(proposal["subshots"])
+    if refined.get("broadcast_proposal") is not None:
+        effective["dialogue"] = refined["dialogue"]
     return effective
 
 
 def candidate_timeline_prompt(shot, refined):
     """Render one consistent camera/audio schedule, including cross-cut speech."""
     proposal = validate_timing_proposal(shot, refined)
+    broadcast = validate_broadcast_proposal(shot, refined)
     from .segments import _seconds, timeline_prompt
-    if proposal is None:
+    if proposal is None and broadcast is None:
         return timeline_prompt(shot)
+    if proposal is None:
+        return ("本次候选的系统播报与画面文字：\n"
+                f"剧情系统界面完整显示（可分页，保留阅读时间）：{broadcast['display_text']}\n"
+                f"仅以下内容由{broadcast['speaker']}画外播报：{broadcast['spoken_text']}\n"
+                "GPT按自然语速安排，不覆盖人物对白；此安排尚待最终提示词审批。")
     lines = [f"本次候选的摄影与声音时间表（总时长{_seconds(shot['duration'])}秒，一次连续生成）：",
              "以下秒点是生成目标，不保证精确到秒；摄影镜头数量、顺序和切点保持原计划，以下文字替代旧内部镜头的 UI 与声音安排。"]
     for index, subshot in enumerate(proposal["subshots"], 1):
@@ -124,13 +196,19 @@ def candidate_timeline_prompt(shot, refined):
         lines.append(f"{_seconds(window['start'])}–{_seconds(window['end'])}秒，{window['speaker'].strip()}：{window['text'].strip()}")
     if not proposal["audio_windows"]:
         lines.append("本段无原定对白，不添加新播报。")
-    lines.extend(["各说话人的原定对白逐字保留，按上述连续声音时窗自然说完；不加速、不截断、不跨生成片段重复。",
+    if broadcast:
+        lines.extend([f"剧情任务框/系统界面完整显示以下详细规则（可分页，留足阅读时间）：{broadcast['display_text']}",
+                      f"画面全文不全部朗读，系统声仅播上述选定关键内容：{broadcast['spoken_text']}",
+                      "人物原对白逐字保留；上述系统简播替代旧完整朗读要求，不同时朗读详细规则。"])
+    lines.extend(["本次实际对白按上述连续声音时窗自然说完；不加速、不截断、不跨生成片段重复。" if broadcast else
+                  "各说话人的原定对白逐字保留，按上述连续声音时窗自然说完；不加速、不截断、不跨生成片段重复。",
                   "摄影切点不终止正在进行的对白；不重复动作，人物、空间轴线、道具和环境底声连续，使用本次真实已批准的图像与声音参考。",
                   "不生成背景配乐，不添加额外画面字幕；剧情中的 UI/任务框文字与播音按本次候选执行。"])
     return "\n".join(lines)
 
 
 def specification(state, shot, prompt, manifest, refined=None):
+    broadcast = validate_broadcast_proposal(shot, refined or {}, state)
     bindings = []
     for identifier in shot["asset_ids"]:
         asset = core._find(state, "asset", identifier)
@@ -151,17 +229,27 @@ def specification(state, shot, prompt, manifest, refined=None):
         specification["timing_proposal"] = proposal
         specification["timing_refinement"] = {key: copy.deepcopy(refined.get(key))
                                               for key in ("prompt", "dialogue", "continuity_notes")}
+    if broadcast is not None:
+        specification["broadcast_proposal"] = broadcast
+        specification["broadcast_refinement"] = {key: copy.deepcopy(refined.get(key))
+                                                 for key in ("prompt", "dialogue", "continuity_notes")}
     return specification
 
 
 def _validate_candidate_timing(shot, candidate):
     refined = candidate.get("refined", {})
+    broadcast = validate_broadcast_proposal(shot, refined)
+    if broadcast != candidate.get("broadcast_proposal"):
+        raise core.GateError("系统简播或画面全文已变化，请重新准备并确认完整提示词。")
+    if broadcast is not None and (candidate.get("dialogue") != refined.get("dialogue")
+            or candidate.get("continuity_notes") != refined.get("continuity_notes")):
+        raise core.GateError("系统简播的对白或说明已变化，请重新准备并确认完整提示词。")
     proposal = validate_timing_proposal(shot, refined)
-    if proposal is None:
+    if proposal is None and broadcast is None:
         if any(key in candidate for key in ("timing_proposal", "timing_summary", "effective_subshots")):
             raise core.GateError("提示词的时间安排元数据已变化，请重新准备并确认。")
         return
-    if (candidate.get("timing_proposal") != proposal
+    if proposal is not None and (candidate.get("timing_proposal") != proposal
             or candidate.get("timing_summary") != proposal["summary"]
             or candidate.get("effective_subshots") != proposal["subshots"]
             or candidate.get("dialogue") != refined.get("dialogue")
@@ -172,7 +260,8 @@ def _validate_candidate_timing(shot, candidate):
     if not isinstance(prompt, str) or prompt.count(timeline) != 1:
         raise core.GateError("最终提示词须包含唯一完整的候选摄影与声音时间表。")
     from .segments import timeline_prompt
-    if timeline_prompt(shot) in prompt:
+    old_timeline = timeline_prompt(shot)
+    if old_timeline and old_timeline in prompt:
         raise core.GateError("最终提示词仍包含旧声音时间限制，请重新准备一致的候选。")
 
 
@@ -224,6 +313,9 @@ def prepare(root, shot_id, refined, prompt, manifest):
                      "refined": copy.deepcopy(refined), "reference_manifest": copy.deepcopy(manifest),
                      "created_at": core.now()}
         proposal = validate_timing_proposal(shot, refined)
+        broadcast = validate_broadcast_proposal(shot, refined, state)
+        if broadcast is not None:
+            candidate["broadcast_proposal"] = broadcast
         if proposal is not None:
             candidate.update(timing_proposal=copy.deepcopy(proposal), timing_summary=proposal["summary"],
                              effective_subshots=copy.deepcopy(proposal["subshots"]))

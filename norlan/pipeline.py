@@ -10,7 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import core, media, official, prompt_gate
+from . import broadcast, core, media, official, prompt_gate
 from .brain import task_asset_summary, task_context_summary, task_shot_summary
 from .billing import price_snapshot
 from .failures import exception_failure, sanitize_failure
@@ -185,9 +185,10 @@ def _review_shot_summary(shot):
     """Compare actual frames against this version's approved delivery draft."""
     refined = shot.get("refined_prompt")
     effective = prompt_gate.effective_shot(shot, refined if isinstance(refined, dict) else {})
-    if isinstance(refined, dict) and refined.get("timing_proposal") is not None:
-        # The source prompt can still describe the superseded UI/audio onset.
-        # Review the executed draft together with its effective subshots.
+    if isinstance(refined, dict) and (refined.get("timing_proposal") is not None
+                                      or refined.get("broadcast_proposal") is not None):
+        # The source prompt can still require a superseded UI/audio onset or a
+        # complete system reading. Review the executed delivery draft instead.
         effective["prompt"] = refined["prompt"]
         effective["continuity_notes"] = refined.get("continuity_notes", "")
     return task_shot_summary(effective)
@@ -795,15 +796,18 @@ def _observation_images(root, context, images, previous):
 
 
 def _final_shot_prompt(state, shot, refined, context):
+    effective = prompt_gate.effective_shot(shot, refined)
+    concise = refined.get("broadcast_proposal") is not None
     prompt = refined["prompt"]
-    if "subshots" in shot:
+    if "subshots" in shot or concise:
         prompt += "\n" + prompt_gate.candidate_timeline_prompt(shot, refined)
-    if shot.get("dialogue"):
-        prompt += "\n必须使用的原定对白：" + shot["dialogue"]
-    prompt += "\n不添加画面字幕，不添加背景配乐。"
+    if effective.get("dialogue"):
+        label = "本次实际播读对白（人物台词保留原文，系统仅播读关键内容）：" if concise else "必须使用的原定对白："
+        prompt += "\n" + label + effective["dialogue"]
+    prompt += "\n不添加对白字幕，不添加背景配乐；剧情系统界面和任务框的详细文字按本次候选保留。"
     if (context.get("previous_actual") or {}).get("reference_mode") == "original_video":
         prompt += "\n视频1是已批准的上一段原始视频。仅承接其结尾继续本段剧情，保持人物、场景、动作方向和声音连续；不要重演已完成的动作或重复已说完的台词。"
-    policy = state.get("audio_policy", {}).get("system_broadcast", {})
+    policy = broadcast.policy_for(state)
     if policy.get("enabled") is True and policy.get("voice_id") in shot["asset_ids"]:
         reference = next((item for item in context.get("audio_references", [])
                           if item.get("asset_id") == policy["voice_id"]), None)
@@ -811,7 +815,7 @@ def _final_shot_prompt(state, shot, refined, context):
             raise core.GateError("系统播报必须传入已批准的女声参考，不能仅靠文字描述。")
         prompt += (f"\n系统播音规则（覆盖旧分镜中与之冲突的无配音或不念字幕要求）：使用音频{reference['index']}"
                    "作为固定系统女声，仅作画外播报，不生成可见播报员。" + policy.get("instruction", "") +
-                   "任务框播音与画面字幕是不同要求；不添加画面字幕不代表取消播音。只播读本片段明确安排的系统通知，"
+                   "任务框播音与界面文字分别安排；详细规则显示在界面上，不要求逐字朗读。只播读本次候选明确安排的系统关键内容，"
                    "不重复试音台词，不覆盖人物对白，不通过加速或截断强行压缩。")
         prompt += "\n如果本片段没有明确系统通知，则该系统声源保持静默，不凭空增加播报内容；弹幕、直播标题与普通道具文字不自动当作系统通知。"
     return prompt
@@ -869,8 +873,16 @@ def _revision_analysis(root, shot):
         raise core.GateError("；".join(record["blockers"]))
     policy = result.get("audio_policy") or {}
     previous_policy = state.get("audio_policy", {})
-    policy_changed = bool(policy.get("system_broadcast", {}).get("enabled")
-                          or previous_policy.get("system_broadcast", {}).get("enabled")) and policy != previous_policy
+    # The model receives the effective editorial default, while older projects
+    # can retain their original instruction as an immutable source record.
+    # Comparing raw strings would turn that normalization into another asset
+    # approval. Explicit enabled=False is still a real policy change; omitting
+    # audio_policy means keep the existing rule.
+    previous_effective = broadcast.policy_for(state)
+    proposed_effective = broadcast.policy_for({**state,
+        "assets": state["assets"] + result.get("additions", []),
+        "audio_policy": policy or previous_policy})
+    policy_changed = bool(proposed_effective.get("enabled") or previous_effective.get("enabled")) and proposed_effective != previous_effective
     references_changed = any(set(update.get("add_asset_ids", [])) - set(core._find(state, "shot", update["id"])["asset_ids"])
                              for update in result.get("shot_updates", []))
     if result["needs_assets"] or references_changed or policy_changed:
