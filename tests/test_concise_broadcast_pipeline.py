@@ -95,7 +95,8 @@ class ConciseBroadcastPipelineTests(unittest.TestCase):
                          [self.root / "media/system-voice.wav"])
         review = self.readback[-1]["shot"]
         self.assertEqual(review["dialogue"], candidate["dialogue"])
-        self.assertEqual(review["prompt"], candidate["refined"]["prompt"])
+        self.assertTrue(review["prompt"].startswith(candidate["refined"]["prompt"]))
+        self.assertIn(candidate["broadcast_proposal"]["display_text"], review["prompt"])
         self.assertEqual(review["subshots"], candidate["timing_proposal"]["subshots"])
         self.assertFalse(core.human_approved_shot(self.shot()))
         pipeline.run(self.root)

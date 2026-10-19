@@ -98,6 +98,14 @@ class BroadcastPromptGateTests(unittest.TestCase):
         with self.assertRaises(core.GateError):
             prompt_gate._validate_candidate_timing(shot, candidate)
 
+    def test_review_sees_full_visual_rules_even_if_refined_prose_only_says_show_them(self):
+        shot, refined = shot_and_refined()
+        shot["refined_prompt"] = refined
+        reviewed = pipeline._review_shot_summary(shot)
+        self.assertEqual(reviewed["dialogue"], refined["dialogue"])
+        self.assertIn("剧情系统界面完整显示：" + FULL, reviewed["prompt"])
+        self.assertIn("系统仅播以下关键内容：" + SHORT, reviewed["prompt"])
+
     def test_source_and_selected_words_are_bound_to_exact_single_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

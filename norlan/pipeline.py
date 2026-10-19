@@ -191,6 +191,10 @@ def _review_shot_summary(shot):
         # complete system reading. Review the executed delivery draft instead.
         effective["prompt"] = refined["prompt"]
         effective["continuity_notes"] = refined.get("continuity_notes", "")
+        if refined.get("broadcast_proposal") is not None:
+            proposal = refined["broadcast_proposal"]
+            effective["prompt"] += ("\n剧情系统界面完整显示：" + proposal["display_text"]
+                                    + "\n系统仅播以下关键内容：" + proposal["spoken_text"])
     return task_shot_summary(effective)
 
 
