@@ -308,6 +308,7 @@ class MCPServer:
             "planning_feedback": "当前片段提示词准备有冲突时，请用 open_review；用户在片段卡填写调整意见并重新准备提示词，再确认生成。普通继续、建议或未答复都不是调整时间安排的同意；不能清掉阻塞后直接提交视频。",
             "budget": "预算仅由用户在终端执行 nolan configure PROJECT --budget AMOUNT 设置；模型不能提高预算。",
             "configuration": "模型、单次调用价格上限及服务凭证须由用户通过本机配置设置。",
+            "postproduction": "本集片段通过后自动进入本集后期：本地识别和GPT订阅校对、音乐首次试听批准、整集字幕配乐合成。请open_review，由用户本人试听及审批；字幕和配乐意见用网页专用入口，不能因此reject全部视频。",
         }
         assets_by_id = {asset["id"]: asset for asset in state["assets"]}
         for public in result["assets"]:
@@ -320,6 +321,13 @@ class MCPServer:
                 if asset.get("audition_selection_error"):
                     public["audition_selection_error"] = _diagnostic(asset["audition_selection_error"])["message"]
         for public, episode in zip(result["episodes"], state["episodes"]):
+            # The browser gets the complete editor; the conversational agent
+            # only needs the gate and counts, not another full transcript.
+            post = public.get("postproduction", {})
+            subtitles = post.get("subtitles", {})
+            subtitles["segment_count"] = len(subtitles.pop("segments", []))
+            music = post.get("music", {})
+            music["cue_count"] = len(music.pop("cues", []))
             public["music_prompt"] = episode.get("music_prompt", "")
             for pshot, shot in zip(public["shots"], episode["shots"]):
                 for key in ("dialogue", "asset_ids", "scene_id", "continuity_notes", "revision", "subshots"):
@@ -340,6 +348,11 @@ class MCPServer:
     def _review_gate_key(state):
         """Identify a saved human decision, excluding feedback and provider text."""
         status = state.get("status")
+        if status == "awaiting_postproduction":
+            waiting = [(ep.get("id"), ep.get("postproduction", {}).get("status"),
+                        ep.get("postproduction", {}).get("revision", 0))
+                       for ep in state.get("episodes", []) if ep.get("status") != "approved"]
+            return ("postproduction", json.dumps(waiting, sort_keys=True))
         if block := dashboard._current_planning_block(state):
             return ("planning", json.dumps([block["shot_id"], block["signature"]]))
         if status == "awaiting_prompt_approval":

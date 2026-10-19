@@ -110,8 +110,10 @@ def preview(root, kind="", item_id=""):
 
 def doctor():
     findings = {"Nolan": __version__, "Python": sys.version.split()[0]}
-    for command in ("ffmpeg", "ffprobe", "codex", "jimeng"):
+    for command in ("ffmpeg", "ffprobe", "codex", "jimeng", "whisper-cli"):
         findings[command] = shutil.which(command) or "未安装"
+    from .local_transcription import DEFAULT_MODEL_PATH
+    findings["本地字幕模型"] = str(DEFAULT_MODEL_PATH) if DEFAULT_MODEL_PATH.is_file() else "未安装；运行 scripts/install-local-asr.sh"
     try:
         from .brain import BrainError, resolve_codex
         selected_codex = resolve_codex()
@@ -139,6 +141,9 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("doctor", help="检查本地工具与账户配置，不显示密钥")
     sub.add_parser("connection", help="查看 GPT 订阅/API 连接选择")
+    music_login = sub.add_parser("music-login", help="隐藏输入火山音乐AK/SK并启动Nolan，仅保留在本次进程")
+    music_login.add_argument("project", type=Path, nargs="?")
+    music_login.add_argument("--resume", action="store_true", dest="music_resume")
     setup_parser = sub.add_parser("setup", help="选择 ChatGPT 订阅或 OpenAI API 连接")
     setup_parser.add_argument("--provider", choices=["chatgpt", "openai"])
     setup_parser.add_argument("--model", help="明确指定模型 ID；API 模式必填")
@@ -205,6 +210,9 @@ def main(argv=None):
             from .connection import describe_connection
             print(describe_connection())
             return 0
+        if args.command == "music-login":
+            from .music_setup import launch_with_music
+            return launch_with_music(args.project, resume=args.music_resume)
         if args.command in (None, "chat"):
             from .interactive import launch
             return launch(getattr(args, "project", None),

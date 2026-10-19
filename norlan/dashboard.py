@@ -20,6 +20,7 @@ from .regroup import PUBLIC_ERRORS as SEGMENT_ERRORS
 
 MAX_BODY = 32_768
 MAX_REFERENCE_BODY = 12 * 1024 * 1024
+MAX_MUSIC_BODY = 42 * 1024 * 1024
 INPUT_ERRORS = frozenset({
     "这张参考图片已经上传，无需重复添加。",
     "每项资产最多上传 9 张参考图片。",
@@ -44,8 +45,31 @@ INPUT_ERRORS = frozenset({
     "请在片段下确认提示词后再生成。",
     "请先查看资产失败原因，并明确提出重试意见。",
     "请在当前片段填写调整意见，重新准备提示词；尚未提交视频生成。",
+    "本项目尚未开启本集后期",
+    "后续集已开始制作，请先暂停并处理依赖，不能直接修改已批准前集后期",
+    "后期修改范围只能是字幕、配乐或全部后期",
+    "请填写4000字以内的后期调整意见",
+    "先逐段批准本集视频，再开始本集后期；音乐可提前导入试听",
+    "页面版本已过期，请刷新后重新审阅",
+    "自动生成音乐需配置火山纯音乐服务（独立AK/SK）及单次费用上限；也可直接导入本地音乐。",
+    "未找到火山音乐AK/SK；方舟API Key不能代替。可在本机配置，或导入本地音乐。",
+    "已有音乐生成请求，请继续原任务，不能重复提交",
+    "原音乐任务未结清，请恢复或核实原任务，不能再次提交",
 })
-MEDIA_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".m4v", ".mov", ".webm", ".wav", ".mp3", ".m4a", ".ogg", ".srt", ".vtt"})
+MUSIC_INPUT_ERRORS = frozenset({
+    "音乐资产 ID 无效。", "音乐版本号无效。", "音乐库格式无效。", "音乐资产格式无效。",
+    "找不到该音乐版本，请刷新后重试。", "音乐资产 ID 或版本重复，不能猜测需要审批的文件。",
+    "音乐原件路径缺失。", "音乐原件必须保存在本项目受控音乐库。", "音乐相对路径必须提供项目根目录。",
+    "音乐原件缺失或哈希无效；请重新导入并试听。", "音乐文件已改变，原试听审批失效；请重新导入并确认。",
+    "音乐资产必须是有有效时长的独立音频。", "音乐时长与原记录不一致，不能沿用试听审批。",
+    "配乐尚未经过本人试听确认，不能加入整集。", "请填写 1–160 字的音乐名称。",
+    "请导入不超过 100 MB 的 WAV、MP3、M4A、OGG 或 FLAC 音频。",
+    "所选文件不是有效的独立音乐音频。", "音乐库目标已被修改，导入停止。",
+    "音乐上传上限为 30 MB。", "仅支持 WAV、MP3、M4A、OGG、FLAC 音频上传。",
+    "音乐上传数据无效。", "音乐上传不能为空，且不能超过 30 MB。",
+    "试听的音乐版本已更新，请刷新并试听当前版本。", "试听的音乐版本已更新，请刷新后再提交意见。",
+})
+MEDIA_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".m4v", ".mov", ".webm", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".srt", ".vtt"})
 
 
 def _core():
@@ -485,6 +509,12 @@ def _public_production_stop(state):
         current = next(((index, shot) for index, shot in enumerate(episode.get("shots", []), 1)
                         if not human_approved_shot(shot)), None)
         if current is None:
+            post = episode.get("postproduction", {})
+            if isinstance(post, dict) and state.get("settings", {}).get("postproduction", {}).get("enabled"):
+                result.update(stage="postproduction", stage_label="本集后期")
+                if post.get("error"):
+                    result["message"] = sanitize_failure({"message": str(post["error"])})["message"]
+                return result
             stage = episode.get("progress_stage", {}).get("stage")
             labels = {"music": "准备配乐", "subtitles": "准备字幕", "rendering": "合成本集",
                       "batch_assembly": "拼接累计预览", "batch_review": "审查累计预览"}
@@ -659,6 +689,64 @@ def _shot_progress(state, episode, shot, episode_status, stamp):
     return result
 
 
+def _public_music_library(state: dict) -> dict:
+    """Music is auditionable media; provider responses and credentials stay local."""
+    library = state.get("music_library", {})
+    if not isinstance(library, dict):
+        return {"tracks": []}
+    tracks = []
+    for track in library.get("tracks", []):
+        if not isinstance(track, dict):
+            continue
+        item = _pick(track, ("id", "title", "version", "file", "sha256", "duration", "status", "prompt", "feedback"))
+        if not _valid_sha(item.get("sha256")) or not isinstance(item.get("file"), str):
+            continue
+        item["version"] = _version(item.get("version"))
+        tracks.append(item)
+    return {"tracks": tracks}
+
+
+def _public_postproduction(state: dict, episode: dict) -> dict:
+    """Only the editing plan and bounded human-facing diagnostics reach the page."""
+    from .failures import sanitize_failure
+    value = episode.get("postproduction", {})
+    if not isinstance(value, dict):
+        value = {}
+    result = _pick(value, ("enabled", "status", "revision", "ready", "final_ready", "rough_file", "dry_file", "feedback"))
+    from .core import human_approved_shot
+    result["enabled"] = state.get("settings", {}).get("postproduction", {}).get("enabled") is True
+    shots = episode.get("shots", [])
+    result["ready"] = bool(shots) and all(human_approved_shot(shot) for shot in shots)
+    result["final_ready"] = bool(value.get("final_ready") is True and episode.get("status") in {"awaiting_review", "approved"})
+    result["missing_configuration"] = [sanitize_failure({"message": text})["message"] for text in value.get("missing_configuration", [])
+                                        if isinstance(text, str) and len(text) <= 1000][:20]
+    for section in ("subtitles", "music"):
+        source = value.get(section, {})
+        source = source if isinstance(source, dict) else {}
+        item = _pick(source, ("status", "file", "engine", "summary", "feedback", "can_generate"))
+        if source.get("error"):
+            item["error"] = sanitize_failure({"message": str(source["error"])})["message"]
+        if section == "subtitles":
+            segments = source.get("segments", source.get("cues", []))
+            item["segments"] = [_pick(cue, ("start", "end", "text")) for cue in segments
+                                if isinstance(cue, dict)][:2000] if isinstance(segments, list) else []
+        else:
+            item["cues"] = [_pick(cue, ("track_id", "start", "end", "source_start", "gain_db", "fade_in", "fade_out", "reason"))
+                            for cue in source.get("cues", []) if isinstance(cue, dict)][:500]
+        result[section] = item
+    if value.get("error"):
+        result["error"] = sanitize_failure({"message": str(value["error"])})["message"]
+    if result["enabled"]:
+        from .episode_post import music_configuration
+        can_generate, _reason = music_configuration(state)
+        result["music"]["can_generate"] = bool(can_generate)
+    library = state.get("music_library", {})
+    tracks = library.get("tracks", []) if isinstance(library, dict) else []
+    if result["enabled"] and not any(isinstance(track, dict) and track.get("status") in {"approved", "awaiting_approval"} for track in tracks):
+        result["missing_configuration"].append("需要首次导入音乐并试听确认；自动生成音乐另需火山音乐 AK/SK 和调用预算。")
+    return result
+
+
 def public_state(state: dict) -> dict:
     """Keep credentials, source novel, provider responses and settings off the UI API."""
     result = _pick(state, ("id", "title", "mode", "status", "paused", "created_at", "updated_at"))
@@ -668,6 +756,7 @@ def public_state(state: dict) -> dict:
     result["pending_advisory_notice"] = (f"有 {result['pending_advisory_count']} 次 GPT 审查调用的费用或额度待核实，未自动重试。"
                                          if result["pending_advisory_count"] else "")
     result["plan"] = _pick(state.get("plan", {}), ("status", "version", "style", "ratio", "feedback"))
+    result["music_library"] = _public_music_library(state)
     if state.get("last_error"):
         from .failures import sanitize_failure
         result["last_error"] = sanitize_failure({"provider_message": state["last_error"]}).get(
@@ -734,6 +823,7 @@ def public_state(state: dict) -> dict:
                 current_shot=production_stop["shot_id"], current_shot_index=production_stop["shot_index"],
                 elapsed_seconds=None, is_working=False, waiting_for_human=True)
         item["rough_cuts"] = _public_rough_cuts(episode)
+        item["postproduction"] = _public_postproduction(state, episode)
         proposal = episode.get("segment_proposal")
         if isinstance(proposal, dict) and proposal.get("status") == "candidate":
             item["segment_proposal"] = _pick(proposal, ("id", "status", "source_ids", "created_at"))
@@ -806,6 +896,22 @@ def _media_paths(state: dict) -> set[str]:
             path = item.get(key)
             if isinstance(path, str):
                 paths.add(path)
+    library = state.get("music_library", {})
+    if isinstance(library, dict):
+        for track in library.get("tracks", []):
+            if isinstance(track, dict) and isinstance(track.get("file"), str):
+                paths.add(track["file"])
+    for episode in state.get("episodes", []):
+        post = episode.get("postproduction", {})
+        if not isinstance(post, dict):
+            continue
+        for key in ("rough_file", "dry_file", "subtitle_file"):
+            if isinstance(post.get(key), str):
+                paths.add(post[key])
+        for section in ("subtitles", "rough_cut"):
+            value = post.get(section, {})
+            if isinstance(value, dict) and isinstance(value.get("file"), str):
+                paths.add(value["file"])
     return paths
 
 
@@ -1061,7 +1167,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._host_ok():
             return self._error(403, "仅允许本机访问。")
         path = urlsplit(self.path).path
-        if path not in {"/api/action", "/api/asset-reference"}:
+        if path not in {"/api/action", "/api/asset-reference", "/api/music-upload"}:
             return self._error(404, "未找到此操作。")
         context = self.server.context
         if not secrets.compare_digest(self.headers.get("X-Norlan-Token", "").encode("utf-8"), context.token.encode("ascii")):
@@ -1077,7 +1183,7 @@ class _Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             return self._error(400, "请求长度无效。")
-        limit = MAX_REFERENCE_BODY if path == "/api/asset-reference" else MAX_BODY
+        limit = MAX_REFERENCE_BODY if path == "/api/asset-reference" else MAX_MUSIC_BODY if path == "/api/music-upload" else MAX_BODY
         if length <= 0 or length > limit:
             return self._error(413, "请求过大或为空。")
         try:
@@ -1086,6 +1192,39 @@ class _Handler(BaseHTTPRequestHandler):
                 raise ValueError
             action = data.get("action")
             with context.mutation_lock:
+                if path == "/api/music-upload" or action in {"music_approve", "music_reject", "music_generate", "postproduction"}:
+                    if context.running or context.external_run_active():
+                        return self._error(409, "制作正在进行，请等待当前任务结束后再调整后期。")
+                    item_id, version = data.get("id"), data.get("version")
+                    if (not isinstance(item_id, str) or not 0 < len(item_id) <= 128
+                            or type(version) is not int or version < 0):
+                        raise ValueError
+                    if path == "/api/music-upload":
+                        title, data_url = data.get("title"), data.get("data_url")
+                        if (not isinstance(title, str) or not title.strip() or len(title) > 160
+                                or not isinstance(data_url, str)):
+                            raise ValueError
+                        _core().import_music(context.project_dir, item_id, version, data_url, title.strip())
+                    elif action in {"music_approve", "music_reject"}:
+                        sha256 = data.get("sha256")
+                        if version < 1 or not _valid_sha(sha256):
+                            raise ValueError
+                        if action == "music_approve":
+                            _core().approve_music(context.project_dir, item_id, version, sha256)
+                        else:
+                            feedback = data.get("feedback")
+                            if not isinstance(feedback, str) or not feedback.strip() or len(feedback) > 8000:
+                                raise ValueError
+                            _core().reject_music(context.project_dir, item_id, version, sha256, feedback.strip())
+                    elif action == "music_generate":
+                        _core().request_music_generation(context.project_dir, item_id, version)
+                    else:
+                        target, feedback = data.get("target"), data.get("feedback", "")
+                        if (target not in {"all", "music", "subtitles", "continue"}
+                                or not isinstance(feedback, str) or len(feedback) > 4000):
+                            raise ValueError
+                        _core().request_postproduction(context.project_dir, item_id, version, target, feedback.strip())
+                    return self._json(200, context.state())
                 if path == "/api/asset-reference" or action in {"asset_input", "remove_asset_reference"}:
                     item_id, version, revision = data.get("id"), data.get("version"), data.get("input_revision")
                     if (not isinstance(item_id, str) or not 0 < len(item_id) <= 128
@@ -1184,8 +1323,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(409, message if message in INPUT_ERRORS or message in SEGMENT_ERRORS else "状态已变化或参数无效，请刷新后重试。")
         except (BrokenPipeError, ConnectionResetError):
             pass
-        except Exception:
-            self._error(500, "操作未完成，请刷新后检查项目状态。")
+        except Exception as exc:
+            message = str(exc)
+            if message in MUSIC_INPUT_ERRORS:
+                self._error(409, message)
+            else:
+                self._error(500, "操作未完成，请刷新后检查项目状态。")
 
 
 def make_server(project_dir: Path, port: int = 8765) -> ReviewServer:

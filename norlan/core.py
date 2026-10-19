@@ -209,7 +209,8 @@ def create_project(root, novel: str, mode="demo", title="Nolan 漫剧"):
             "caps": {"image": 0, "video_second": 0, "llm": 0},
             "max_attempts": 3, "max_llm_calls": 80, "batch_size": 3,
             "poll_seconds": 10, "max_poll_seconds": 1800,
-            "music": {}, "subtitles": {"mode": "none", "call_cap": 0},
+            "music": {}, "subtitles": {"mode": "local" if mode == "live" else "none", "call_cap": 0},
+            "postproduction": {"enabled": mode == "live"},
             "creative_brief": "", "require_voice_reference": True,
         },
         "budget": {"limit": 0, "currency": "CNY", "spent": 0, "reserved": 0,
@@ -750,6 +751,9 @@ def approve(root, kind, item_id, version):
             rendered = item.get("render_manifest", {}).get("clips", [])
             if rendered != [{"id": sh["id"], "sha256": sh["sha256"]} for sh in item["shots"]]:
                 raise GateError("本集镜头已更新或缺少合成记录，请重新合成后审批")
+            if s["settings"].get("postproduction", {}).get("enabled"):
+                from .episode_post import check_final
+                check_final(root, s, item)
         elif kind == "shot":
             if item.get("pending_asset_amendment"):
                 raise GateError("本片段正在等待资产增补确认，请先完成新资产审批再返修")
@@ -1065,6 +1069,8 @@ def resolve_completed_asset_feedback(root, shot_id):
 
 def request_caption_fix(root, item_id, version, feedback):
     """A subtitle-only edit preserves the generated picture and sound."""
+    if load_project(root)["settings"].get("postproduction", {}).get("enabled"):
+        return request_postproduction(root, item_id, version, "subtitles", feedback)
     if not isinstance(feedback, str) or not feedback.strip():
         raise ValueError("请说明要修改的字幕文字")
     with run_lock(root), transaction(root) as s:
@@ -1084,6 +1090,31 @@ def request_caption_fix(root, item_id, version, feedback):
         s["status"] = "ready"
         event(s, "caption_fix_requested", id=item_id, version=version, feedback=feedback)
     return load_project(root)
+
+
+def request_postproduction(root, episode_id, version, target="continue", feedback=""):
+    from .episode_post import request
+    return request(root, episode_id, version, target, feedback)
+
+
+def import_music(root, episode_id, version, data_url, title):
+    from .episode_post import import_music as action
+    return action(root, episode_id, version, data_url, title)
+
+
+def approve_music(root, track_id, version, sha256):
+    from .episode_post import decide_music
+    return decide_music(root, track_id, version, sha256)
+
+
+def reject_music(root, track_id, version, sha256, feedback):
+    from .episode_post import decide_music
+    return decide_music(root, track_id, version, sha256, feedback)
+
+
+def request_music_generation(root, episode_id, version):
+    from .episode_post import request_generation
+    return request_generation(root, episode_id, version)
 
 
 def _amendment_idle(state):
@@ -1416,6 +1447,7 @@ def set_paused(root, paused):
 
 def configure(root, settings=None, limit=None, currency=None):
     with transaction(root) as s:
+        s["settings"].setdefault("postproduction", {"enabled": False})
         if settings:
             if set(settings) - set(s["settings"]):
                 raise ValueError("未知配置字段")
@@ -1439,6 +1471,8 @@ def configure(root, settings=None, limit=None, currency=None):
             for val in s["settings"]["caps"].values():
                 if isinstance(val, bool) or not isinstance(val, (float, int)) or not math.isfinite(val) or val < 0:
                     raise ValueError("调用价格上限必须为非负有限数字")
+            if type(s["settings"]["postproduction"].get("enabled")) is not bool:
+                raise ValueError("本集后期开关必须为布尔值")
         _totals(s)
         if currency:
             if currency not in {"CNY", "USD"}:

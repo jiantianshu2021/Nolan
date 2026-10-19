@@ -65,7 +65,15 @@ def _new_work_gate(state):
 def _brain(root, method, *args, **kwargs):
     from .brain import Brain
     from .connection import production_brain_config
+    cache_key = kwargs.pop("_cache_key", None)
     s = _gate(root)
+    if cache_key and method in {"proofread_subtitles", "arrange_music"}:
+        for old in reversed(list(s["jobs"].values())):
+            if (old.get("item_id") == method and old.get("state") == "completed"
+                    and old.get("post_cache_key") == cache_key):
+                if "post_result" not in old or core._json_digest(old["post_result"]) != old.get("post_result_hash"):
+                    raise core.GateError("已完成的后期GPT缓存缺失或被改动；不会重复调用。请检查记录，或提交新后期调整意见。")
+                return copy.deepcopy(old["post_result"])
     _new_work_gate(s)
     if s["mode"] == "demo":
         raise core.GateError("演示项目不调用在线模型；请新建 live 项目进行真实制作")
@@ -94,6 +102,8 @@ def _brain(root, method, *args, **kwargs):
             # report when there are no frames. It consumes no model request.
             return result
         cached = {"review_result": copy.deepcopy(result), "review_result_hash": core._json_digest(result)} if method == "review" else {}
+        if cache_key and method in {"proofread_subtitles", "arrange_music"}:
+            cached.update(post_cache_key=cache_key, post_result=copy.deepcopy(result), post_result_hash=core._json_digest(result))
         core.update_job(root, job_id, state="completed", accounting="spent", **cached)
         return result
     except Exception as exc:
@@ -1113,6 +1123,8 @@ def _soundtrack(root, ep):
     if ep.get("music_file"):
         return core.safe_path(root, ep["music_file"])
     duration = sum(media.probe(core.safe_path(root, sh["file"]))["duration"] for sh in ep["shots"])
+    if ep.get("post_music_candidate"):
+        duration = min(60, max(30, duration))
     if duration > 120:
         raise core.GateError("本集超过纯音乐接口的 120 秒上限；请提供足够时长的本地配乐，或拆分分集")
     duration = max(30, int(duration + 0.999))
@@ -1308,7 +1320,9 @@ def _refresh_candidate_preview(root, ep_id):
 def _episode(root, ep_id):
     s = _gate(root)
     ep = core._find(s, "episode", ep_id)
-    if ep["status"] == "awaiting_review" and all(core.human_approved_shot(shot) for shot in ep["shots"]):
+    post_enabled = s["settings"].get("postproduction", {}).get("enabled")
+    if (ep["status"] == "awaiting_review" and all(core.human_approved_shot(shot) for shot in ep["shots"])
+            and (not post_enabled or ep.get("postproduction", {}).get("final_ready"))):
         _set(root, status="awaiting_episode_review")
         return
     _save_episode(root, ep_id, status="generating")
@@ -1354,6 +1368,10 @@ def _episode(root, ep_id):
             # segment's report or revokes that segment's human approval.
     fresh = core._find(core.load_project(root), "episode", ep_id)
     _gate(root)
+    if core.load_project(root)["settings"].get("postproduction", {}).get("enabled"):
+        from .episode_post import finish
+        finish(root, fresh, brain_call=_brain, gate=_gate, soundtrack=_soundtrack)
+        return
     _progress(root, ep_id, "music")
     music = _soundtrack(root, fresh)
     _progress(root, ep_id, "subtitles")

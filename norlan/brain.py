@@ -178,6 +178,12 @@ COMMAND_SCHEMA = _object({
     "reply": STRING})
 CAPTION_SCHEMA = _object({"segments": _array(_object({"start": {"type": "number", "minimum": 0},
                                                        "end": {"type": "number", "minimum": 0}, "text": STRING}), maxItems=5000)})
+MUSIC_CUE_SCHEMA = _object({"summary": STRING, "cues": _array(_object({
+    "track_id": STRING, "start": {"type": "number", "minimum": 0},
+    "end": {"type": "number", "minimum": 0}, "source_start": {"type": "number", "minimum": 0},
+    "gain_db": {"type": "number", "minimum": -40, "maximum": -3},
+    "fade_in": {"type": "number", "minimum": 0}, "fade_out": {"type": "number", "minimum": 0},
+}), maxItems=64)})
 
 
 def _validate(value, schema: dict, path: str = "output") -> None:
@@ -959,6 +965,47 @@ budget 仅在用户明确设置总预算上限且给出金额时使用，limit �
 kind 必须为 plan/asset/episode/shot/none，对应 id 在 context 中查找，不适用则空字符串。
 每次只执行一种意图；复杂复合要求请用 answer 请用户逐项处理。""",
                           {"message": message, "context": context}, COMMAND_SCHEMA)
+
+    def proofread_subtitles(self, segments: list[dict], context: dict) -> list[dict]:
+        """Text-only proofreading, never a claim to have heard the soundtrack."""
+        try:
+            canonical = [{k: s[k] for k in ("start", "end", "text")} for s in segments]
+        except (KeyError, TypeError):
+            raise BrainError("字幕缺少 start/end/text 字段。") from None
+        _validate({"segments": canonical}, CAPTION_SCHEMA)
+        if any(s["end"] <= s["start"] or not s["text"].strip() for s in canonical):
+            raise BrainError("字幕时间段或文字无效，尚未提交校对。")
+        if len(canonical) > 80 or len(json.dumps(context, ensure_ascii=False)) > 9000:
+            raise BrainError("字幕校对上下文过长，请按实际音频分批；尚未提交请求。")
+        result = self._call("""校对本机实际音频识别出的中文字幕。你只收到识别文字和时间戳，没有听过音频。
+仅结合本批角色名、已计划台词修正明显同音错字、专名与标点；实际识别是依据，剧本只是辅助。
+禁止把未识别到的计划台词、画面系统规则或旁白补进字幕，不补对白、不按剧本重写实际语音。
+数字、价格与规则含义即使与计划不符，也不得据剧本替换；只有用户明确给出听审修正意见才可改。
+每条 start/end、数量、顺序完全不变，只改 text。听不清或无法确定的原文保留，留待用户最终审片。
+按 feedback 修改明确对应的字幕文字；时间安排不能靠文字猜测。""",
+                            {"segments": canonical, "context": context}, CAPTION_SCHEMA)
+        corrected = result["segments"]
+        if len(corrected) != len(canonical) or any(
+                (new["start"], new["end"]) != (old["start"], old["end"])
+                for new, old in zip(corrected, canonical)):
+            raise BrainError("GPT 改动了字幕时间或数量，原字幕已保留。")
+        if any(not s["text"].strip() for s in corrected):
+            raise BrainError("GPT返回空字幕，原字幕已保留。")
+        return corrected
+
+    def arrange_music(self, context: dict) -> dict:
+        if len(json.dumps(context, ensure_ascii=False)) > 20000:
+            raise BrainError("本集配乐上下文过长；尚未提交请求。")
+        return self._call("""为已锁定实际时长的本集安排配乐。只能选择 catalog 内已人工试听批准的音乐。
+你没有听过音频，metadata/prompt 是创作意图，不是已核实的听觉事实。以实际时间轴、对白窗口、
+本集剧情节奏和 music_prompt 编排；对白密集处降低音量，重要台词/反转可留白。禁止添加人声或旁白。
+输出全局秒数 cue：track_id、start/end、source_start、gain_db（建议-20至-12）、fade_in/out。
+preferred_track_ids如存在，至少安排其中一首本集新批准音乐；不能忽略用户刚确认的替换曲目。
+每条 cue 必须在本集和源音乐真实时长内，淡入淡出不超过cue时长；交叉淡化可适度重叠。
+短音乐可显式安排多条cue复用，但只在乐句/情绪合理处接续，不任意机械循环。130秒本集照常编排，
+不受音乐服务单次120秒限制，不改视频时长。结尾自然收束/留悬念；有 previous 时参考上一集尾部的
+已批准曲目与结束方式。feedback只修改本集音乐编排，不改视频/对白/字幕。至少安排一条音乐cue。
+summary简述选曲和衔接理由，具体听觉效果最终由用户看带字幕配乐的整集审批。""", context, MUSIC_CUE_SCHEMA)
 
     def correct_subtitles(self, segments: list[dict], feedback: str) -> list[dict]:
         """Revise only requested caption text, retaining the actual ASR timing."""

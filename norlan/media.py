@@ -432,7 +432,7 @@ def _write_subtitles(entries: list[dict], target: Path, duration: float) -> None
 
 def compose(
     clips: list[Path], output: Path, subtitles: list[dict] | None = None,
-    music: Path | None = None, *, burn_subtitles: bool = True,
+    music: Path | None = None, *, burn_subtitles: bool = True, music_gain: float = 0.18,
 ) -> dict:
     """Normalize and join clips in order, preserving sound and filling silence.
 
@@ -444,6 +444,8 @@ def compose(
     """
     if not clips:
         raise MediaError("至少需要一个已生成镜头才能合成。")
+    if isinstance(music_gain, bool) or not isinstance(music_gain, (int, float)) or not math.isfinite(music_gain) or not 0 <= music_gain <= 1:
+        raise MediaError("配乐增益必须为0至1的有限数字。")
     paths = [_local(path) for path in clips]
     output = _destination(output)
     if output in paths:
@@ -522,7 +524,7 @@ def compose(
             graph += [
                 "[norm]asplit=2[voice][sidechain]",
                 f"[{len(normalized)}:a:0]aresample=48000,aformat=channel_layouts=stereo,"
-                f"apad,atrim=duration={duration:.9f},asetpts=PTS-STARTPTS,volume=0.18,"
+                f"apad,atrim=duration={duration:.9f},asetpts=PTS-STARTPTS,volume={music_gain:.6f},"
                 f"afade=t=in:st=0:d={fade:.6f},afade=t=out:st={duration-fade:.6f}:d={fade:.6f}[music]",
                 "[music][sidechain]sidechaincompress=threshold=0.03:ratio=8:attack=15:release=300[ducked]",
                 "[voice][ducked]amix=inputs=2:duration=first:normalize=0," + _LOUDNORM + "[audio]",

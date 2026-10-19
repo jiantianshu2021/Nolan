@@ -23,6 +23,12 @@ _POST_STAGES = {
     "music": (90.0, "处理本集配乐"),
     "subtitles": (93.0, "处理本集字幕与时间轴"),
     "rendering": (96.0, "合成整集画面、配乐和字幕"),
+    "transcribing": (91.0, "本地识别本集实际对白和字幕时间轴"),
+    "correcting_subtitles": (93.0, "GPT 校对字幕文字与断句"),
+    "arranging_music": (95.0, "GPT 复用已批准音乐，编排本集配乐"),
+    "assembling": (90.0, "锁定已批准片段，拼接本集原声粗剪"),
+    "recognizing": (91.0, "本地识别本集实际对白和字幕时间轴"),
+    "proofreading": (93.0, "GPT 校对字幕文字与断句"),
 }
 
 
@@ -129,7 +135,10 @@ def episode_progress(state, episode, *, now=None):
             result["percent"] = value
         return result
 
-    if all_complete and episode.get("file") and episode.get("sha256") and episode.get("status") in {"awaiting_review", "approved"}:
+    post = episode.get("postproduction", {})
+    post = post if isinstance(post, dict) else {}
+    post_enabled = state.get("settings", {}).get("postproduction", {}).get("enabled") is True
+    if all_complete and episode.get("file") and episode.get("sha256") and episode.get("status") in {"awaiting_review", "approved"} and (not post_enabled or post.get("final_ready") is True):
         if episode["status"] == "approved":
             return finish("approved", "本集已通过人工审批", value=100.0)
         return finish("awaiting_review", "本集已合成，请观看成片并审批", waiting=True, value=100.0)
@@ -156,6 +165,17 @@ def episode_progress(state, episode, *, now=None):
         return finish("paused", label)
     if blocking_unknown_jobs(state):
         return finish("unknown", "存在结果不明的调用，需核实原任务后继续", waiting=True)
+    if all_complete and post_enabled:
+        post_status = post.get("status", "")
+        if post_status == "awaiting_music_approval":
+            return finish("awaiting_music_approval", "请在本集后期试听并确认新音乐，才能混入成片", waiting=True, value=94.0)
+        if post_status in {"configuration_required", "awaiting_music", "awaiting_music_selection", "postproduction_configuration"}:
+            return finish("postproduction_configuration", "本集后期需要补充配置或音乐素材，请查看本集后期", waiting=True, value=percent)
+        if post_status in {"failed", "error"} or post.get("error"):
+            return finish("postproduction_failed", "本集后期已停止；视频保留，请查看本集后期的具体原因", waiting=True, value=percent)
+        if post_status in _POST_STAGES:
+            value, label = _POST_STAGES[post_status]
+            return finish(post_status, label, working=True, value=value)
     prompt_shot = next((shot for shot in shots if shot.get("status") == "awaiting_prompt_approval"), None)
     if prompt_shot:
         result["current_shot"] = prompt_shot.get("id")

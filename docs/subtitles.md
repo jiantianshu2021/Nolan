@@ -1,8 +1,24 @@
 # 根据实际对白制作字幕
 
+## 默认流程：本地识别 + GPT订阅校对
+
+0.6.0 新建真实项目默认启用“本集后期”。本集片段全部人工通过后，本机 whisper.cpp 识别已拼接原声音轨，得到实际文字与时间戳；GPT 通过 Nolan 现有 ChatGPT 订阅连接分批校对专名、错别字和标点。不需要 OpenAI API Key，不调用云端转录，不把本机识别记成供应商实际费用。GPT 订阅额度仍按账户规则消耗。
+
+macOS 执行 `bash scripts/install-local-asr.sh` 安装 whisper-cpp 并下载官方多语言 small 模型，或者配置已有模型路径。详见[本地识别安装](local-asr.md)。示例项目设置：
+
+```json
+{"postproduction":{"enabled":true},"subtitles":{"mode":"local","backend":"whisper_cpp","language":"zh","call_cap":0}}
+```
+
+字幕源是实际识别文字，计划对白只作为当前集的短参考。GPT 不接收小说、历次报告或全部提示词，不新增未识别的对白，不推测数字；每条字幕的时间和数量保持不变。每批最多60条，已完成校对按输入哈希缓存，重启后复用。原声音轨或模型改变则重新本地识别。识别结果为空而本集计划有对白时会停止，不伪装成已完成字幕。
+
+本地识别仍可能误听数字、人名和叠音；文字校对不代表 GPT 听过音频。网页能展开字幕，最终由用户观看带字幕配乐的整集。单独提交字幕意见只修正字幕并重新合成，保留全部视频、时间轴和已批准音乐。
+
+## 兼容的云端模式
+
 Nolan 的自动字幕从已经生成的视频音轨识别文字和时间，不把剧本台词直接当成实际对白。分镜阶段仍然规划台词；当前主流程先将本集镜头合成，再识别整集实际音轨，时间戳直接对应本集时间轴。镜头重生成或时长变化后，应重新识别合成音轨并重建字幕。
 
-当前适配器使用 OpenAI `POST /v1/audio/transcriptions`，选择 `whisper-1`、`verbose_json` 和分段时间戳。该组合已经依据官方文档核实；当前代码不接受直接替换为没有相同时间戳返回约定的模型。[OpenAI 转录接口](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create)、[文件转录指南](https://developers.openai.com/api/docs/guides/speech-to-text)
+旧项目可选的云端适配器使用 OpenAI `POST /v1/audio/transcriptions`，选择 `whisper-1`、`verbose_json` 和分段时间戳。该组合已经依据官方文档核实；当前代码不接受直接替换为没有相同时间戳返回约定的模型。[OpenAI 转录接口](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create)、[文件转录指南](https://developers.openai.com/api/docs/guides/speech-to-text)
 
 配置放在项目的 `settings.subtitles` 中：
 
@@ -27,4 +43,4 @@ Nolan 的自动字幕从已经生成的视频音轨识别文字和时间，不�
 
 已有字幕的成片可单独校正文字。例如在终端对话中输入 `E001 字幕 把“你好”改成“您好”`，或者运行 `nolan captions 项目目录 E001 --version 1 --correction '把你好改成您好'`。校正针对所见的具体版本，保留视频镜头和已有时间戳，再重新合成供人工审片；它不会为了字幕错字重新付费生成全部视频。网页审片室也有独立的“修改字幕”按钮。对白本身错误、漏说或口型错误应通过镜头返工处理。
 
-没有配置转录时可以选择主流程提供的无字幕或人工对齐方式，但不能将计划台词标成“已与实际声音校准”。当前适配器没有安装或调用本地 Whisper，也没有进行任何付费测试。
+没有配置转录时可以选择主流程提供的无字幕或人工对齐方式，但不能将计划台词标成“已与实际声音校准”。云端适配器没有进行付费测试。本地识别路径已在 Apple Silicon Mac 上用已有视频音轨验证。
