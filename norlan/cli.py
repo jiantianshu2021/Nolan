@@ -42,7 +42,11 @@ def summary(s):
     mode = "DEMO · 合成占位素材" if s["mode"] == "demo" else "真实制作"
     rows = [f"\n{s['title']}  [{mode}]", f"状态：{STATUS.get(s['status'],s['status'])}"]
     b = s["budget"]
-    rows.append(f"预算 {b['currency']}：上限 {b['limit']:.2f} / 保守已用 {b['spent']:.2f} / 在途 {b['reserved']:.2f} / 待核实 {b['unknown']:.2f}")
+    actual = f"{b['actual_cost']:.6f}".rstrip("0").rstrip(".") + " " + b["currency"] if b.get("actual_cost_jobs") else "待对账"
+    usage = f"{b['usage_cost']:.6f}".rstrip("0").rstrip(".") + " " + b["currency"] if b.get("usage_cost_jobs") else "暂无可计费用量"
+    rows.append(f"已核对实际费用：{actual}；按实际用量计费（未对账）：{usage}")
+    rows.append(f"预算 {b['currency']}：上限 {b['limit']:.2f} / 已结束调用占用上限 {b['spent']:.2f} / 在途预留 {b['reserved']:.2f} / 结果待核实 {b['unknown']:.2f}")
+    rows.append("用量计费未含折扣、赠额等账单调整；预算占用不等于实际扣款。可用 norlan costs 查看逐调用明细。")
     p = s["plan"]
     rows.append(f"规划 v{p['version']}：{STATUS.get(p['status'],p['status'])}")
     for a in s["assets"]:
@@ -163,6 +167,12 @@ def main(argv=None):
     p.add_argument("outcome", choices=["resume", "spent", "released"])
     p.add_argument("--note", required=True)
     p.add_argument("--task-id")
+    p = sub.add_parser("costs", help="查看费用、仅查询现有任务用量或导入逐调用账单")
+    p.add_argument("project", type=Path)
+    p.add_argument("--sync", action="store_true", help="仅 GET 已有任务的供应商用量，不生成素材")
+    p.add_argument("--confirm-no-video-input", action="store_true", help="确认历史任务没有输入参考视频，允许按当前公开价折算；须与 --sync 一起使用")
+    p.add_argument("--import-bill", type=Path, help="导入含 job_id/amount/currency/bill_reference/scope=per_call 的 JSON 明细列表")
+    p.add_argument("--json", action="store_true", help="输出经过筛选的费用账本 JSON")
     p = sub.add_parser("import-plan")
     p.add_argument("project", type=Path)
     p.add_argument("file", type=Path)
@@ -193,6 +203,35 @@ def main(argv=None):
         if args.command == "doctor":
             return doctor()
         root = args.project.expanduser().resolve()
+        if args.command == "costs":
+            from .costs import cost_report, format_report, sync_usage
+            if args.confirm_no_video_input and not args.sync:
+                raise ValueError("--confirm-no-video-input 必须与 --sync 一起使用。")
+            imported = None
+            if args.import_bill:
+                try:
+                    records = json.loads(args.import_bill.expanduser().read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    raise ValueError("无法读取账单 JSON；请提供逐调用明细列表，不能导入账户或日期汇总金额。") from None
+                core.import_bill_costs(root, records)
+                imported = len(records)
+            synced = sync_usage(root, args.confirm_no_video_input) if args.sync else None
+            report = cost_report(root)
+            if imported is not None:
+                report["imported_records"] = imported
+            if synced is not None:
+                report["sync"] = synced
+            if args.json:
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+            else:
+                if imported is not None:
+                    print(f"已核对导入 {imported} 条逐调用账单记录（相同记录重复导入不会重复计费）。")
+                if synced is not None:
+                    print(f"用量查询：已同步 {synced['synced']}，已跳过 {synced['skipped']}，无可查询用量 {synced['unavailable']}。")
+                    for error in synced["errors"]:
+                        print(error["job_id"] + "：" + error["error"], file=sys.stderr)
+                print(format_report(report))
+            return 1 if synced and synced["errors"] else 0
         if args.command in {"new", "demo"}:
             mode = "demo" if args.command == "demo" else args.mode
             novel = "Norlan synthetic workflow demo." if args.command == "demo" else args.novel.expanduser().read_text(encoding="utf-8")

@@ -9,6 +9,9 @@ import uuid
 from pathlib import Path
 
 from . import core, media
+from .billing import price_snapshot
+from .voice import (AuditionSelectionError, audition_duration, audition_profile,
+                    audition_selection_key, build_audition_prompt, validate_audition)
 
 
 def demo_plan():
@@ -124,13 +127,17 @@ def _poll_video(root, job_id, output):
             raise core.GateError("视频任务没有供应商 ID，必须先对账")
         result = provider.poll_video(job["task_id"])
         if result["status"] == "completed":
+            core.record_usage(root, job_id, result)
             # Retain ID before download. An expired/download-failed URL is never
             # permission to resubmit the paid generation task.
             core.update_job(root, job_id, state="download_pending", accounting="spent")
+            if not result.get("url"):
+                raise core.GateError("供应商任务已完成，但未返回可下载地址；用量已保存，继续时只查询原任务。")
             provider.download(result["url"], output)
             core.update_job(root, job_id, state="completed", output=_rel(root, output))
             return
         if result["status"] == "failed":
+            core.record_usage(root, job_id, result)
             core.update_job(root, job_id, state="failed", accounting="spent")
             raise core.GateError("供应商报告任务失败，已按上限保守计账；再次运行可在重试限制内返工")
         # A pause stops waiting/new submissions; the saved task is polled again
@@ -159,11 +166,15 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
         provider.preflight("video")
     job_id = f"{kind}-{item_id}-{uuid.uuid4().hex[:8]}"
     amount = 0 if s["mode"] == "demo" else duration * s["settings"]["caps"]["video_second"]
-    core.reserve(root, job_id, kind, item_id, amount)
+    pricing = price_snapshot({**s["settings"]["ark"], "currency": s["budget"]["currency"]}, kind)
+    core.reserve(root, job_id, kind, item_id, amount, pricing=pricing if s["mode"] == "live" else None)
     with core.transaction(root) as current:
         obj = core._find(current, "asset" if kind == "voice" else "shot", item_id)
         obj["job_id"] = job_id
         obj.setdefault("attempts", []).append({"job_id": job_id, "revision": obj.get("revision", 0), "time": core.now()})
+        if kind == "voice":
+            current["jobs"][job_id]["audition_profile"] = copy.deepcopy(obj.get("audition_profile", {}))
+            current["jobs"][job_id]["duration"] = duration
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     if s["mode"] == "demo":
         media.synthetic_clip(output, prompt, duration, index=len(s["jobs"]))
@@ -180,6 +191,43 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
     core.update_job(root, job_id, state="submitted", task_id=result["id"])
     _poll_video(root, job_id, output)
     return job_id
+
+
+def _select_audition(root, asset, character):
+    """Select a sourced excerpt once per voice/feedback/source change."""
+    novel = (Path(root) / "source/novel.txt").read_text(encoding="utf-8")
+    signature = audition_selection_key(asset, character["name"], core.digest(Path(root) / "source/novel.txt"))
+    if asset.get("audition_selection_key") == signature and asset.get("audition_selection_error"):
+        raise core.GateError(asset["audition_selection_error"])
+
+    def invalid_selection(message):
+        _save_asset(root, asset["id"], audition_selection_key=signature, audition_selection_error=message)
+        raise core.GateError(message)
+
+    needs_selection = not asset.get("audition_text") or (asset["status"] == "rejected" and asset.get("audition_selection_key") != signature)
+    if needs_selection and asset.get("audition_selection_key") != signature:
+        selection = _brain(root, "select_voice_audition", novel, asset, character)
+        if not isinstance(selection, dict) or any(not isinstance(selection.get(key), str) or len(selection[key]) > 4000
+                for key in ("audition_text", "audition_reason", "audition_source")):
+            invalid_selection("声音选句返回无效；尚未提交试音，请在 Norlan 中检查原文选句。")
+        candidate = {**asset, **{key: selection[key] for key in ("audition_text", "audition_reason", "audition_source")}}
+        if candidate["audition_text"].strip():
+            try:
+                validate_audition(candidate, novel, character["name"])
+            except AuditionSelectionError as exc:
+                invalid_selection(str(exc))
+        elif candidate["audition_source"].strip() or not candidate["audition_reason"].strip():
+            invalid_selection("没有合适试音句时必须说明原因，并将台词和来源留空；尚未提交试音。")
+        values = {key: candidate[key] for key in ("audition_text", "audition_reason", "audition_source")}
+        values["audition_selection_key"] = signature
+        values["audition_selection_error"] = ""
+        _save_asset(root, asset["id"], **values)
+        asset = {**asset, **values}
+    try:
+        validate_audition(asset, novel, character["name"])
+    except AuditionSelectionError as exc:
+        raise core.GateError(str(exc) + (" 选句说明：" + asset["audition_reason"] if asset.get("audition_reason") else "")) from None
+    return asset
 
 
 def _assets(root):
@@ -199,6 +247,10 @@ def _assets(root):
             total_attempts = sum(j["item_id"] == asset["id"] and j["kind"] in {"voice", "image"} for j in s["jobs"].values())
             if total_attempts >= s["settings"]["max_attempts"]:
                 raise core.GateError("资产已达到尝试上限；请调整方案或显式提高上限：" + asset["id"])
+            if asset["kind"] == "voice" and s["mode"] == "live":
+                character = core._find(s, "asset", asset["character_id"])
+                core._check_artifact(root, character)
+                asset = _select_audition(root, asset, character)
             version = asset["version"] + 1
             with core.transaction(root) as current:
                 a = core._find(current, "asset", asset["id"])
@@ -220,8 +272,13 @@ def _assets(root):
                 raise core.GateError("声音试音必须绑定一个已批准的角色，不能猜测说话人")
             core._check_artifact(root, character)
             images = [core.safe_path(root, character["file"])]
-            _video(root, "voice", asset["id"], out, 5,
-                prompt + "\n角色声音试音：说一句简短中文对白，只保留清晰人声，无配乐、无其他说话人。", images,
+            voice_prompt = asset.get("audition_prompt", "已提交声音试片，仅恢复原任务") if recovering else (
+                "DEMO / SYNTHETIC PLACEHOLDER voice audition" if s["mode"] == "demo" else build_audition_prompt(asset))
+            duration = 5 if recovering or s["mode"] == "demo" else audition_duration(asset)
+            if not recovering:
+                _save_asset(root, asset["id"], audition_profile=audition_profile(asset), audition_prompt=voice_prompt)
+            _video(root, "voice", asset["id"], out, duration,
+                voice_prompt, images,
                 old_job=asset.get("job_id") if recovering else None)
             ev = _relative_evidence(root, media.extract_evidence(out, Path(root) / "evidence" / f"{asset['id']}-v{version}"))
             if not ev.get("audio"):
@@ -233,7 +290,8 @@ def _assets(root):
                 provider.preflight("image")
             job_id = f"image-{asset['id']}-{uuid.uuid4().hex[:8]}"
             amount = 0 if s["mode"] == "demo" else s["settings"]["caps"]["image"]
-            core.reserve(root, job_id, "image", asset["id"], amount)
+            pricing = price_snapshot({**s["settings"]["ark"], "currency": s["budget"]["currency"]}, "image")
+            core.reserve(root, job_id, "image", asset["id"], amount, pricing=pricing if s["mode"] == "live" else None)
             with core.transaction(root) as current:
                 a = core._find(current, "asset", asset["id"])
                 a["job_id"] = job_id
@@ -242,7 +300,9 @@ def _assets(root):
                 if s["mode"] == "demo":
                     media.synthetic_asset(out, asset["id"] + " / DEMO", "#2563eb" if asset["kind"] == "character" else "#059669")
                 else:
-                    provider.generate_image(prompt, out)
+                    result = provider.generate_image(prompt, out,
+                        on_usage=lambda usage: core.record_usage(root, job_id, usage))
+                    core.record_usage(root, job_id, result)
                 core.update_job(root, job_id, state="completed", accounting="spent", output=_rel(root, out))
             except Exception as exc:
                 uncertain = getattr(exc, "uncertain", True)
@@ -296,6 +356,12 @@ def _shot_context(root, ep, shot, previous):
             image_manifest.append({"index": len(images), "role": "previous_actual_tail", "shot_id": previous["id"], "sha256": core.digest(path)})
     if len(images) > 9 or len(voices) > 3:
         raise core.GateError("参考素材超过模型限制，不能静默省略人物或声音参考")
+    if voices:
+        voices, reference_details = media.prepare_voice_references(voices, Path(root) / "media" / "voice-references")
+        for reference, details in zip(voice_manifest, reference_details, strict=True):
+            if reference["sha256"] != details["source_sha256"]:
+                raise core.GateError("声音原件在准备参考时发生变化，不能提交未批准的音频")
+            reference.update(details)
     context = {"episode": {k: ep.get(k) for k in ("id", "title", "summary", "feedback")},
         "style": s["plan"].get("style"), "assets": [{k: a.get(k) for k in
             ("id", "kind", "name", "prompt", "character_id", "version", "sha256")} for a in assets],

@@ -25,7 +25,8 @@ class Response(io.BytesIO):
 
 def plan():
     return {"title": "测试", "style": "二维动画", "ratio": "16:9",
-            "assets": [{"id": "hero", "kind": "character", "name": "主角", "prompt": "蓝色外套", "character_id": ""}],
+            "assets": [{"id": "hero", "kind": "character", "name": "主角", "prompt": "蓝色外套", "character_id": "",
+                        "audition_text": "", "audition_reason": "", "audition_source": ""}],
             "episodes": [{"id": "E001", "title": "开端", "summary": "寻找信封", "music_prompt": "钢琴淡入",
                           "shots": [{"id": "S001", "duration": 5, "prompt": "向右走", "dialogue": "找到你了。",
                                      "asset_ids": ["hero"], "scene_id": "room", "continuity_notes": "右手拿信封"}]}]}
@@ -176,7 +177,8 @@ class ProviderTests(unittest.TestCase):
 class BrainTests(unittest.TestCase):
     def test_voice_plan_requires_real_character_and_same_shot_reference(self):
         valid = plan()
-        valid["assets"].append({"id": "hero_voice", "kind": "voice", "name": "主角声音", "prompt": "清晰低音", "character_id": "hero"})
+        valid["assets"].append({"id": "hero_voice", "kind": "voice", "name": "主角声音", "prompt": "清晰低音", "character_id": "hero",
+                                "audition_text": "", "audition_source": "", "audition_reason": "原文未找到可稳定试音的完整台词"})
         valid["episodes"][0]["shots"][0]["asset_ids"].append("hero_voice")
         validate_plan(valid)
         valid["assets"][-1]["character_id"] = "missing"

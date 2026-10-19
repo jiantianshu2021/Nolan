@@ -32,6 +32,27 @@ def _pick(value: dict, keys: tuple[str, ...]) -> dict:
     return {key: value[key] for key in keys if key in value}
 
 
+def _public_cost_sync_result(value: dict) -> dict:
+    """Expose counts and bounded job identifiers, never arbitrary exceptions."""
+    if not isinstance(value, dict) or not isinstance(value.get("errors"), list):
+        raise ValueError("费用同步摘要无效")
+    result = {}
+    for key in ("synced", "skipped", "unavailable"):
+        count = value.get(key)
+        if type(count) is not int or count < 0:
+            raise ValueError("费用同步摘要无效")
+        result[key] = count
+    result["error_count"] = len(value["errors"])
+    errors = []
+    for item in value["errors"][:100]:
+        job_id = item.get("job_id", "") if isinstance(item, dict) else ""
+        if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", job_id):
+            job_id = ""
+        errors.append({"job_id": job_id, "error": "该调用用量暂时无法同步，请检查任务 ID、权限或服务状态。"})
+    result["errors"] = errors
+    return result
+
+
 def public_state(state: dict) -> dict:
     """Keep credentials, source novel, provider responses and settings off the UI API."""
     result = _pick(state, ("id", "title", "mode", "status", "paused", "created_at", "updated_at"))
@@ -41,9 +62,12 @@ def public_state(state: dict) -> dict:
         message = re.sub(r"(?i)\b(?:sk|ark)[-_][A-Za-z0-9_-]{12,}", "[已隐藏凭据]", message)
         message = re.sub(r"(?i)(api[_ -]?key|authorization|secret|token)\s*[:=]\s*[^\s,;]+", r"\1=[已隐藏]", message)
         result["last_error"] = message
-    result["budget"] = _pick(state.get("budget", {}), ("limit", "spent", "reserved", "unknown", "currency"))
+    from .billing import summarize_costs
+    budget = state.get("budget", {})
+    result["budget"] = _pick(budget, ("limit", "spent", "reserved", "unknown", "currency", "available"))
+    result["budget"].update(summarize_costs(state.get("jobs", {}), budget.get("currency", "CNY")))
     result["assets"] = [
-        _pick(asset, ("id", "kind", "name", "prompt", "status", "version", "file", "audio_file", "feedback"))
+        _pick(asset, ("id", "kind", "name", "prompt", "status", "version", "file", "audio_file", "feedback", "audition_profile"))
         for asset in state.get("assets", [])
     ]
     episodes = []
@@ -102,14 +126,52 @@ class _Context:
     nonce: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     lock: threading.Lock = field(default_factory=threading.Lock)
     mutation_lock: threading.Lock = field(default_factory=threading.Lock)
+    cost_sync_lock: threading.Lock = field(default_factory=threading.Lock)
     running: bool = False
     worker_error: str | None = None
+    cost_sync_running: bool = False
+    cost_sync_result: dict | None = None
+    cost_sync_error: str | None = None
 
     def state(self) -> dict:
         state = public_state(_core().load_project(self.project_dir))
         with self.lock:
             state["dashboard"] = {"running": self.running, "error": self.worker_error}
+        with self.cost_sync_lock:
+            state["dashboard"]["cost_sync"] = {"running": self.cost_sync_running,
+                                              "result": self.cost_sync_result, "error": self.cost_sync_error}
         return state
+
+    def launch_cost_sync(self) -> bool:
+        """Query usage in a separate worker; never resume or run production."""
+        with self.cost_sync_lock:
+            if self.cost_sync_running:
+                return False
+            self.cost_sync_running = True
+            self.cost_sync_result = None
+            self.cost_sync_error = None
+
+        def worker():
+            try:
+                from .costs import sync_usage
+                result = _public_cost_sync_result(sync_usage(self.project_dir, confirm_no_video_input=False))
+                with self.cost_sync_lock:
+                    self.cost_sync_result = result
+            except Exception:
+                with self.cost_sync_lock:
+                    self.cost_sync_error = "费用同步未完成，请检查本机方舟凭据、网络和任务权限。"
+            finally:
+                with self.cost_sync_lock:
+                    self.cost_sync_running = False
+
+        try:
+            threading.Thread(target=worker, name="norlan-cost-sync", daemon=True).start()
+        except Exception:
+            with self.cost_sync_lock:
+                self.cost_sync_running = False
+                self.cost_sync_error = "费用同步未能启动，请稍后重试。"
+            raise RuntimeError("费用同步未能启动，请稍后重试。") from None
+        return True
 
     def launch(self) -> bool:
         with self.lock:
@@ -276,6 +338,10 @@ class _Handler(BaseHTTPRequestHandler):
                 raise ValueError
             action = data.get("action")
             with context.mutation_lock:
+                if action == "sync_costs":
+                    if not context.launch_cost_sync():
+                        return self._error(409, "费用正在同步，请稍候，无需重复启动。")
+                    return self._json(202, context.state())
                 if action == "run":
                     if not context.launch():
                         return self._error(409, "制作正在进行，无需重复启动。")

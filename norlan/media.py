@@ -1,11 +1,12 @@
 """Local, deterministic media operations. No model or network calls are made here.
 
 Every media argument is a local file, subprocesses use argv (never a shell), and
-completed outputs replace their destinations only after successful encoding.
+completed outputs are published only after successful encoding.
 """
 
 from __future__ import annotations
 
+import fcntl
 import functools
 import hashlib
 import html
@@ -111,6 +112,108 @@ def probe(path: Path) -> dict:
         "frame_rate": (video or {}).get("avg_frame_rate"),
         "size": path.stat().st_size,
     }
+
+
+def prepare_voice_references(
+    paths: list[Path], output_dir: Path,
+) -> tuple[list[Path], list[dict]]:
+    """Fit already-approved local voice samples into the provider's 15 s limit.
+
+    The caller must verify approval and source hashes first. This only takes a
+    beginning excerpt: it does not regenerate, speed up, join, or approve voices.
+    Original samples and their approval files remain unchanged. Cropping can cut
+    off a sentence and is only for reference conditioning, not a dialogue edit.
+    """
+    if len(paths) > 3:
+        raise ValueError("单次最多使用 3 条已批准的声音参考。")
+    if not paths:
+        return [], []
+    sources = []
+    for raw_path in paths:
+        try:
+            path = _local(raw_path)
+            info = probe(path)
+        except (MediaError, OSError, ValueError) as exc:
+            raise ValueError(f"声音参考缺失或无法读取：{Path(raw_path).name}。") from exc
+        if (not info["has_audio"] or info["has_video"] or info["duration"] < 2
+                or info["sample_rate"] <= 0):
+            raise ValueError(f"声音参考必须是至少 2 秒的有效音频文件：{path.name}。")
+        sources.append((path, info, _sha256(path)))
+    duration_sum = sum(info["duration"] for _, info, _ in sources)
+    limit = (15.0 if duration_sum <= 15.0
+             else math.floor(14.9 / len(sources) * 1000) / 1000)
+    prepared: list[Path] = []
+    metadata: list[dict] = []
+    for source, info, source_sha in sources:
+        if info["duration"] <= limit:
+            prepared.append(source)
+            metadata.append({
+                "source_sha256": source_sha, "sha256": source_sha,
+                "trim_start": 0.0, "trim_duration": info["duration"], "derived": False,
+            })
+            continue
+        directory = Path(output_dir).expanduser().resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f"voice-ref-{source_sha}-0-{round(limit * 1000)}ms.wav"
+        manifest = target.with_suffix(".json")
+        # One lock covers both immutable files, so concurrent callers never
+        # observe an unfinished pair or replace an existing cached derivative.
+        with (directory / ".voice-references.lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if target.exists() or manifest.exists() or target.is_symlink() or manifest.is_symlink():
+                try:
+                    if (target.is_symlink() or manifest.is_symlink()
+                            or not target.is_file() or not manifest.is_file()):
+                        raise ValueError("缓存文件不完整")
+                    cached = json.loads(manifest.read_text(encoding="utf-8"))
+                    actual = probe(target)
+                    if (cached.get("version") != 1 or cached.get("source_sha256") != source_sha
+                            or cached.get("requested_duration") != limit
+                            or cached.get("trim_start") != 0.0 or cached.get("derived") is not True
+                            or cached.get("sha256") != _sha256(target)
+                            or not actual["has_audio"] or actual["has_video"]
+                            or not 2 <= actual["duration"] <= limit
+                            or cached.get("trim_duration") != actual["duration"]):
+                        raise ValueError("缓存校验不通过")
+                except (OSError, MediaError, ValueError, AttributeError) as exc:
+                    raise ValueError("声音参考裁切缓存已改变或不完整；停止复用，原始审批音频未改变。") from exc
+            else:
+                with tempfile.TemporaryDirectory(prefix=".norlan-voice-ref-", dir=directory) as raw:
+                    temporary = Path(raw)
+                    candidate = temporary / "reference.wav"
+                    # Sample-based trimming never rounds past the allocated
+                    # duration, including inputs with non-24/48 kHz sample rates.
+                    end_sample = math.floor(limit * info["sample_rate"])
+                    _ffmpeg([
+                        "-protocol_whitelist", "file,pipe", "-i", str(source),
+                        "-map", "0:a:0", "-vn", "-sn", "-dn", "-map_metadata", "-1",
+                        "-af", f"atrim=start_sample=0:end_sample={end_sample},asetpts=PTS-STARTPTS",
+                        "-c:a", "pcm_s16le", str(candidate),
+                    ])
+                    actual = probe(candidate)
+                    if (not actual["has_audio"] or actual["has_video"]
+                            or not 2 <= actual["duration"] <= limit):
+                        raise ValueError("声音参考裁切结果时长无效；原始审批音频未改变。")
+                    if _sha256(source) != source_sha:
+                        raise ValueError("声音参考原件在裁切期间发生改变；请重新核对审批。")
+                    cached = {
+                        "version": 1, "source_sha256": source_sha, "sha256": _sha256(candidate),
+                        "requested_duration": limit, "trim_start": 0.0,
+                        "trim_duration": actual["duration"], "derived": True,
+                    }
+                    candidate_manifest = temporary / "reference.json"
+                    candidate_manifest.write_text(json.dumps(cached, ensure_ascii=False), encoding="utf-8")
+                    # Exclusive publication refuses to overwrite even if another
+                    # process ignores the lock and creates the same destination.
+                    os.link(candidate, target)
+                    os.link(candidate_manifest, manifest)
+        prepared.append(target)
+        metadata.append({key: cached[key] for key in (
+            "source_sha256", "sha256", "trim_start", "trim_duration", "derived",
+        )})
+    if sum(item["trim_duration"] for item in metadata) > 15.0:
+        raise ValueError("声音参考总时长仍超过 15 秒，停止提交。")
+    return prepared, metadata
 
 
 @functools.lru_cache(maxsize=1)

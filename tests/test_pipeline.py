@@ -37,9 +37,14 @@ def fake_media():
         write(output, b"composed:" + b"".join(Path(p).read_bytes() for p in clips))
         return {"duration": len(clips) * 4}
 
+    def voice_references(paths, directory):
+        return list(paths), [{"source_sha256": core.digest(p), "sha256": core.digest(p),
+                              "trim_start": 0, "trim_duration": 4, "derived": False} for p in paths]
+
     with ExitStack() as stack:
         for name, fn in {"synthetic_asset": asset, "synthetic_clip": clip, "extract_evidence": evidence,
-                         "compose": compose, "probe": lambda p: {"duration": 4, "has_video": True, "has_audio": True}}.items():
+                         "compose": compose, "prepare_voice_references": voice_references,
+                         "probe": lambda p: {"duration": 4, "has_video": True, "has_audio": True}}.items():
             stack.enter_context(patch.object(pipeline.media, name, side_effect=fn))
         yield
 

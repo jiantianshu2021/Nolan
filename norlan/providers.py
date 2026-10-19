@@ -21,6 +21,7 @@ import re
 import socket
 import subprocess
 import tempfile
+from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
@@ -167,7 +168,13 @@ class ArkProvider:
             raise ProviderError("Ark 请求超时、连接中断或响应无法解析；未自动重发。",
                                 uncertain=method == "POST", request_id=request_id) from None
 
-    def generate_image(self, prompt: str, output: Path, references: list[Path] | None = None) -> dict:
+    def generate_image(self, prompt: str, output: Path, references: list[Path] | None = None,
+                       *, on_usage: Callable[[dict], None] | None = None) -> dict:
+        """Report metering before decoding/downloading a possibly billable image.
+
+        ``on_usage`` receives only billing metadata. If durable recording fails,
+        its exception stops local processing; the generation POST is not retried.
+        """
         refs = list(references or [])
         if not prompt.strip() or len(refs) > 9:
             raise ProviderError("图片提示词不能为空，参考图最多 9 张。")
@@ -185,10 +192,38 @@ class ArkProvider:
         if refs:
             payload["image"] = [_data_uri(p, "image", 30_000_000) for p in refs]
         result, request_id = self._request("POST", "/images/generations", payload)
+        if on_usage is not None:
+            usage = result.get("usage")
+            usage = usage if isinstance(usage, dict) else {}
+            # Do not forward response text, image bytes, signed URLs, or arbitrary
+            # provider extensions into the durable billing callback.
+            metered = {key: value for key in ("generated_images", "input_images", "output_tokens", "total_tokens")
+                       if isinstance(value := usage.get(key), int) and not isinstance(value, bool) and value >= 0}
+            items = result.get("data")
+            items = items if isinstance(items, list) else []
+            has_image = any(isinstance(item, dict) and not item.get("error")
+                            and (item.get("b64_json") or item.get("url")) for item in items)
+            has_error = bool(result.get("error")) or any(isinstance(item, dict) and item.get("error") for item in items)
+            count = metered.get("generated_images")
+            if has_image or (count is not None and count > 0):
+                provider_status = "succeeded"
+            elif count == 0 or has_error:
+                provider_status = "failed"
+            else:
+                provider_status = "unknown"
+            reported_model = result.get("model")
+            if not isinstance(reported_model, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", reported_model):
+                reported_model = None
+            on_usage({"model": reported_model, "usage": metered,
+                      "request_id": request_id, "provider_status": provider_status})
         try:
             item = result["data"][0]
+            if not isinstance(item, dict):
+                raise ValueError("invalid image item")
             if item.get("error"):
-                raise ProviderError("图片生成服务返回失败：" + _safe_code(item["error"].get("code")), request_id=request_id)
+                error = item["error"]
+                code = error.get("code") if isinstance(error, dict) else None
+                raise ProviderError("图片生成服务返回失败：" + _safe_code(code), request_id=request_id)
             if item.get("b64_json"):
                 data = base64.b64decode(item["b64_json"], validate=True)
                 if not data:
@@ -206,7 +241,8 @@ class ArkProvider:
         except (KeyError, IndexError, TypeError, ValueError, OSError):
             raise ProviderError("图片响应或本地保存失败；需核对已生成结果，禁止直接重发。",
                                 uncertain=True, request_id=request_id) from None
-        return {"output": str(Path(output)), "request_id": request_id, "usage": result.get("usage", {})}
+        return {"output": str(Path(output)), "request_id": request_id, "usage": result.get("usage", {}),
+                "model": result.get("model"), "provider_status": "succeeded"}
 
     def _audio_duration(self, path: Path) -> float:
         try:
@@ -260,18 +296,33 @@ class ArkProvider:
             raise ProviderError("视频任务响应缺少 ID；需人工核对，未自动重发。", uncertain=True, request_id=request_id)
         return {"id": result["id"], "request_id": request_id}
 
+    def video_usage(self, task_id: str) -> dict:
+        """GET existing task metadata only; no media download or generation."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", task_id):
+            raise ProviderError("无效的视频任务 ID。")
+        result, request_id = self._request("GET", "/contents/generations/tasks/" + quote(task_id, safe=""))
+        return {"id": task_id, "request_id": request_id, "provider_status": result.get("status"),
+                "model": result.get("model"), "usage": result.get("usage", {}),
+                **{key: result[key] for key in ("resolution", "service_tier") if key in result}}
+
     def poll_video(self, task_id: str) -> dict:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", task_id):
             raise ProviderError("无效的视频任务 ID。")
         result, request_id = self._request("GET", "/contents/generations/tasks/" + quote(task_id, safe=""))
         status = result.get("status")
-        base = {"id": task_id, "request_id": request_id, "provider_status": status, "usage": result.get("usage", {})}
+        base = {"id": task_id, "request_id": request_id, "provider_status": status, "usage": result.get("usage", {}),
+                "model": result.get("model"),
+                **{key: result[key] for key in ("resolution", "service_tier") if key in result}}
         if status == "succeeded":
             content = result.get("content")
             url = content.get("video_url") if isinstance(content, dict) else None
-            if not url:
-                raise ProviderError("已完成任务缺少下载地址；请核对原任务，不要重新生成。")
-            return {**base, "status": "completed", "url": _https_url(url)}
+            try:
+                url = _https_url(url) if isinstance(url, str) and url else None
+            except (ProviderError, ValueError):
+                url = None
+            # Metering survives missing/invalid output URLs. The orchestrator
+            # must persist it before reporting a recoverable download problem.
+            return {**base, "status": "completed", "url": url}
         if status in {"failed", "cancelled", "expired"}:
             error = result.get("error")
             return {**base, "status": "failed", "error": _safe_code(error.get("code", status) if isinstance(error, dict) else status)}

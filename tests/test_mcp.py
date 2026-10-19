@@ -48,7 +48,7 @@ class MCPTests(unittest.TestCase):
             self.assertEqual(self.initialize(protocol)["result"]["protocolVersion"], protocol)
         self.assertEqual(self.initialize("future")["result"]["protocolVersion"], "2025-06-18")
         tools = self.server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})["result"]["tools"]
-        self.assertEqual(len(tools), 11)
+        self.assertEqual(len(tools), 13)
         self.assertTrue(all(t["inputSchema"]["additionalProperties"] is False for t in tools))
         self.assertEqual(self.server.handle({"jsonrpc": "2.0", "id": 4, "method": "ping"})["result"], {})
         self.assertIsNone(self.server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
@@ -86,7 +86,7 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         responses = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([response["id"] for response in responses], [1, 2])
-        self.assertEqual(len(responses[1]["result"]["tools"]), 11)
+        self.assertEqual(len(responses[1]["result"]["tools"]), 13)
         self.assertEqual(result.stderr, "")
 
     def test_unknown_and_privileged_tools_are_not_exposed(self):

@@ -36,6 +36,7 @@ _PLAN_ERRORS = {
     "asset_text_required": ("资产缺少名称或生成说明。", "name 和 prompt 均须填写非空字符串。"),
     "voice_character_required": ("声音资产未绑定有效角色。", "voice 的 character_id 必须指向已定义的 character 资产。画外声音也须定义声源角色，并在提示词中说明不入画。"),
     "nonvoice_character_forbidden": ("非声音资产不能绑定 character_id。", "仅 voice 填写 character_id；其他资产省略此字段或填空字符串，角色自身也不例外。"),
+    "voice_selection_invalid": ("试音选句或来源不符合要求。", "为 voice 填写原文连续台词 audition_text、选句依据 audition_reason 和含说话人归属的原文摘录 audition_source。无合适句时 text/source 留空并在 reason 说明；非 voice 填空。"),
     "episode_title_required": ("每集必须包含标题。", "填写非空字符串 title。"),
     "shots_required": ("每集必须包含分镜。", "shots 使用非空分镜列表。"),
     "duration_invalid": ("单镜时长必须为 4–15 秒整数。", "duration 填写 4 至 15 的整数秒数。"),
@@ -84,11 +85,23 @@ def event(project_state, action, **details):
 
 
 def _totals(state):
+    from .billing import summarize_costs
     b = state["budget"]
+    def exposure(job):
+        billing = job.get("billing", {})
+        values = [job["amount"]]
+        if billing.get("currency") == b["currency"]:
+            for key in ("usage_cost", "actual_cost"):
+                value = billing.get(key)
+                if not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+                    values.append(value)
+        return max(values)
     for status in ("spent", "reserved", "unknown"):
-        b[status] = round(sum(j["amount"] for j in state["jobs"].values()
+        b[status] = round(sum(exposure(j) for j in state["jobs"].values()
                               if j["accounting"] == status), 6)
     b["available"] = round(b["limit"] - b["spent"] - b["reserved"] - b["unknown"], 6)
+    b.update(summarize_costs(state["jobs"], b["currency"]))
+    b["basis"] = "预算占用与费用分开；用量费用按公开标准价计算，实际费用须核对账单"
 
 
 def _write(root, state):
@@ -220,6 +233,15 @@ def validate_plan(plan):
             voices[asset["id"]] = character_id
         elif asset.get("character_id", "") != "":
             raise PlanValidationError("nonvoice_character_forbidden", path)
+        fields = ("audition_text", "audition_reason", "audition_source")
+        if any(key in asset for key in fields):
+            if any(not isinstance(asset.get(key, ""), str) or len(asset.get(key, "")) > 4000 for key in fields):
+                raise PlanValidationError("voice_selection_invalid", f"plan.assets[{index}].audition_text")
+            if asset["kind"] != "voice" and any(asset.get(key, "").strip() for key in fields):
+                raise PlanValidationError("voice_selection_invalid", f"plan.assets[{index}].audition_text")
+            if asset["kind"] == "voice":
+                if not asset.get("audition_reason", "").strip() or bool(asset.get("audition_text", "").strip()) != bool(asset.get("audition_source", "").strip()):
+                    raise PlanValidationError("voice_selection_invalid", f"plan.assets[{index}].audition_text")
     for ep_index, ep in enumerate(episodes):
         ep_path = f"plan.episodes[{ep_index}]"
         identifier(ep, ep_path)
@@ -252,6 +274,15 @@ def validate_plan(plan):
 
 def install_plan(root, plan):
     validate_plan(plan)
+    from .voice import AuditionSelectionError, validate_audition
+    novel = (Path(root) / "source/novel.txt").read_text(encoding="utf-8")
+    characters = {a["id"]: a["name"] for a in plan["assets"] if a["kind"] == "character"}
+    for index, asset in enumerate(plan["assets"]):
+        if asset["kind"] == "voice" and asset.get("audition_text", "").strip():
+            try:
+                validate_audition(asset, novel, characters[asset["character_id"]])
+            except AuditionSelectionError:
+                raise PlanValidationError("voice_selection_invalid", f"plan.assets[{index}].audition_source") from None
     with transaction(root) as s:
         if any(j["state"] in {"submitting", "submitted", "download_pending", "uncertain"} for j in s["jobs"].values()):
             raise GateError("尚有未完成或结果不明的调用，不能覆盖规划")
@@ -501,7 +532,7 @@ def configure(root, settings=None, limit=None, currency=None):
     return load_project(root)
 
 
-def reserve(root, job_id, kind, item_id, amount):
+def reserve(root, job_id, kind, item_id, amount, *, pricing=None):
     """Persist BEFORE calling provider. Unknown outcomes stay charged/reserved."""
     with transaction(root) as s:
         if job_id in s["jobs"]:
@@ -526,6 +557,9 @@ def reserve(root, job_id, kind, item_id, amount):
         s["jobs"][job_id] = {"id": job_id, "kind": kind, "item_id": item_id,
             "amount": round(amount, 6), "accounting": "reserved", "state": "submitting",
             "created_at": now(), "task_id": None}
+        if pricing is not None:
+            s["jobs"][job_id]["billing"] = {"price": copy.deepcopy(pricing),
+                "currency": s["budget"]["currency"], "status": "usage_missing"}
         event(s, "call_reserved", id=job_id, amount=amount, kind=kind)
     return load_project(root)["jobs"][job_id]
 
@@ -533,7 +567,7 @@ def reserve(root, job_id, kind, item_id, amount):
 def update_job(root, job_id, **values):
     with transaction(root) as s:
         j = s["jobs"][job_id]
-        if set(values) & {"id", "item_id", "kind", "amount", "created_at"}:
+        if set(values) & {"id", "item_id", "kind", "amount", "created_at", "billing"}:
             raise ValueError("已登记的调用身份和预算金额不可更改")
         if "accounting" in values and values["accounting"] not in {"spent", "reserved", "unknown", "released"}:
             raise ValueError("账本状态无效")
@@ -546,6 +580,64 @@ def update_job(root, job_id, **values):
         j.update(values, updated_at=now())
         event(s, "call_updated", id=job_id, state=j["state"], accounting=j["accounting"])
     return load_project(root)["jobs"][job_id]
+
+
+def record_usage(root, job_id, result, *, historical_pricing=None):
+    """Persist only whitelisted provider usage; never treat it as a paid bill."""
+    from .billing import usage_record
+    with transaction(root) as state:
+        job = state["jobs"][job_id]
+        billing = job.setdefault("billing", {"currency": state["budget"]["currency"]})
+        if not billing.get("price") and historical_pricing:
+            billing["price"] = copy.deepcopy(historical_pricing)
+            billing["price"]["historical_lookup"] = True
+        record = usage_record(result, billing.get("price", {}))
+        if record.get("currency") != state["budget"]["currency"]:
+            record.update(currency=state["budget"]["currency"], usage_cost=None, status="pricing_missing")
+        # A later incomplete poll must not erase an already recorded usage result.
+        if record.get("usage_cost") is None and billing.get("usage_cost") is not None:
+            return copy.deepcopy(job)
+        if all(billing.get(key) == value for key, value in record.items()):
+            return copy.deepcopy(job)
+        billing.update(record)
+        billing["usage_recorded_at"] = now()
+        event(state, "provider_usage_recorded", id=job_id)
+    return load_project(root)["jobs"][job_id]
+
+
+def import_bill_costs(root, records):
+    """Operator-supplied per-call bill amounts; aggregate bills cannot be allocated."""
+    if not isinstance(records, list) or not records or len(records) > 10000:
+        raise ValueError("账单应为非空调用明细列表")
+    with transaction(root) as state:
+        seen = set()
+        for row in records:
+            if not isinstance(row, dict):
+                raise ValueError("每条账单必须是调用明细对象")
+            job_id, amount = row.get("job_id"), row.get("amount")
+            reference = row.get("bill_reference")
+            if not isinstance(job_id, str) or job_id in seen or job_id not in state["jobs"]:
+                raise ValueError("账单调用 ID 缺失、重复或不存在")
+            seen.add(job_id)
+            if row.get("currency") != state["budget"]["currency"]:
+                raise ValueError("账单币种必须与项目相同，不能自动换算")
+            if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount) or amount < 0:
+                raise ValueError("实际费用必须是非负有限金额")
+            if row.get("scope") != "per_call" or not isinstance(reference, str) or not 0 < len(reference.strip()) <= 300:
+                raise ValueError("必须提供逐调用账单依据；不可把账户或日期汇总金额分摊到单次调用")
+            job = state["jobs"][job_id]
+            if job["accounting"] not in {"spent", "unknown"}:
+                raise ValueError("仅可核实已结束或结果待核实的调用费用")
+            billing = job.setdefault("billing", {})
+            amount = round(amount, 6)
+            if "actual_cost" in billing:
+                if billing["actual_cost"] == amount and billing.get("bill_reference") == reference.strip():
+                    continue
+                raise GateError("已有不同核实账单，不能覆盖原记录")
+            billing.update(actual_cost=amount, currency=row["currency"], bill_reference=reference.strip(),
+                           bill_basis="operator_verified_per_call", bill_verified_at=now())
+            event(state, "bill_cost_verified", id=job_id, amount=amount)
+    return load_project(root)
 
 
 def reconcile(root, job_id, outcome, note, task_id=None):
@@ -568,4 +660,41 @@ def reconcile(root, job_id, outcome, note, task_id=None):
         else:
             raise ValueError("对账结果只能是 resume / spent / released")
         event(s, "human_reconciled", id=job_id, outcome=outcome, note=note)
+    return load_project(root)
+
+
+def set_voice_audition(root, asset_id, text, source, reason):
+    """Save a sourced selection without approval, generation or version changes."""
+    from .voice import AuditionSelectionError, audition_selection_key, validate_audition
+    values = {"audition_text": text, "audition_source": source, "audition_reason": reason}
+    if any(not isinstance(value, str) or not value.strip() or len(value) > 4000 for value in values.values()):
+        raise GateError("试音选句、原文来源和选句理由须为非空文本，每项不超过4000字；缺少原文时须先补充或选择，不能编造台词。")
+    with run_lock(root), transaction(root) as state:
+        asset = _find(state, "asset", asset_id)
+        if asset.get("kind") != "voice":
+            raise GateError("原文试音选句只能设置在声音资产上。")
+        if asset.get("status") not in {"planned", "rejected"}:
+            raise GateError("仅待制作或已申请返工的声音可调整选句；候选或已批准声音须先由用户明确提出返工。")
+        jobs = [job for job in state["jobs"].values()
+                if job.get("kind") == "voice" and job.get("item_id") == asset_id]
+        if any(job.get("accounting") == "unknown" or job.get("state") in
+               {"submitting", "submitted", "download_pending"} for job in jobs):
+            raise GateError("该声音尚有在途或结果不明的调用；请先恢复原任务或完成对账，再调整试音选句。")
+        active = state["jobs"].get(asset.get("job_id", ""), {})
+        if asset["status"] != "rejected" and active.get("state") == "completed":
+            raise GateError("该声音已有完成但尚待恢复的任务；请先取回并审核旧素材，再决定是否返工。")
+        character = _find(state, "asset", asset.get("character_id"))
+        if character.get("kind") != "character":
+            raise GateError("声音试音必须绑定一个有效角色，不能猜测说话人。")
+        novel_path = safe_path(root, "source/novel.txt")
+        novel = novel_path.read_text(encoding="utf-8")
+        candidate = {**asset, **values}
+        try:
+            validate_audition(candidate, novel, character["name"])
+        except AuditionSelectionError as exc:
+            raise GateError(str(exc)) from None
+        asset.update(values)
+        asset["audition_selection_key"] = audition_selection_key(asset, character["name"], digest(novel_path))
+        asset.pop("audition_selection_error", None)
+        event(state, "voice_audition_selected", id=asset_id)
     return load_project(root)

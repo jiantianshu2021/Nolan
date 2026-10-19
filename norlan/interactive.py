@@ -25,6 +25,7 @@ _PROVIDERS = {"chatgpt", "openai"}
 _MCP_TOOLS = (
     "project_status", "list_projects", "read_novel", "create_project", "save_plan",
     "run_production", "pause_production", "request_revision", "correct_captions",
+    "set_voice_audition", "get_costs",
     "open_review", "set_creative_brief",
 )
 _SERVICE_ENV = (
@@ -50,6 +51,11 @@ _DIRECTOR_INSTRUCTIONS = """你是 Norlan，用户在终端里的 GPT 对话伙�
 save_plan 保存待用户审批的完整分集、资产、分镜与声画方案。逐镜参考已批准人物/场景/声音资产，
 以实际上一镜头尾帧与动作状态续接，维护空间、服装、道具、对白、环境声和配乐衔接。
 声音资产必须绑定角色；画外声音也需要声源角色，并在镜头提示词明确该角色不出镜。
+试音从该角色原剧本里选连续完整、较平稳的较长台词，保存原句、逐字来源和理由；
+以普通话中性语气确认音色，剧情情绪留在分镜。没有合适原句时解释缺口，不编测试句；
+用 set_voice_audition 保存另选的有效原句，候选或已批准声音须先按用户明确意见申请返工。
+费用用 get_costs 查看或同步：已核对账单金额、按实际用量计算的标准价、预算占用分开说明；
+没有账单时不得把预留或标准价称为真实扣款。同步只查询已有任务，不触发视频生成。
 保存失败时按工具返回的字段路径和修复建议修改候选方案，再提交；不要猜测 ID 格式或改动无关字段。
 所有制作操作只能使用提供的 Norlan MCP 工具，不能运行 shell、改文件、浏览器自动化或调用其他工具绕过流程。
 计划、人物、场景、声音资产与每集完整成片必须由人审批。不要把聊天中的“通过”代写为审批记录；
