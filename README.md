@@ -112,6 +112,8 @@ norlan configure ./my-drama --file ./settings.json --budget 30
 
 密钥只通过终端环境变量读取，不要放入小说、提示词、配置文件或 Git 仓库。ChatGPT 订阅不包含 OpenAI API 和火山媒体服务费用；即梦网页登录也不能代替 `ARK_API_KEY`。
 
+图片与视频须分别指定模型：`image_model` 使用已开通的 Seedream，`video_model` 使用已开通的 Seedance 2.x；同一方舟 API Key 可以在获得相应权限后调用两者。Seedream 5.0 flash/pro 的图片请求采用其支持的单图参数。已知的模型类型填反会在本地预检时报告，避免发送无效请求。模型 ID 与参数能力请以[官方图片接口](https://docs.volcengine.com/docs/ark/image-generation-api?lang=zh)为准。
+
 每次付费提交前，程序先写入预算预留。超时或进程中断导致结果不明时保留额度并停止新提交，不把“没有收到结果”当成“没有扣费”。预算是基于你填写单价的本地控制，不能代替供应商的实时账单和账户消费限额；已经提交的远程任务也不会因本地暂停而自动取消。
 
 ## 配乐与字幕

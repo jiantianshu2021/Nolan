@@ -1,6 +1,6 @@
 """Explicit, non-retrying adapters for the official Volcengine Ark API.
 
-References (checked 2026-10-19):
+References (checked 2026-10-20):
 https://console.volcengine.com/ark/region:cn-beijing/docs/create-video-generation-task-api
 https://console.volcengine.com/ark/region:cn-beijing/docs/get-video-generation-task-api
 https://docs.volcengine.com/docs/ark/image-generation-api?lang=zh
@@ -130,7 +130,12 @@ class ArkProvider:
         model = str(self.config.get(f"{kind}_model", "")).strip()
         if not model:
             raise ProviderError(f"请先配置已开通服务的 {kind}_model。")
-        if kind == "video" and "seedance-1-" in model:
+        family = model.lower()
+        if kind == "image" and "seedance-" in family:
+            raise ProviderError("Seedance 用于视频生成，不能配置为 image_model；请另选已开通的 Seedream 图片模型。")
+        if kind == "video" and "seedream-" in family:
+            raise ProviderError("Seedream 用于图片生成，不能配置为 video_model；请另选已开通的 Seedance 视频模型。")
+        if kind == "video" and "seedance-1-" in family:
             raise ProviderError("连续性流程需要 Seedance 2.x 全模态参考能力，不能使用 Seedance 1.x。")
         return model
 
@@ -166,9 +171,17 @@ class ArkProvider:
         refs = list(references or [])
         if not prompt.strip() or len(refs) > 9:
             raise ProviderError("图片提示词不能为空，参考图最多 9 张。")
-        payload = {"model": self._model("image"), "prompt": prompt,
+        model = self._model("image")
+        payload = {"model": model, "prompt": prompt,
                    "size": self.config.get("image_size", "2K"), "response_format": "b64_json",
-                   "watermark": True, "stream": False, "sequential_image_generation": "disabled"}
+                   "watermark": True, "stream": False}
+        # Seedream 5.0 pro/flash generate one image and reject this option.
+        # Preserve explicit single-image mode for 4.x/5.0 lite and existing endpoints.
+        if re.search(r"seedream-5-0-(?:pro|flash)(?:-|$)", model.lower()):
+            # Pipeline assets are saved as .png and later uploaded as image/png.
+            payload["output_format"] = "png"
+        else:
+            payload["sequential_image_generation"] = "disabled"
         if refs:
             payload["image"] = [_data_uri(p, "image", 30_000_000) for p in refs]
         result, request_id = self._request("POST", "/images/generations", payload)

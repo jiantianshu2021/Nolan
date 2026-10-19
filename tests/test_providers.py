@@ -101,6 +101,61 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(result["output"], str(output))
         self.assertEqual(json.loads(http.call_args.args[0].data)["sequential_image_generation"], "disabled")
 
+    def test_seedream_flash_and_pro_use_supported_single_image_request(self):
+        for model in ("doubao-seedream-5-0-flash-260915", "doubao-seedream-5-0-pro-260628"):
+            with self.subTest(model=model):
+                api = ArkProvider({"image_model": model})
+                output = self.path / "asset.png"
+                response = {"data": [{"b64_json": base64.b64encode(b"generated-image").decode()}]}
+                with patch("norlan.providers._api_open", return_value=Response(response)) as http:
+                    api.generate_image("同一人物的正面肖像", output, [self.image])
+                payload = json.loads(http.call_args.args[0].data)
+                self.assertEqual(payload["model"], model)
+                self.assertNotIn("sequential_image_generation", payload)
+                self.assertEqual(payload["response_format"], "b64_json")
+                self.assertEqual(payload["output_format"], "png")
+                self.assertFalse(payload["stream"])
+                self.assertEqual(payload["size"], "2K")
+                self.assertEqual(payload["image"], ["data:image/png;base64," + base64.b64encode(b"image-data").decode()])
+                self.assertEqual(output.read_bytes(), b"generated-image")
+                self.assertEqual(http.call_count, 1)
+
+    def test_older_seedream_models_keep_explicit_single_image_mode(self):
+        for model in ("doubao-seedream-4-0-250828", "doubao-seedream-4-5-251128",
+                      "doubao-seedream-5-0-260128", "ep-previously-configured"):
+            with self.subTest(model=model):
+                api = ArkProvider({"image_model": model})
+                response = {"data": [{"b64_json": base64.b64encode(b"generated-image").decode()}]}
+                with patch("norlan.providers._api_open", return_value=Response(response)) as http:
+                    api.generate_image("单张人物肖像", self.path / "asset.png")
+                payload = json.loads(http.call_args.args[0].data)
+                self.assertEqual(payload["sequential_image_generation"], "disabled")
+                self.assertNotIn("output_format", payload)
+
+    def test_known_image_video_model_mismatch_is_rejected_before_network(self):
+        for kind, model, expected in (("image", "doubao-seedance-2-0-fast-260128", "image_model"),
+                                      ("video", "doubao-seedream-5-0-flash-260915", "video_model")):
+            with self.subTest(kind=kind), patch("norlan.providers._api_open") as http:
+                api = ArkProvider({f"{kind}_model": model})
+                with self.assertRaisesRegex(ProviderError, expected):
+                    api.preflight(kind)
+                with self.assertRaisesRegex(ProviderError, expected):
+                    if kind == "image":
+                        api.generate_image("角色", self.path / "asset.png")
+                    else:
+                        api.submit_video("继续动作", 5, [])
+                http.assert_not_called()
+
+    def test_seedream_flash_timeout_is_uncertain_and_never_retried(self):
+        api = ArkProvider({"image_model": "doubao-seedream-5-0-flash-260915"})
+        with patch("norlan.providers._api_open", side_effect=TimeoutError("super-secret")) as http:
+            with self.assertRaises(ProviderError) as caught:
+                api.generate_image("单张人物肖像", self.path / "asset.png")
+        self.assertEqual(http.call_count, 1)
+        self.assertTrue(caught.exception.uncertain)
+        self.assertNotIn("super-secret", str(caught.exception))
+        self.assertFalse((self.path / "asset.png").exists())
+
     def test_poll_does_not_submit_again(self):
         with patch("norlan.providers._api_open", return_value=Response({"status": "succeeded", "content": {"video_url": "https://example.test/movie.mp4"}})) as http:
             result = self.api.poll_video("task-123")
