@@ -29,8 +29,10 @@ class HumanReviewPipelineTests(unittest.TestCase):
         self.verdict = "fail"
         self.api = Mock()
         self.api.submit_video.side_effect = lambda *a, **kw: {"id": "synthetic-" + str(self.api.submit_video.call_count)}
-        self.api.poll_video.return_value = {"status": "completed", "url": "https://example.test/synthetic.mp4"}
-        self.api.download.side_effect = lambda url, output: write(output, b"SYNTHETIC " + str(output).encode())
+        self.api.poll_video.return_value = {"status": "completed", "url": "https://example.test/synthetic.mp4",
+                                            "last_frame_url": "https://example.test/synthetic-tail.jpg"}
+        self.api.download.side_effect = lambda url, output: write(output,
+            b"\xff\xd8\xffSYNTHETIC OFFICIAL TAIL" if url.endswith(".jpg") else b"SYNTHETIC " + str(output).encode())
         self.enterContext(patch.object(pipeline, "_ark", return_value=self.api))
         self.brain = self.enterContext(patch.object(pipeline, "_brain", side_effect=self.fake_brain))
 
@@ -149,7 +151,8 @@ class HumanReviewPipelineTests(unittest.TestCase):
         self.api.download.side_effect = ProviderError("synthetic network failure")
         self.assertEqual(pipeline.run(self.root)["status"], "blocked")
         original_job = self.shot()["job_id"]
-        self.api.download.side_effect = lambda url, output: write(output, b"SYNTHETIC RECOVERED")
+        self.api.download.side_effect = lambda url, output: write(output,
+            b"\xff\xd8\xffSYNTHETIC OFFICIAL TAIL" if url.endswith(".jpg") else b"SYNTHETIC RECOVERED")
         self.assertEqual(pipeline.run(self.root)["status"], "review_required")
         self.assertEqual(self.shot()["job_id"], original_job)
         self.assertEqual(self.shot()["version"], 1)
@@ -170,7 +173,8 @@ class HumanReviewPipelineTests(unittest.TestCase):
         self.assertNotIn("file", self.shot())
         self.assertEqual(self.shot()["version"], 2)
         self.assertEqual(self.shot()["history"][0]["sha256"], original["sha256"])
-        self.api.download.side_effect = lambda url, output: write(output, b"SYNTHETIC V2 RECOVERY")
+        self.api.download.side_effect = lambda url, output: write(output,
+            b"\xff\xd8\xffSYNTHETIC OFFICIAL TAIL" if url.endswith(".jpg") else b"SYNTHETIC V2 RECOVERY")
         core.set_paused(self.root, False)
         state = pipeline.run(self.root)
         self.assertEqual(state["status"], "review_required")

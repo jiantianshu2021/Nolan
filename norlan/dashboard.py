@@ -186,6 +186,34 @@ def _public_shot_failures(state, shot):
     return result
 
 
+def _public_shot_continuity(state, episode, shot):
+    """Describe the saved engine references without exposing source URLs."""
+    result = {}
+    manifest = shot.get("reference_manifest")
+    context = manifest.get("context") if isinstance(manifest, dict) else None
+    previous = context.get("previous_actual") if isinstance(context, dict) else None
+    if isinstance(previous, dict):
+        mode = previous.get("reference_mode")
+        source_id = previous.get("shot_id")
+        source_index = next((index + 1 for index, item in enumerate(episode.get("shots", []))
+                             if isinstance(item, dict) and item.get("id") == source_id), None)
+        key, role = ("video_references", "previous_original_video") if mode == "original_video" else (
+            "image_references", "previous_official_tail")
+        references = context.get(key)
+        referenced = isinstance(references, list) and any(
+            isinstance(item, dict) and item.get("role") == role and item.get("shot_id") == source_id
+            and type(item.get("index")) is int and item["index"] > 0 and _valid_sha(item.get("sha256"))
+            for item in references)
+        if source_index and referenced and mode in {"original_video", "official_tail"}:
+            label = (f"衔接参考：第 {source_index} 段原始视频" if mode == "original_video"
+                     else f"衔接参考：第 {source_index} 段官方尾帧")
+            result["continuity_reference"] = {"mode": mode, "label": label}
+    job = _bound_shot_job(state, shot)
+    if _current_shot_artifact(shot) and isinstance(job.get("official_tail_error"), dict) and job["official_tail_error"]:
+        result["official_tail_warning"] = "本段视频可正常审阅；官方尾帧尚未保存，后续衔接需先恢复原任务素材。"
+    return result
+
+
 def _public_shot_report(record, version):
     """Only publish an advisory report bound to this exact video's hash."""
     review = record.get("review")
@@ -404,6 +432,7 @@ def public_state(state: dict) -> dict:
                                      for part in shot["subshots"] if isinstance(part, dict)]
             entry["version"] = _version(shot.get("version"))
             entry.update(_public_shot_failures(state, shot))
+            entry.update(_public_shot_continuity(state, episode, shot))
             if shot.get("continuity_review"):
                 entry["continuity_review"] = "前段已返工，请重新审看片段接续。当前视频保留，由你决定是否需要重做。"
             if not _current_shot_artifact(shot):

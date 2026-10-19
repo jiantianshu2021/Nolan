@@ -136,8 +136,10 @@ class PipelineIntakeTests(unittest.TestCase):
             self.make_live()
             provider = Mock()
             provider.submit_video.return_value = {"id": "synthetic-failed-clip"}
-            provider.poll_video.return_value = {"status": "completed", "url": "https://example.test/clip"}
-            provider.download.side_effect = lambda url, output: write(output, b"SYNTHETIC FAILED CLIP")
+            provider.poll_video.return_value = {"status": "completed", "url": "https://example.test/clip",
+                "last_frame_url": "https://example.test/official-tail.jpg", "created_at": core.now()}
+            provider.download.side_effect = lambda url, output: write(output,
+                b"\xff\xd8\xffSYNTHETIC OFFICIAL TAIL" if url.endswith(".jpg") else b"SYNTHETIC FAILED CLIP")
             refinements = []
             initial = core.load_project(self.root)["episodes"][0]["shots"][0]
 
@@ -209,11 +211,12 @@ class PipelineIntakeTests(unittest.TestCase):
 
             def poll(task_id):
                 self.assertEqual(stage(), "shot_generation")
-                return {"status": "completed", "url": "https://example.test/" + task_id}
+                return {"status": "completed", "url": "https://example.test/" + task_id,
+                        "last_frame_url": "https://example.test/" + task_id + ".jpg", "created_at": core.now()}
 
             def download(url, output):
                 self.assertEqual(stage(), "shot_download")
-                write(output, b"SYNTHETIC VIDEO " + url.encode())
+                write(output, (b"\xff\xd8\xffSYNTHETIC OFFICIAL TAIL " if url.endswith(".jpg") else b"SYNTHETIC VIDEO ") + url.encode())
 
             def brain(root, method, *args, **kwargs):
                 if method == "refine_shot":

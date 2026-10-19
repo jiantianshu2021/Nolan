@@ -422,7 +422,16 @@ shot 是一次视频 API 任务，subshots 是其内部镜头时间表。保持 
 返工意见若要求改变既定时间结构，应留待修改规划，不能在细化提示词时偷偷更改。
 旧项目没有 subshots 时保留原单段结构，不擅自拆镜或增加任务。一次人工返工仅生成一个新版本，之后重新等待人工审批。
 一个视频任务对应整个片段；不能声称能单独重做内镜头，也不能因 GPT 检查报告自行安排下一轮生成。
-图片顺序必须对应 context 中的引用清单，明确哪些锁人物/场景，哪些是实际尾帧；不能凭空声称有参考视频。
+视频生成引擎的图片编号严格对应 context.image_references，明确哪些锁人物/场景、哪些是官方尾帧；不能凭空声称有参考视频。
+context.observation_images（如有）是你实际接收的附图顺序，和视频引擎的图片编号分开。
+仅供观察的图片（sent_to_video_engine=false）只能用于分析实际结尾，不得把它写成已经上传给视频引擎的图片参考，
+也不得将它的观察编号写入 prompt 的图片引用；只在存在 generation_image_index 时用该编号引用引擎图片。
+旧上下文没有 observation_images 时，按 image_references 识别附图，不能虚构新的引用。
+previous_actual.reference_mode=original_video 时，只有 context.video_references 确认的原始视频才是视频参考，
+视频 1 / video1 指向已人工接受的上一片段原片。要求从视频结尾继续，保留最后的站位、视线、动作方向、道具状态和对白终点，
+不重演上一片段、不重复已说台词。只生成本段计划时长的新内容，视频参考的时长不计入本段输出时长。
+previous_actual.reference_mode=official_tail 时，用 image_references 中 previous_official_tail 的实际图片编号承接。
+参考视频传给视频生成引擎；你只收到这里的图片和文字，没有播放完整视频或听到音轨，不得声称已观看完整动作或核实声音。
 承接动作的起点、人物相对位置、视线和道具持握。previous_actual.human_decision 表示前段的人工决定，
 accepted_deviations 保留该版本原报告的疑点，用户接受版本不等于逐项证实这些疑点；以实际已接受画面为准，
 不要把疑点当成必须纠正的事实。已人工通过的实际前段是连续性基准，即使旧 GPT 报告曾判 fail。

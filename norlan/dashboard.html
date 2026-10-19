@@ -170,8 +170,10 @@ function shotCard(shot,index,previous){
  heading.append(el("h4",null,"片段 "+(index+1)+" · "+shot.id),el("span","shot-version"));card.append(heading);
  const progress=el("div","shot-progress");progress.id="shot-progress-"+shot.id;
  progress.append(el("span","shot-phase"),el("span","shot-timing"));card.append(progress);
+ if(shot.continuity_reference?.label)card.append(el("p","muted continuity-reference",shot.continuity_reference.label));
  if(shot.file){const video=el("video");video.controls=true;video.preload="metadata";video.playsInline=true;video.src=mediaURL(shot.file);video.setAttribute("aria-label","片段 "+(index+1)+" · 第 "+(shot.version||1)+" 版");card.append(video);const report=advisoryReport(shot.review);if(report)card.append(report);else card.append(el("p","muted",shot.status==="reviewing"?"GPT 正在整理本版本的审查报告。":"本版本暂无对应的 GPT 审查报告。"));}
  else card.append(el("div","shot-placeholder",shot.generation_error||(shot.status==="generating"?"生成完成后，视频和本版本的报告会保留在此处。":"本段视频将在生成后显示。")));
+ if(shot.official_tail_warning)card.append(el("p","preview-pending official-tail-warning",shot.official_tail_warning));
  if(shot.continuity_review)card.append(el("p","feedback-copy",shot.continuity_review));
  const failure=failureDetails(shot.failure,undefined,shot.failure_recoverable);if(failure)card.append(failure);
  if(shot.status==="review_required"||shot.status==="generation_failed"||(!shot.file&&shot.failure))card.append(shotReview(shot));

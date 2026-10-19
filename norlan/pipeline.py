@@ -4,12 +4,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import re
 import time
 import uuid
 from pathlib import Path
 
-from . import core, media
+from . import core, media, official
 from .billing import price_snapshot
 from .failures import exception_failure, sanitize_failure
 from .voice import (AuditionSelectionError, audition_duration, audition_profile,
@@ -254,10 +255,26 @@ def _poll_video(root, job_id, output):
                 _record_video_failure(root, job_id, {"stage": "download", "message": "供应商任务已完成，但未返回可下载地址；继续时只查询原任务。", "uncertain": False})
                 raise core.GateError("供应商任务已完成，但未返回可下载地址；用量已保存，继续时只查询原任务。")
             try:
-                provider.download(result["url"], output)
+                original = job.get("origin_video", {})
+                if original:
+                    if not Path(output).is_file() or core.digest(output) != original.get("sha256"):
+                        raise core.GateError("已保存的原始视频缺失或发生变化；未覆盖已有原件。")
+                else:
+                    provider.download(result["url"], output)
+                    core.update_job(root, job_id, output=_rel(root, output), origin_video={
+                        "file": _rel(root, output), "sha256": core.digest(output), "task_id": job["task_id"],
+                        "created_at": result.get("created_at") or job["created_at"]})
             except Exception as exc:
                 _record_video_failure(root, job_id, exception_failure(exc, "download"))
                 raise
+            if job.get("kind") == "video":
+                try:
+                    official.cache_tail(root, job_id, result, provider)
+                except Exception as exc:
+                    # A missing ancillary image cannot hide a paid-for video
+                    # or authorize another POST. Resolve it by GET before the
+                    # next segment needs an official continuity reference.
+                    official.tail_error(root, job_id, exc)
             core.update_job(root, job_id, state="completed", output=_rel(root, output), failure=None)
             return
         if result["status"] == "failed":
@@ -274,13 +291,19 @@ def _poll_video(root, job_id, output):
         time.sleep(s["settings"]["poll_seconds"])
 
 
-def _video(root, kind, item_id, output, duration, prompt, references, audio_references=None, old_job=None):
+def _video(root, kind, item_id, output, duration, prompt, references, audio_references=None, old_job=None,
+           previous_video=None, reference_duration=0):
     s = _gate(root)
     if old_job:
         job = s["jobs"][old_job]
         if job.get("output") and core.safe_path(root, job["output"]) != Path(output).resolve():
             raise core.GateError("恢复任务输出路径与已登记版本不符，禁止复制旧任务为新版本")
         if job["state"] == "completed" and Path(output).is_file():
+            origin = job.get("origin_video")
+            if origin and (origin.get("file") != _rel(root, output)
+                           or origin.get("task_id") != job.get("task_id")
+                           or origin.get("sha256") != core.digest(output)):
+                raise core.GateError("已完成任务的原始视频发生变化；未覆盖或采用修改后的文件。")
             return old_job
         if job.get("task_id") and job["state"] != "failed":
             _poll_video(root, old_job, output)
@@ -292,14 +315,21 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
     if provider:
         provider.preflight("video")
     job_id = f"{kind}-{item_id}-{uuid.uuid4().hex[:8]}"
-    amount = 0 if s["mode"] == "demo" else duration * s["settings"]["caps"]["video_second"]
-    pricing = price_snapshot({**s["settings"]["ark"], "currency": s["budget"]["currency"]}, kind)
+    if previous_video is not None and (isinstance(reference_duration, bool)
+            or not isinstance(reference_duration, (int, float)) or not math.isfinite(reference_duration)
+            or not 2 <= reference_duration <= 15):
+        raise core.GateError("原始视频参考时长尚未核实；未提交新任务。")
+    amount = 0 if s["mode"] == "demo" else (duration + reference_duration) * s["settings"]["caps"]["video_second"]
+    pricing = price_snapshot({**s["settings"]["ark"], "currency": s["budget"]["currency"]}, kind,
+                             has_video_input=previous_video is not None)
     core.reserve(root, job_id, kind, item_id, amount, pricing=pricing if s["mode"] == "live" else None)
     with core.transaction(root) as current:
         obj = core._find(current, "asset" if kind == "voice" else "shot", item_id)
         obj["job_id"] = job_id
         obj.setdefault("attempts", []).append({"job_id": job_id, "revision": obj.get("revision", 0),
                                                "version": obj.get("version", 0), "time": core.now()})
+        current["jobs"][job_id].update(duration=duration, reference_video_duration=reference_duration,
+                                       return_last_frame=s["mode"] == "live")
         if kind == "voice":
             current["jobs"][job_id]["audition_profile"] = copy.deepcopy(obj.get("audition_profile", {}))
             current["jobs"][job_id]["duration"] = duration
@@ -310,8 +340,10 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
         return job_id
     try:
         _job_progress(root, {"kind": kind, "item_id": item_id}, "shot_submission")
-        result = provider.submit_video(prompt, duration, references,
-                                       audio_references=audio_references or [])
+        video_options = {"audio_references": audio_references or []}
+        if previous_video is not None:
+            video_options["previous_video"] = previous_video
+        result = provider.submit_video(prompt, duration, references, **video_options)
     except Exception as exc:
         uncertain = getattr(exc, "uncertain", True)
         detail = {**exception_failure(exc, "submission"), "uncertain": uncertain}
@@ -504,12 +536,28 @@ def _shot_context(root, ep, shot, previous):
             continuity["accepted_deviations"] = copy.deepcopy(report.get("issues", []))
             continuity["acceptance_note"] = "用户已接受这个视频版本；报告中的疑点未必被用户逐项证实。以实际已接受画面承接，不擅自纠正其既有细节。"
         if continuity["same_scene"]:
-            tail = previous["evidence"]["tail_frame"]
-            path = core.safe_path(root, tail)
-            if not path.is_file() or core.digest(path) != previous["evidence"].get("frame_hashes", {}).get(tail):
-                raise core.GateError("前镜尾帧缺失或内容改变，不能沿用未核实的画面参考")
-            images.append(path)
-            image_manifest.append({"index": len(images), "role": "previous_actual_tail", "shot_id": previous["id"], "sha256": core.digest(path)})
+            override = shot.get("continuity_reference", {})
+            use_video = (isinstance(override, dict) and override.get("mode") == "original_video"
+                         and override.get("revision") == shot.get("revision", 0))
+            if s["mode"] == "live" and use_video:
+                if (override.get("source_shot_id") != previous["id"]
+                        or override.get("source_sha256") != previous["sha256"]):
+                    raise core.GateError("原始视频参考授权与当前批准版本不一致。")
+                continuity["reference_mode"] = "original_video"
+            else:
+                if s["mode"] == "live":
+                    path = official.get_tail(root, previous, _ark(root))
+                    role = "previous_official_tail"
+                    continuity["reference_mode"] = "official_tail"
+                else:
+                    tail = previous["evidence"]["tail_frame"]
+                    path = core.safe_path(root, tail)
+                    if not path.is_file() or core.digest(path) != previous["evidence"].get("frame_hashes", {}).get(tail):
+                        raise core.GateError("前镜尾帧缺失或内容改变，不能沿用未核实的画面参考")
+                    role = "previous_actual_tail"
+                    continuity["reference_mode"] = "synthetic_demo"
+                images.append(path)
+                image_manifest.append({"index": len(images), "role": role, "shot_id": previous["id"], "sha256": core.digest(path)})
     if len(images) > 9 or len(voices) > 3:
         raise core.GateError("参考素材超过模型限制，不能静默省略人物或声音参考")
     if voices:
@@ -526,6 +574,22 @@ def _shot_context(root, ep, shot, previous):
         "audio_strategy": "使用批准的声音参考，镜头不生成背景配乐；配乐在整集时间线统一添加。",
         "limitations": "尾帧是实际画面参考；不能保证身份、口型和音色绝对一致。"}
     return context, images, voices
+
+
+def _observation_images(root, context, images, previous):
+    """Local evidence may inform GPT, but it is never an Ark image reference."""
+    observed = list(images)
+    manifest = [{**item, "generation_image_index": item["index"], "sent_to_video_engine": True}
+                for item in context.get("image_references", [])]
+    if (previous and (context.get("previous_actual") or {}).get("reference_mode") == "original_video"):
+        tail = previous.get("evidence", {}).get("tail_frame")
+        path = core.safe_path(root, tail) if tail else None
+        if path and path.is_file() and core.digest(path) == previous["evidence"].get("frame_hashes", {}).get(tail):
+            observed.append(path)
+            manifest.append({"index": len(observed), "role": "previous_observation_tail", "shot_id": previous["id"],
+                             "sha256": core.digest(path), "sent_to_video_engine": False})
+    context["observation_images"] = manifest
+    return observed
 
 
 def _shot(root, ep_id, shot_id, previous):
@@ -562,16 +626,39 @@ def _shot(root, ep_id, shot_id, previous):
     if not recovering:
         _new_work_gate(s)
         _progress(root, ep_id, "shot_preparation", shot_id)
-    context, images, voices = _shot_context(root, ep, shot, previous)
+    previous_video, reference_duration = None, 0
+    if recovering:
+        # Already-submitted jobs need only their original task ID, even after
+        # source URLs/records have expired. Do not resolve inputs again.
+        saved = shot.get("reference_manifest", {})
+        context = copy.deepcopy(saved.get("context", {}))
+        images, voices = [], []
+        observations = []
+        observed_manifest = context.get("observation_images", context.get("image_references", []))
+        for relative, info in zip(saved.get("observations", saved.get("images", [])), observed_manifest):
+            path = core.safe_path(root, relative)
+            if path.is_file() and core.digest(path) == info.get("sha256"):
+                observations.append(path)
+        if len(observations) != len(observed_manifest):
+            context["observation_images"] = []
+            context["observation_warning"] = "部分历史参考图已不可读取；本次只对实际可读的抽样图出具报告。"
+            observations = []
+    else:
+        context, images, voices = _shot_context(root, ep, shot, previous)
+        if (context.get("previous_actual") or {}).get("reference_mode") == "original_video":
+            previous_video, reference_duration, video_manifest = official.resolve_video(root, previous, _ark(root))
+            context["video_references"] = [video_manifest]
+        observations = _observation_images(root, context, images, previous)
     if not recovering:
         if s["mode"] == "demo":
             refined = {"prompt": shot["prompt"] + " " + shot.get("feedback", ""), "dialogue": "", "continuity_notes": "Synthetic demo"}
         else:
-            refined = _brain(root, "refine_shot", shot, context, images)
+            refined = _brain(root, "refine_shot", shot, context, observations)
         version = shot.get("version", 0) + 1
         _save_shot(root, shot_id, refined_prompt=refined, version=version, status="generating", generation_error=None,
             reference_manifest={"images": [_rel(root, f) for f in images],
-                "audio": [_rel(root, f) for f in voices], "context": context})
+                "audio": [_rel(root, f) for f in voices], "context": context,
+                "observations": [_rel(root, f) for f in observations]})
         shot = core._find(core.load_project(root), "shot", shot_id)
     version = shot["version"]
     out = Path(root) / "media" / ep_id / f"{shot_id}-v{version}.mp4"
@@ -590,9 +677,12 @@ def _shot(root, ep_id, shot_id, previous):
     if shot.get("dialogue"):
         prompt += "\n必须使用的原定对白：" + shot["dialogue"]
     prompt += "\n不添加画面字幕，不添加背景配乐。"
+    if (context.get("previous_actual") or {}).get("reference_mode") == "original_video":
+        prompt += "\n视频1是已批准的上一段原始视频。仅承接其结尾继续本段剧情，保持人物、场景、动作方向和声音连续；不要重演已完成的动作或重复已说完的台词。"
     try:
         _video(root, "video", shot_id, out, shot["duration"], prompt, images, voices,
-               old_job=shot.get("job_id") if recovering else None)
+               old_job=shot.get("job_id") if recovering else None,
+               previous_video=previous_video, reference_duration=reference_duration)
     except Exception:
         current = core.load_project(root)
         current_shot = core._find(current, "shot", shot_id)
@@ -610,15 +700,18 @@ def _shot(root, ep_id, shot_id, previous):
     # This local preview is published before the advisory GPT call completes.
     _refresh_candidate_preview(root, ep_id)
     # Review the seam too: prior tail + current sampled frames, tied to hashes.
-    review_images = images + [Path(f) for f in evidence["frames"]]
+    review_images = observations + [Path(f) for f in evidence["frames"]]
+    has_prior_frame = any(item.get("role") in {"previous_actual_tail", "previous_official_tail", "previous_observation_tail"}
+                          for item in context.get("observation_images", []) if isinstance(item, dict))
+    prior_scope = ("含前段实际尾帧参考。" if has_prior_frame else "未提供前段实际画面，不能核实跨段画面衔接。")
     review_context = {**context, "shot": shot, "actual": relative,
-        "current_frame_image_indices": list(range(len(images) + 1, len(review_images) + 1)),
-        "current_frame_samples": [{"image_index": len(images) + index + 1, "time_seconds": instant}
+        "current_frame_image_indices": list(range(len(observations) + 1, len(review_images) + 1)),
+        "current_frame_samples": [{"image_index": len(observations) + index + 1, "time_seconds": instant}
                                   for index, instant in enumerate(evidence.get("sample_times", []))],
-        "review_scope": "当前镜头首/中/尾抽样画面与前镜实际尾帧。没有审听音频；不可宣称整段动作或音色已核实。"}
+        "review_scope": "当前镜头首/中/尾抽样画面。" + prior_scope + "没有审听音频；不可宣称整段动作或音色已核实。"}
     if "subshots" in shot:
         review_context.update(
-            review_scope="按计划子镜中点及切点前后采样，包含实测首帧、最后一帧与前段实际尾帧参考。"
+            review_scope="按计划子镜中点及切点前后采样，包含实测首帧和最后一帧。" + prior_scope +
                          "只是计划点抽样，未检测或确认实际切镜；未审听音频，不可宣称完整动作、口型或音色已核实。",
             repair_unit="一个生成段对应一次视频任务；仅当用户选择返工时才重新生成整段，不能仅替换段内某一子镜。")
     _progress(root, ep_id, "shot_review", shot_id)

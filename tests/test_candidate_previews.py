@@ -34,8 +34,10 @@ class CandidatePreviewTests(unittest.TestCase):
         self.api = Mock()
         self.api.submit_video.side_effect = lambda *a, **kw: {
             "id": "synthetic-preview-" + str(self.api.submit_video.call_count)}
-        self.api.poll_video.return_value = {"status": "completed", "url": "https://example.test/synthetic.mp4"}
-        self.api.download.side_effect = lambda url, output: write(output, b"SYNTHETIC " + str(output).encode())
+        self.api.poll_video.return_value = {"status": "completed", "url": "https://example.test/synthetic.mp4",
+                                            "last_frame_url": "https://example.test/synthetic-tail.jpg"}
+        self.api.download.side_effect = lambda url, output: write(output,
+            b"\xff\xd8\xffSYNTHETIC OFFICIAL TAIL" if url.endswith(".jpg") else b"SYNTHETIC " + str(output).encode())
         self.enterContext(patch.object(pipeline, "_ark", return_value=self.api))
         self.brain = self.enterContext(patch.object(pipeline, "_brain", side_effect=self.fake_brain))
         pipeline.media.compose.reset_mock()
@@ -223,7 +225,8 @@ class CandidatePreviewTests(unittest.TestCase):
         old_video = (self.root / old_shot["file"]).read_bytes()
         old_preview = (self.root / old_cut["file"]).read_bytes()
         core.reject(self.root, "shot", old_shot["id"], 1, "合成测试：要求第二段再生成一个版本")
-        self.api.download.side_effect = lambda url, output: write(output, old_video)
+        self.api.download.side_effect = lambda url, output: write(output,
+            b"\xff\xd8\xffSYNTHETIC OFFICIAL TAIL" if url.endswith(".jpg") else old_video)
         pipeline.media.compose.reset_mock()
         state = pipeline.run(self.root)
         self.assertEqual(state["status"], "review_required", state.get("last_error"))

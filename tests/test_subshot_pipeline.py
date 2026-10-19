@@ -43,17 +43,30 @@ class SubshotPipelineTests(unittest.TestCase):
         core.configure(self.root, {"caps": {"video_second": 1}, "max_poll_seconds": 1}, limit=100)
         with core.transaction(self.root) as state:
             state["mode"] = "live"
-        previous_video = write(self.root / "media/previous.mp4", b"SYNTHETIC PREVIOUS VIDEO")
+        previous_video = write(self.root / "media/previous-segment-v1.mp4", b"SYNTHETIC PREVIOUS VIDEO")
         previous_tail = write(self.root / "evidence/previous-tail.png", b"SYNTHETIC ACTUAL TAIL")
         relative_tail = str(previous_tail.relative_to(self.root))
-        self.previous = {"id": "previous-segment", "status": "accepted", "scene_id": "station",
+        self.official_tail = write(self.root / "media/official-tails/previous.jpg", b"\xff\xd8\xffSYNTHETIC OFFICIAL TAIL")
+        stamp, previous_sha = core.now(), core.digest(previous_video)
+        self.previous = {"id": "previous-segment", "status": "accepted", "scene_id": "station", "version": 1,
             "file": str(previous_video.relative_to(self.root)), "sha256": core.digest(previous_video),
-            "review": {"observed_end_state": "人物在桌旁。"},
+            "job_id": "synthetic-previous-job", "approved_sha256": previous_sha, "approved_at": stamp,
+            "human_decision": {"decision": "approved", "version": 1, "sha256": previous_sha, "at": stamp},
+            "review": {"observed_end_state": "人物在桌旁。", "sha256": previous_sha, "version": 1},
             "evidence": {"tail_frame": relative_tail, "frame_hashes": {relative_tail: core.digest(previous_tail)}}}
+        core.reserve(self.root, "synthetic-previous-job", "video", self.previous["id"], 1)
+        core.update_job(self.root, "synthetic-previous-job", state="completed", accounting="spent",
+            task_id="synthetic-previous-task", output=self.previous["file"], origin_video={
+                "file": self.previous["file"], "sha256": previous_sha, "task_id": "synthetic-previous-task", "created_at": stamp},
+            official_tail={"file": str(self.official_tail.relative_to(self.root)), "sha256": core.digest(self.official_tail),
+                "task_id": "synthetic-previous-task", "video_sha256": previous_sha,
+                "source": "ark_official_tail", "created_at": stamp})
         self.provider = Mock()
         self.provider.submit_video.return_value = {"id": "synthetic-task"}
-        self.provider.poll_video.return_value = {"status": "completed", "url": "https://example.test/video"}
-        self.provider.download.side_effect = lambda url, path: write(path, b"SYNTHETIC VIDEO " + str(path).encode())
+        self.provider.poll_video.return_value = {"status": "completed", "url": "https://example.test/video",
+            "last_frame_url": "https://example.test/official-tail.jpg", "created_at": stamp}
+        self.provider.download.side_effect = lambda url, path: write(path,
+            b"\xff\xd8\xffSYNTHETIC OFFICIAL TAIL" if url.endswith(".jpg") else b"SYNTHETIC VIDEO " + str(path).encode())
         self.ark = self.enterContext(patch.object(pipeline, "_ark", return_value=self.provider))
         self.review_contexts = []
         self.review_verdicts = ["pass"]
@@ -91,11 +104,12 @@ class SubshotPipelineTests(unittest.TestCase):
         self.assertIn("10–15秒", prompt)
         self.assertIn("必须使用的原定对白：请把这封信交给他。", prompt)
         self.assertNotIn("不可替换原定对白", prompt)
-        self.assertEqual(images[-1], self.root / self.previous["evidence"]["tail_frame"])
+        self.assertEqual(images[-1], self.official_tail)
+        self.assertNotIn(self.root / self.previous["evidence"]["tail_frame"], images)
         self.assertEqual(len(images), 3)
         self.assertEqual(self.provider.submit_video.call_args.kwargs["audio_references"], [self.root / "media/voice.wav"])
         state = core.load_project(self.root)
-        video_jobs = [job for job in state["jobs"].values() if job["kind"] == "video"]
+        video_jobs = [job for job in state["jobs"].values() if job["kind"] == "video" and job["item_id"] == "E001-S001"]
         self.assertEqual(len(video_jobs), 1)
         self.assertEqual(video_jobs[0]["amount"], 15)
         self.assertEqual(state["episodes"][0]["shots"][0]["subshots"], SUBSHOTS)
@@ -105,6 +119,8 @@ class SubshotPipelineTests(unittest.TestCase):
         self.assertIn("未检测", context["review_scope"])
         self.assertIn("用户选择返工", context["repair_unit"])
         self.assertEqual(context["previous_actual"]["shot_id"], "previous-segment")
+        self.assertEqual(context["previous_actual"]["reference_mode"], "official_tail")
+        self.assertEqual(context["previous_actual"]["human_decision"], self.previous["human_decision"])
         self.assertEqual(context["actual"]["tail_frame"], context["actual"]["frames"][-1])
 
     def test_only_human_rejection_retries_entire_segment_and_preserves_previous_version(self):
@@ -145,7 +161,9 @@ class SubshotPipelineTests(unittest.TestCase):
         with patch.object(core, "reserve", wraps=core.reserve) as reserve:
             pipeline._video(self.root, "video", "E001-S001", output, 15, "synthetic", [], old_job="old-task")
         self.provider.poll_video.assert_called_once_with("old-provider-task")
-        self.provider.download.assert_called_once()
+        self.assertEqual(self.provider.download.call_count, 2)
+        self.provider.download.assert_any_call("https://example.test/video", output)
+        self.assertEqual(core.load_project(self.root)["jobs"]["old-task"]["official_tail"]["source"], "ark_official_tail")
         self.provider.submit_video.assert_not_called()
         reserve.assert_not_called()
         self.assertTrue(output.is_file())

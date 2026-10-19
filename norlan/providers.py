@@ -93,6 +93,32 @@ def _https_url(url: str) -> str:
     return url
 
 
+def _artifact_url(value: object) -> str | None:
+    """Keep signed artifact links transient and reject malformed provider data."""
+    if not isinstance(value, str) or not value or any(ord(c) < 33 for c in value):
+        return None
+    try:
+        return _https_url(value)
+    except (ProviderError, ValueError):
+        return None
+
+
+def _video_metadata(result: dict) -> dict:
+    """An allowlist of provenance/media facts, never arbitrary response content."""
+    metadata = {}
+    for key in ("created_at", "updated_at", "duration", "frames", "framespersecond"):
+        value = result.get(key)
+        if type(value) is int and 0 <= value <= 10_000_000_000:
+            metadata[key] = value
+    if "framespersecond" in metadata:
+        metadata["fps"] = metadata["framespersecond"]
+    if result.get("ratio") in ("16:9", "9:16", "1:1", "4:3", "3:4", "21:9"):
+        metadata["ratio"] = result["ratio"]
+    if result.get("output_format") in ("mp4", "mov"):
+        metadata["output_format"] = result["output_format"]
+    return metadata
+
+
 def _data_uri(path: Path, media: str, max_bytes: int) -> str:
     path = Path(path)
     formats = {"image": {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".webp": "webp",
@@ -136,6 +162,8 @@ class ArkProvider:
     capabilities = {"image_references": True, "max_video_images": 9,
                     "max_audio_references": 3, "max_audio_seconds": 15,
                     "local_video_upload": False, "video_reference_url": True,
+                    "official_last_frame": True, "official_video_artifacts": True,
+                    "max_video_reference_seconds": 15, "max_video_reference_bytes": 200_000_000,
                     "native_audio": True, "stable_voice_guarantee": False,
                     "first_frame_plus_references": False,
                     "min_duration": 4, "max_duration": 15}
@@ -345,22 +373,32 @@ class ArkProvider:
                         "role": "reference_image"} for p in refs)
         if previous_video is not None:
             if isinstance(previous_video, str) and previous_video.startswith("https://"):
-                video_url = _https_url(previous_video)
+                video_url = _artifact_url(previous_video)
+                if not video_url:
+                    raise ProviderError("上一片段视频参考须为有效的 HTTPS 原始素材地址。")
             else:
                 try:
-                    digest = hashlib.sha256(Path(previous_video).read_bytes()).hexdigest()
-                except OSError:
+                    video_path = Path(previous_video)
+                    if video_path.suffix.lower() not in {".mp4", ".mov"}:
+                        raise ProviderError("视频参考须为原始 MP4/MOV 文件，不可用本地抽帧替代。")
+                    if not video_path.is_file() or not 0 < video_path.stat().st_size <= 200_000_000:
+                        raise ProviderError("上一片段视频为空、缺失或超过 200 MB 限制。")
+                    digest = hashlib.sha256(video_path.read_bytes()).hexdigest()
+                except (OSError, TypeError, ValueError):
                     raise ProviderError("无法读取上一镜头视频。") from None
                 video_url = self.config.get("reference_video_urls", {}).get(digest)
                 if not video_url:
-                    raise ProviderError("视频参考不支持本地 Base64。请提供此文件哈希对应的有效 HTTPS 来源，或显式改用实际尾帧参考。")
-                video_url = _https_url(video_url)
+                    raise ProviderError("视频参考不支持本地 Base64。请读取原生成任务的有效 HTTPS 原始视频地址；不会改用本地抽帧。")
+                video_url = _artifact_url(video_url)
+                if not video_url:
+                    raise ProviderError("上一片段视频参考须为有效的 HTTPS 原始素材地址。")
             content.append({"type": "video_url", "video_url": {"url": video_url}, "role": "reference_video"})
         content.extend({"type": "audio_url", "audio_url": {"url": _data_uri(p, "audio", 15_000_000)},
                         "role": "reference_audio"} for p in audio)
         payload = {"model": self._model("video"), "content": content, "duration": int(duration),
                    "ratio": self.config.get("ratio", "16:9"), "resolution": self.config.get("resolution", "720p"),
-                   "generate_audio": bool(self.config.get("generate_audio", True)), "watermark": True}
+                   "generate_audio": bool(self.config.get("generate_audio", True)), "watermark": True,
+                   "return_last_frame": True}
         result, request_id = self._request("POST", "/contents/generations/tasks", payload)
         if not isinstance(result.get("id"), str) or not result["id"]:
             failure = _remote_failure(result, stage="submission", uncertain=True, request_id=request_id,
@@ -379,23 +417,23 @@ class ArkProvider:
                 **{key: result[key] for key in ("resolution", "service_tier") if key in result}}
 
     def poll_video(self, task_id: str) -> dict:
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", task_id):
+        if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", task_id):
             raise ProviderError("无效的视频任务 ID。")
         result, request_id = self._request("GET", "/contents/generations/tasks/" + quote(task_id, safe=""))
         status = result.get("status")
         base = {"id": task_id, "request_id": request_id, "provider_status": status, "usage": result.get("usage", {}),
                 "model": result.get("model"),
+                **_video_metadata(result),
                 **{key: result[key] for key in ("resolution", "service_tier") if key in result}}
         if status == "succeeded":
             content = result.get("content")
-            url = content.get("video_url") if isinstance(content, dict) else None
-            try:
-                url = _https_url(url) if isinstance(url, str) and url else None
-            except (ProviderError, ValueError):
-                url = None
+            content = content if isinstance(content, dict) else {}
+            url = _artifact_url(content.get("video_url"))
+            last_frame_url = _artifact_url(content.get("last_frame_url"))
             # Metering survives missing/invalid output URLs. The orchestrator
             # must persist it before reporting a recoverable download problem.
-            return {**base, "status": "completed", "url": url}
+            return {**base, "status": "completed", "url": url, "video_url": url,
+                    "last_frame_url": last_frame_url}
         if status in {"failed", "cancelled", "expired"}:
             failure = _remote_failure(result, stage="generation", request_id=request_id,
                                       message="供应商未完成本次生成，没有可供审批的视频。")
@@ -404,6 +442,15 @@ class ArkProvider:
         if status not in {"queued", "running"}:
             raise ProviderError("未知的视频任务状态；保留任务 ID 等待核对。", stage="poll", request_id=request_id)
         return {**base, "status": "pending"}
+
+    def video_artifacts(self, task_id: str) -> dict:
+        """Read an existing task once, using GET only; never create a new task.
+
+        Links are transient and must not be stored in logs or project JSON.
+        Ark retains task queries for 7 days and artifact links for 24 hours;
+        fetching the task again does not promise to extend link validity.
+        """
+        return self.poll_video(task_id)
 
     def download(self, url: str, output: Path) -> None:
         """Download without credentials; original remains intact on partial failure."""
