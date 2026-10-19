@@ -6,12 +6,24 @@ import unittest
 from unittest.mock import Mock, patch
 
 from norlan import core, pipeline
-from test_pipeline import choose_gpt_assets, fake_media, write
+from test_pipeline import choose_gpt_assets, fake_media, write, run_confirming_prompts
 
 
 SUBSHOTS = [{"start": 0, "end": 5, "prompt": "中景，人物在桌旁转身。"},
             {"start": 5, "end": 10, "prompt": "切近景，人物拿起信封。"},
             {"start": 10, "end": 15, "prompt": "切双人中景，人物将信封递出。"}]
+
+
+def confirming_shot(root, episode_id, shot_id, previous):
+    """A synthetic human confirms the exact prepared request before one POST."""
+    result = pipeline._shot(root, episode_id, shot_id, previous)
+    state = core.load_project(root)
+    current = core._find(state, "shot", shot_id)
+    if state["mode"] == "live" and current.get("status") == "awaiting_prompt_approval":
+        candidate = current["prompt_candidate"]
+        core.approve_prompt(root, shot_id, candidate["id"], candidate["request_hash"])
+        return pipeline._shot(root, episode_id, shot_id, previous)
+    return result
 
 
 class SubshotPipelineTests(unittest.TestCase):
@@ -26,7 +38,7 @@ class SubshotPipelineTests(unittest.TestCase):
         core.install_plan(self.root, plan)
         core.approve(self.root, "plan", "plan", 1)
         choose_gpt_assets(self.root)
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         for asset in state["assets"]:
             core.approve(self.root, "asset", asset["id"], asset["version"])
         preview = write(self.root / "media/voice.mp4", b"SYNTHETIC VOICE PREVIEW")
@@ -61,6 +73,10 @@ class SubshotPipelineTests(unittest.TestCase):
             official_tail={"file": str(self.official_tail.relative_to(self.root)), "sha256": core.digest(self.official_tail),
                 "task_id": "synthetic-previous-task", "video_sha256": previous_sha,
                 "source": "ark_official_tail", "created_at": stamp})
+        # The real prompt approval gate verifies that the previous approved
+        # source still exists in project state, not only in a caller's object.
+        with core.transaction(self.root) as state:
+            state["episodes"][0]["shots"].insert(0, copy.deepcopy(self.previous))
         self.provider = Mock()
         self.provider.submit_video.return_value = {"id": "synthetic-task"}
         self.provider.poll_video.return_value = {"status": "completed", "url": "https://example.test/video",
@@ -74,6 +90,9 @@ class SubshotPipelineTests(unittest.TestCase):
         self.evidence = self.enterContext(patch.object(pipeline.media, "extract_evidence", side_effect=self.fake_evidence))
 
     def fake_brain(self, root, method, *args):
+        if method == "plan_revision":
+            return {"needs_assets": False, "additions": [], "shot_updates": [],
+                    "summary": "合成普通动作修正，复用既有资产。", "blockers": []}
         if method == "refine_shot":
             return {"prompt": "SYNTHETIC refined prompt", "dialogue": "不可替换原定对白", "continuity_notes": "synthetic"}
         self.assertEqual(method, "review")
@@ -93,7 +112,7 @@ class SubshotPipelineTests(unittest.TestCase):
                 "sampling_note": "只是计划点采样，不代表已检测实际切镜。"}
 
     def test_three_subshots_are_one_task_with_locked_timeline_dialogue_and_references(self):
-        self.assertFalse(pipeline._shot(self.root, "E001", "E001-S001", self.previous))
+        self.assertFalse(confirming_shot(self.root, "E001", "E001-S001", self.previous))
         self.provider.submit_video.assert_called_once()
         prompt, duration, images = self.provider.submit_video.call_args.args
         self.assertEqual(duration, 15)
@@ -112,7 +131,7 @@ class SubshotPipelineTests(unittest.TestCase):
         video_jobs = [job for job in state["jobs"].values() if job["kind"] == "video" and job["item_id"] == "E001-S001"]
         self.assertEqual(len(video_jobs), 1)
         self.assertEqual(video_jobs[0]["amount"], 15)
-        self.assertEqual(state["episodes"][0]["shots"][0]["subshots"], SUBSHOTS)
+        self.assertEqual(core._find(state, "shot", "E001-S001")["subshots"], SUBSHOTS)
         context = self.review_contexts[0]
         self.assertEqual([item["image_index"] for item in context["current_frame_samples"]], list(range(4, 13)))
         self.assertAlmostEqual(context["current_frame_samples"][-1]["time_seconds"], 14.966667)
@@ -125,14 +144,14 @@ class SubshotPipelineTests(unittest.TestCase):
 
     def test_only_human_rejection_retries_entire_segment_and_preserves_previous_version(self):
         self.review_verdicts = ["fail", "pass"]
-        self.assertFalse(pipeline._shot(self.root, "E001", "E001-S001", self.previous))
-        self.assertFalse(pipeline._shot(self.root, "E001", "E001-S001", self.previous))
+        self.assertFalse(confirming_shot(self.root, "E001", "E001-S001", self.previous))
+        self.assertFalse(confirming_shot(self.root, "E001", "E001-S001", self.previous))
         self.provider.submit_video.assert_called_once()
         core.reject(self.root, "shot", "E001-S001", 1, "用户要求修正第二个内镜动作")
-        self.assertFalse(pipeline._shot(self.root, "E001", "E001-S001", self.previous))
+        self.assertFalse(confirming_shot(self.root, "E001", "E001-S001", self.previous))
         self.assertEqual(self.provider.submit_video.call_count, 2)
         self.assertEqual([call.args[1] for call in self.provider.submit_video.call_args_list], [15, 15])
-        shot = core.load_project(self.root)["episodes"][0]["shots"][0]
+        shot = core._find(core.load_project(self.root), "shot", "E001-S001")
         self.assertEqual(shot["version"], 2)
         self.assertEqual(shot["subshots"], SUBSHOTS)
         self.assertEqual(shot["history"][0]["version"], 1)

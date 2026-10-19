@@ -112,7 +112,7 @@ class OfficialContinuityRenderingTests(unittest.TestCase):
     def test_source_and_warning_do_not_hide_video_or_add_actions(self):
         html = Path(dashboard.__file__).with_name("dashboard.html").read_text()
         sources = []
-        for name in ("el", "mediaURL", "appendPrompt", "failureDetails", "shotReview", "advisoryReport", "subshotPlan", "shotCard"):
+        for name in ("el", "mediaURL", "appendPrompt", "failureDetails", "shotReview", "advisoryReport", "subshotPlan", "promptApproval", "shotCard"):
             start = html.index("function " + name + "(")
             sources.append(html[start:html.index("\nfunction ", start + 1)])
         program = r'''

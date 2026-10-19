@@ -15,7 +15,7 @@ import re
 import shutil
 import tempfile
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +36,7 @@ _PLAN_ERRORS = {
     "asset_text_required": ("资产缺少名称或生成说明。", "name 和 prompt 均须填写非空字符串。"),
     "voice_character_required": ("声音资产未绑定有效角色。", "voice 的 character_id 必须指向已定义的 character 资产。画外声音也须定义声源角色，并在提示词中说明不入画。"),
     "nonvoice_character_forbidden": ("非声音资产不能绑定 character_id。", "仅 voice 填写 character_id；其他资产省略此字段或填空字符串，角色自身也不例外。"),
+    "voice_only_invalid": ("画外声源标记不合法。", "voice_only 使用布尔值；仅 character 可以为 true，表示只定义声源、不生成可见人物。"),
     "voice_selection_invalid": ("试音选句或来源不符合要求。", "为 voice 填写原文连续台词 audition_text、选句依据 audition_reason 和含说话人归属的原文摘录 audition_source。无合适句时 text/source 留空并在 reason 说明；非 voice 填空。"),
     "episode_title_required": ("每集必须包含标题。", "填写非空字符串 title。"),
     "shots_required": ("每集必须包含生成片段。", "shots 使用非空生成片段列表，每项对应一条视频 API 任务。"),
@@ -222,6 +223,11 @@ def validate_plan(plan):
         for field in ("name", "prompt"):
             if not isinstance(asset.get(field), str) or not asset[field].strip():
                 raise PlanValidationError("asset_text_required", path + "." + field)
+        if "voice_only" in asset and (type(asset["voice_only"]) is not bool or (asset["voice_only"] and asset["kind"] != "character")):
+            raise PlanValidationError("voice_only_invalid", path + ".voice_only")
+        if (not isinstance(asset.get("audition_speaker", ""), str) or len(asset.get("audition_speaker", "")) > 200
+                or (asset["kind"] != "voice" and asset.get("audition_speaker", "").strip())):
+            raise PlanValidationError("voice_selection_invalid", path + ".audition_speaker")
     asset_ids = {a["id"] for a in assets}
     character_ids = {a["id"] for a in assets if a["kind"] == "character"}
     voices = {}
@@ -287,7 +293,7 @@ def install_plan(root, plan):
     for index, asset in enumerate(plan["assets"]):
         if asset["kind"] == "voice" and asset.get("audition_text", "").strip():
             try:
-                validate_audition(asset, novel, characters[asset["character_id"]])
+                validate_audition(asset, novel, asset.get("audition_speaker", "").strip() or characters[asset["character_id"]])
             except AuditionSelectionError:
                 raise PlanValidationError("voice_selection_invalid", f"plan.assets[{index}].audition_source") from None
     with transaction(root) as s:
@@ -302,12 +308,15 @@ def install_plan(root, plan):
         s["assets"] = [{"character_id": "", **copy.deepcopy(a), "status": "planned", "version": 0,
                          "history": [], "feedback": "", "creation_input": empty_input()}
                         for a in plan["assets"]]
+        for asset in s["assets"]:
+            if asset.get("kind") == "character" and asset.get("voice_only") is True:
+                asset.update(status="candidate", version=1, sha256=voice_only_digest(asset))
         s["episodes"] = []
         for ep in plan["episodes"]:
             ep = copy.deepcopy(ep)
             ep.update(status="planned", version=0, history=[], feedback="", reviews=[])
             for shot in ep["shots"]:
-                shot.update(status="planned", attempts=[], revision=0, feedback="")
+                shot.update(status="planned", version=0, attempts=[], revision=0, feedback="")
             s["episodes"].append(ep)
         s["status"] = "awaiting_plan"
         event(s, "plan_created", version=version)
@@ -337,7 +346,21 @@ def _check_version(item, version):
         raise GateError("页面版本已过期，请刷新后重新审阅")
 
 
+def voice_only_digest(asset):
+    """Bind approval of an offscreen voice source to its exact public definition."""
+    return _json_digest({key: asset.get(key) for key in ("id", "kind", "name", "prompt", "voice_only")})
+
+
+def _json_digest(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+
+
 def _check_artifact(root, item):
+    if item.get("kind") == "character" and item.get("voice_only") is True:
+        if item.get("sha256") != voice_only_digest(item):
+            raise GateError("画外声源定义已改变，请重新确认当前定义")
+        return
     if not item.get("file"):
         raise GateError("素材文件缺失，不能审批")
     path = safe_path(root, item["file"])
@@ -596,6 +619,8 @@ def approve(root, kind, item_id, version):
             if rendered != [{"id": sh["id"], "sha256": sh["sha256"]} for sh in item["shots"]]:
                 raise GateError("本集镜头已更新或缺少合成记录，请重新合成后审批")
         elif kind == "shot":
+            if item.get("pending_asset_amendment"):
+                raise GateError("本片段正在等待资产增补确认，请先完成新资产审批再返修")
             if item["status"] != "review_required":
                 raise GateError("此镜头不等待人工复核")
             _check_shot_artifact(root, s, item)
@@ -620,8 +645,11 @@ def _invalidate_shot(shot, reason):
         shot.setdefault("history", []).append({k: copy.deepcopy(shot[k]) for k in
             ("file", "sha256", "evidence", "review", "version", "human_decision", "approved_at",
              "approved_sha256", "approved_version", "continuity_review") if k in shot})
+    if shot.get("prompt_candidate"):
+        shot.setdefault("prompt_history", []).append(copy.deepcopy(shot["prompt_candidate"]))
     shot.update(status="planned", revision=shot.get("revision", 0) + 1, feedback=reason)
-    for key in ("file", "sha256", "evidence", "review", "job_id", "refined_prompt", "approved_at", "approved_sha256", "approved_version", "generation_error"):
+    for key in ("file", "sha256", "evidence", "review", "job_id", "refined_prompt", "approved_at", "approved_sha256", "approved_version", "generation_error",
+                "prompt_candidate", "prompt_approval", "revision_analysis"):
         shot.pop(key, None)
 
 
@@ -706,11 +734,27 @@ def reject(root, kind, item_id, version, feedback, shot_ids=None):
                 raise GateError("已有生成素材，请使用资产或分集返工")
             item.update(status="rejected", feedback=feedback)
         elif kind == "asset":
-            if item["status"] not in {"candidate", "approved", "rejected"}:
+            if item["status"] not in {"candidate", "approved", "rejected", "generation_failed"}:
                 raise GateError("资产尚未生成")
+            if item["status"] == "generation_failed":
+                failed = s["jobs"].get(item.get("job_id", ""), {})
+                expected_kind = "voice" if item.get("kind") == "voice" else "image"
+                if (not item.get("generation_error") or failed.get("state") != "failed" or
+                        failed.get("accounting") not in {"spent", "released"} or
+                        failed.get("kind") != expected_kind or failed.get("item_id") != item_id or
+                        item.get("voice_only") is True):
+                    raise GateError("资产失败记录尚未核实，不能再次提交；请先核实原调用结果")
+                from .failures import sanitize_failure
+                detail = sanitize_failure(failed.get("failure") or {
+                    "stage": "unknown", "message": "原资产生成失败，旧版本未保存具体原因。", "uncertain": False})
+                history = item.setdefault("failure_history", [])
+                if not any(record.get("job_id") == item["job_id"] and record.get("version") == version
+                           for record in history):
+                    history.append({"job_id": item["job_id"], "version": version, "failure": detail,
+                                    "recorded_at": now()})
             item.update(status="rejected", feedback=feedback)
             # The completed task belongs to the rejected candidate, not its replacement.
-            for key in ("job_id", "approved_at", "approved_sha256"):
+            for key in ("job_id", "approved_at", "approved_sha256", "generation_error"):
                 item.pop(key, None)
             affected = False
             for ep in s["episodes"]:
@@ -742,6 +786,8 @@ def reject(root, kind, item_id, version, feedback, shot_ids=None):
             _invalidate_render(item, feedback)
             shot_ids = [shot["id"] for shot in targets]
         elif kind == "shot":
+            if item.get("pending_asset_amendment"):
+                raise GateError("本片段已有资产增补方案，请先完成或拒绝该方案")
             if item["status"] not in {"review_required", "accepted", "generation_failed"}:
                 raise GateError("镜头不在人工复核阶段")
             _check_shot_rejection(root, s, item)
@@ -773,6 +819,250 @@ def request_caption_fix(root, item_id, version, feedback):
         s["status"] = "ready"
         event(s, "caption_fix_requested", id=item_id, version=version, feedback=feedback)
     return load_project(root)
+
+
+def _amendment_idle(state):
+    if any(job.get("accounting") in {"reserved", "unknown"} or job.get("state") in
+           {"submitting", "submitted", "download_pending", "uncertain"} for job in state["jobs"].values()):
+        raise GateError("尚有在途或结果不明的调用，请先恢复原任务或核实结果，再提出资产增补")
+
+
+def _amendment_target(shot):
+    return {key: copy.deepcopy(shot.get(key)) for key in
+            ("id", "version", "revision", "sha256", "file", "status", "prompt", "dialogue", "asset_ids", "feedback",
+             "duration", "subshots", "scene_id", "continuity_notes")}
+
+
+def _amendment_find(state, amendment_id):
+    for amendment in state.get("asset_amendments", []):
+        if amendment.get("id") == amendment_id:
+            return amendment
+    raise GateError("未找到资产增补方案，请刷新当前项目")
+
+
+def _check_amendment_baseline(state, amendment):
+    shot = _find(state, "shot", amendment["target_shot_id"])
+    if _amendment_target(shot) != amendment["target"]:
+        raise GateError("片段版本或返修内容已改变，请重新提出资产增补方案")
+    baseline_ids = set(amendment["baseline_asset_ids"])
+    baseline = [asset for asset in state["assets"] if asset["id"] in baseline_ids]
+    if _json_digest(baseline) != amendment["baseline_assets_sha256"]:
+        raise GateError("原有资产或审批已改变，请重新提出资产增补方案")
+    for saved in amendment["shot_baselines"]:
+        if _amendment_target(_find(state, "shot", saved["id"])) != saved:
+            raise GateError("受影响的后续片段已改变，请重新提出资产增补方案")
+    return shot
+
+
+def _validate_amendment(state, root, shot_id, version, feedback, additions, shot_updates, audio_policy):
+    if not isinstance(feedback, str) or not feedback.strip() or len(feedback) > 100000:
+        raise ValueError("请填写本次资产增补和片段返修要求")
+    if state["plan"].get("status") != "approved":
+        raise GateError("请先批准当前策划，再增补制作资产")
+    target = _find(state, "shot", shot_id)
+    _check_version(target, version)
+    if target.get("status") not in {"planned", "review_required", "accepted", "generation_failed"}:
+        raise GateError("此片段暂不支持资产增补，请先恢复当前任务")
+    if target.get("file"):
+        _check_shot_artifact(root, state, target)
+    elif target.get("job_id"):
+        _check_shot_rejection(root, state, target)
+    if (not isinstance(additions, list) or not 0 <= len(additions) <= 30 or
+            not isinstance(shot_updates, list) or not 1 <= len(shot_updates) <= 100):
+        raise ValueError("资产变更须包含 0–30 项新资产和 1–100 项明确片段更新；没有新资产时须复用已有资产或改变声音规则")
+    allowed = {"id", "kind", "name", "prompt", "character_id", "audition_text", "audition_reason", "audition_source", "voice_only", "audition_speaker"}
+    if any(not isinstance(asset, dict) or set(asset) - allowed for asset in additions):
+        raise ValueError("新资产只允许填写定义和试音选句，不能设置审批、媒体、预算或历史记录")
+    existing_ids = {asset["id"] for asset in state["assets"]}
+    existing_ids.update(ep["id"] for ep in state["episodes"])
+    all_shots = [shot for ep in state["episodes"] for shot in ep["shots"]]
+    existing_ids.update(shot["id"] for shot in all_shots)
+    if any(asset.get("id") in existing_ids for asset in additions):
+        raise GateError("新增资产 ID 已存在；增补方案不能覆盖原有资产或片段")
+    # Validate only new definitions; old approved auditions may predate current
+    # selection rules and must never be silently revalidated or reconstructed.
+    old_definitions = [{"id": asset["id"], "kind": asset["kind"], "name": "已有资产", "prompt": "保留已批准定义",
+                        **({"character_id": asset.get("character_id", "")} if asset["kind"] == "voice" else {})}
+                       for asset in state["assets"]]
+    merged_assets = old_definitions + copy.deepcopy(additions)
+    new_ids = {asset.get("id") for asset in additions}
+    if len(merged_assets) > 200:
+        raise ValueError("项目资产总数不能超过 200 项")
+    target_index = next(index for index, shot in enumerate(all_shots) if shot["id"] == shot_id)
+    updates, seen, added_reference = [], set(), False
+    for update in shot_updates:
+        if (not isinstance(update, dict) or set(update) - {"id", "add_asset_ids", "prompt", "dialogue", "continuity_notes"}
+                or not isinstance(update.get("id"), str) or update["id"] in seen):
+            raise ValueError("片段更新只能包含唯一 ID、追加资产引用及提示词/对白/连续性说明")
+        current = _find(state, "shot", update["id"])
+        index = all_shots.index(current)
+        if index < target_index or (current is not target and
+                (current.get("file") or current.get("job_id") or current.get("attempts") or current.get("status") != "planned")):
+            raise GateError("增补仅可修改目标片段和后续尚未开始的片段，不能改写其他已生成视频")
+        refs = update.get("add_asset_ids")
+        if (not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs) or
+                len(refs) != len(set(refs)) or not set(refs) <= (existing_ids | new_ids)):
+            raise ValueError("追加资产引用必须为不重复的有效资产 ID 列表")
+        updated = copy.deepcopy(current)
+        updated["asset_ids"] = list(dict.fromkeys(current["asset_ids"] + refs))
+        added_reference = added_reference or bool(set(refs) - set(current["asset_ids"]))
+        for key in ("prompt", "dialogue", "continuity_notes"):
+            if key in update:
+                if not isinstance(update[key], str) or len(update[key]) > 100000 or (key == "prompt" and not update[key].strip()):
+                    raise ValueError("片段提示词须为非空文本，其他更新字段须为文本，最多 100000 字")
+                updated[key] = update[key]
+        updates.append(updated)
+        seen.add(current["id"])
+    if shot_id not in seen:
+        raise ValueError("资产变更方案须明确包含目标片段更新")
+    if new_ids and not any(new_ids.intersection(shot["asset_ids"]) for shot in updates):
+        raise ValueError("方案须明确更新目标片段，并实际引用本次新增资产")
+    if not additions and not added_reference and (audio_policy is None or audio_policy == state.get("audio_policy", {})):
+        raise ValueError("没有新增资产时，方案须实际追加已有资产引用或改变声音规则，不能提交空方案")
+    # Use unique synthetic episode/shot IDs only for the validation envelope.
+    ep_id = next("amendment-check-" + str(index) for index in range(1000) if "amendment-check-" + str(index) not in existing_ids | new_ids)
+    validate_plan({"title": state["title"], "assets": merged_assets,
+                   "episodes": [{"id": ep_id, "title": "局部增补校验", "shots": updates}]})
+    from .voice import AuditionSelectionError, validate_audition
+    characters = {asset["id"]: asset["name"] for asset in state["assets"] + additions if asset["kind"] == "character"}
+    novel = safe_path(root, "source/novel.txt").read_text(encoding="utf-8")
+    for asset in additions:
+        if asset["kind"] == "voice" and asset.get("audition_text", "").strip():
+            try:
+                validate_audition(asset, novel, asset.get("audition_speaker", "").strip() or characters[asset["character_id"]])
+            except AuditionSelectionError as exc:
+                raise GateError(str(exc)) from None
+    if audio_policy is not None:
+        if not isinstance(audio_policy, dict) or set(audio_policy) != {"system_broadcast"}:
+            raise ValueError("声音规则仅支持 system_broadcast")
+        policy = audio_policy["system_broadcast"]
+        if (not isinstance(policy, dict) or set(policy) != {"enabled", "character_id", "voice_id", "instruction"}
+                or type(policy["enabled"]) is not bool or not isinstance(policy["instruction"], str)
+                or len(policy["instruction"]) > 4000):
+            raise ValueError("系统播报规则须包含启用状态、角色、声音和不超过 4000 字的播报要求")
+        assets_by_id = {asset["id"]: asset for asset in state["assets"] + additions}
+        voice = assets_by_id.get(policy["voice_id"], {})
+        character = assets_by_id.get(policy["character_id"], {})
+        if policy["enabled"] and (voice.get("kind") != "voice" or character.get("kind") != "character" or voice.get("character_id") != character.get("id")):
+            raise ValueError("系统播报声音须绑定方案中的有效声源角色")
+    return target
+
+
+def propose_asset_amendment(root, shot_id, version, feedback, additions, shot_updates, audio_policy=None, *, already_locked=False):
+    """Save a local candidate; never replace a plan, approve an asset or call a provider."""
+    with (nullcontext() if already_locked else run_lock(root)), transaction(root) as state:
+        _amendment_idle(state)
+        if any(item.get("status") in {"candidate", "awaiting_assets"} for item in state.get("asset_amendments", [])):
+            raise GateError("已有待确认或待完成的资产增补，请先在网页处理当前方案")
+        target = _validate_amendment(state, root, shot_id, version, feedback, additions, shot_updates, audio_policy)
+        amendment = {"id": "amend-" + uuid.uuid4().hex, "version": 1, "status": "candidate", "created_at": now(),
+                     "target_shot_id": shot_id, "target_version": version, "target": _amendment_target(target),
+                     "feedback": feedback.strip(), "additions": copy.deepcopy(additions), "shot_updates": copy.deepcopy(shot_updates),
+                     "baseline_asset_ids": [asset["id"] for asset in state["assets"]],
+                     "baseline_assets_sha256": _json_digest(state["assets"]),
+                     "shot_baselines": [_amendment_target(_find(state, "shot", update["id"])) for update in shot_updates]}
+        if audio_policy is not None:
+            amendment["audio_policy"] = copy.deepcopy(audio_policy)
+        state.setdefault("asset_amendments", []).append(amendment)
+        target["pending_asset_amendment"] = amendment["id"]
+        state["status"] = "awaiting_asset_amendment"
+        state["last_error"] = None
+        event(state, "asset_amendment_proposed", id=amendment["id"], shot_id=shot_id, version=version,
+              asset_ids=[asset["id"] for asset in additions])
+    return load_project(root)
+
+
+def apply_asset_amendment(root, amendment_id, decision):
+    """Apply a human-approved definition proposal, leaving video untouched until assets pass review."""
+    if decision not in {"approve", "reject"}:
+        raise ValueError("请选择采用或拒绝本次资产增补方案")
+    from .asset_inputs import empty_input
+    with run_lock(root), transaction(root) as state:
+        _amendment_idle(state)
+        amendment = _amendment_find(state, amendment_id)
+        if amendment["status"] != "candidate":
+            raise GateError("此资产增补方案已处理，请刷新当前项目")
+        if decision == "reject":
+            target = _find(state, "shot", amendment["target_shot_id"])
+            amendment.update(status="rejected", decided_at=now())
+            if target.get("pending_asset_amendment") == amendment_id:
+                target.pop("pending_asset_amendment", None)
+            state["status"] = "ready"
+        else:
+            target = _check_amendment_baseline(state, amendment)
+            # Revalidate new definitions, without revalidating old auditions.
+            _validate_amendment(state, root, target["id"], amendment["target_version"], amendment["feedback"],
+                                amendment["additions"], amendment["shot_updates"], amendment.get("audio_policy"))
+            for definition in amendment["additions"]:
+                asset = {"character_id": "", **copy.deepcopy(definition), "status": "planned", "version": 0,
+                         "history": [], "feedback": "", "creation_input": empty_input(), "amendment_id": amendment_id}
+                if asset.get("kind") == "character" and asset.get("voice_only") is True:
+                    asset.update(status="candidate", version=1, sha256=voice_only_digest(asset))
+                state["assets"].append(asset)
+            amendment.update(status="awaiting_assets", decided_at=now())
+            state["status"] = "awaiting_assets"
+        state["last_error"] = None
+        event(state, "human_asset_amendment_decided", id=amendment_id, decision=decision)
+    return load_project(root)
+
+
+def activate_asset_amendment(root, amendment_id):
+    """After asset approval, queue the named revision exactly once; no paid work occurs here.
+
+    The production runner may already own its run lock; this short transaction
+    intentionally does not reacquire it. Return False while any new asset awaits review.
+    """
+    with transaction(root) as state:
+        amendment = _amendment_find(state, amendment_id)
+        if amendment.get("status") == "applied":
+            return False
+        if amendment.get("status") != "awaiting_assets":
+            raise GateError("请先由用户确认资产增补方案")
+        _amendment_idle(state)
+        target = _check_amendment_baseline(state, amendment)
+        for definition in amendment["additions"]:
+            asset = _find(state, "asset", definition["id"])
+            if asset.get("status") != "approved":
+                return False
+            _check_artifact(root, asset)
+            if asset.get("approved_sha256") != asset.get("sha256"):
+                raise GateError("新增资产审批与当前定义或媒体不符，请重新确认")
+        for update in amendment["shot_updates"]:
+            shot = _find(state, "shot", update["id"])
+            shot["asset_ids"] = list(dict.fromkeys(shot["asset_ids"] + update["add_asset_ids"]))
+            for key in ("prompt", "dialogue", "continuity_notes"):
+                if key in update:
+                    shot[key] = update[key]
+            # A prompt prepared against the former asset set cannot be reused.
+            shot.pop("prompt_candidate", None)
+            shot.pop("prompt_approval", None)
+        if target.get("status") == "planned" and not target.get("file") and not target.get("job_id"):
+            target["feedback"] = amendment["feedback"]
+            target.pop("refined_prompt", None)
+        else:
+            _request_shot_revision(state, target, amendment["feedback"])
+        target.pop("pending_asset_amendment", None)
+        target["revision_analysis"] = {
+            "signature": hashlib.sha256(json.dumps([target.get("revision", 0), target.get("feedback", "")],
+                                                    ensure_ascii=False).encode()).hexdigest(),
+            "amendment_id": amendment_id, "blockers": [], "summary": "新增资产已获人工批准，按已确认方案准备片段返修提示词。"}
+        if amendment.get("audio_policy"):
+            state.setdefault("audio_policy", {}).update(copy.deepcopy(amendment["audio_policy"]))
+        amendment.update(status="applied", applied_at=now())
+        state["status"] = "ready"
+        state["last_error"] = None
+        event(state, "asset_amendment_activated", id=amendment_id, shot_id=target["id"], revision=target.get("revision", 0))
+    return True
+
+
+def approve_prompt(root, shot_id, candidate_id, sha256):
+    from .prompt_gate import approve
+    return approve(root, shot_id, candidate_id, sha256)
+
+
+def reject_prompt(root, shot_id, candidate_id, sha256, feedback):
+    from .prompt_gate import reject
+    return reject(root, shot_id, candidate_id, sha256, feedback)
 
 
 def set_paused(root, paused):
@@ -982,11 +1272,12 @@ def set_voice_audition(root, asset_id, text, source, reason):
         novel = novel_path.read_text(encoding="utf-8")
         candidate = {**asset, **values}
         try:
-            validate_audition(candidate, novel, character["name"])
+            speaker = asset.get("audition_speaker", "").strip() or character["name"]
+            validate_audition(candidate, novel, speaker)
         except AuditionSelectionError as exc:
             raise GateError(str(exc)) from None
         asset.update(values)
-        asset["audition_selection_key"] = audition_selection_key(asset, character["name"], digest(novel_path))
+        asset["audition_selection_key"] = audition_selection_key(asset, speaker, digest(novel_path))
         asset.pop("audition_selection_error", None)
         event(state, "voice_audition_selected", id=asset_id)
     return load_project(root)

@@ -17,6 +17,7 @@ import threading
 import webbrowser
 
 from . import __version__, core, dashboard, pipeline
+from .brain import NEW_EPISODE_DURATION_RULES
 from .voice import VOICE_PLAN_RULES
 from .segments import MAX_SUBSHOT_PROMPT_CHARS, SEGMENT_PLAN_RULES
 
@@ -56,6 +57,8 @@ PATH = {"type": "string", "minLength": 1, "maxLength": 4096,
 IDENTIFIER = {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"}
 VERSION = {"type": "integer", "minimum": 0}
 ASSET = _object({"id": IDENTIFIER, "kind": {"type": "string", "enum": ["character", "location", "prop", "voice"]},
+                 "voice_only": {"type": "boolean", "description": "仅 character 可为 true，表示仅定义画外声源、不生成可见人物。其他类型省略或 false。"},
+                 "audition_speaker": {"type": "string", "maxLength": 200, "description": "voice 在原文中的真实说话人标记，如系统；可与声源资产显示名不同。非 voice 省略或空串。"},
                  "name": NONEMPTY, "prompt": {**NONEMPTY, "description": VOICE_PLAN_RULES}, "character_id": {
                      **TEXT, "description": "kind=voice 时必填，指向已定义的 character 资产 ID；其他类型省略或填空字符串，角色不能填自身 ID。画外声音也需绑定声源角色，并在提示词说明不入画。"},
                  "audition_text": {**TEXT, "description": "voice 试音所选原文：该角色连续完整、较平稳且足够辨音的台词，建议20–45字；逐字包含在 audition_source 中。没有合适原句时留空等待选句，不编造通用句。非 voice 省略或空串。"},
@@ -81,6 +84,11 @@ PLAN = _object({"title": NONEMPTY, "style": TEXT,
                 "assets": {"type": "array", "items": ASSET, "minItems": 1, "maxItems": 200},
                 "episodes": {"type": "array", "items": EPISODE, "minItems": 1, "maxItems": 100}},
                ["title", "assets", "episodes"])
+AMENDMENT_SHOT_UPDATE = _object({"id": IDENTIFIER,
+    "add_asset_ids": {"type": "array", "items": IDENTIFIER, "maxItems": 200},
+    "prompt": NONEMPTY, "dialogue": TEXT, "continuity_notes": TEXT}, ["id", "add_asset_ids"])
+AUDIO_POLICY = _object({"system_broadcast": _object({"enabled": {"type": "boolean"},
+    "character_id": IDENTIFIER, "voice_id": IDENTIFIER, "instruction": {"type": "string", "maxLength": 4000}})})
 
 
 def _tool(name, description, properties, required=None, read_only=False):
@@ -105,7 +113,12 @@ TOOLS = [
           {"project": PATH, "novel_text": {"type": "string", "minLength": 1, "maxLength": MAX_NOVEL_BYTES},
            "source_path": PATH, "title": {"type": "string", "minLength": 1, "maxLength": 300},
            "brief": TEXT, "mode": {"type": "string", "enum": ["live", "demo"], "default": "live"}}, ["project"]),
-    _tool("save_plan", "保存候选分集/资产/生成片段规划并等待人工审批。" + SEGMENT_PLAN_RULES + "voice 必须绑定已定义角色，非 voice 的 character_id 省略或为空；生成片段引用声音须同时引用其角色，画外声在 prompt 标明不入画。" + VOICE_PLAN_RULES + "校验失败返回字段路径和修复建议，不修改项目。不能写 approved、file、settings 或预算。", {"project": PATH, "plan": PLAN}),
+    _tool("save_plan", "保存候选分集/资产/生成片段规划并等待人工审批。" + NEW_EPISODE_DURATION_RULES + SEGMENT_PLAN_RULES + "voice 必须绑定已定义角色，非 voice 的 character_id 省略或为空；生成片段引用声音须同时引用其角色，画外声在 prompt 标明不入画。" + VOICE_PLAN_RULES + "校验失败返回字段路径和修复建议，不修改项目。不能写 approved、file、settings 或预算。", {"project": PATH, "plan": PLAN}),
+    _tool("propose_asset_amendment", "在分镜或返修阶段提出新增声音/人物/场景等资产，或复用已有资产及声音规则的关联片段更新，打开网页供用户确认。只创建候选，不覆盖save_plan、不修改旧资产或已有媒体、不批准、不生成。additions可为空，此时必须实际追加已有资产引用或改变audio_policy，不能提交空方案。用户采用后先确认新增资产定义/试听，全部批准后才应用片段修改并等待生成确认；复用已批准资产不重新制作。仅更新目标及后续未启动片段；系统女播音可新增voice_only=true的character声源与绑定voice，用audition_speaker标明原文说话人。试音必须来自原文，不得编造。audio_policy可要求以后任务框统一播报。不得自己批准提案或资产。",
+          {"project": PATH, "shot_id": IDENTIFIER, "version": VERSION, "feedback": NONEMPTY,
+           "additions": {"type": "array", "items": ASSET, "minItems": 0, "maxItems": 30},
+           "shot_updates": {"type": "array", "items": AMENDMENT_SHOT_UPDATE, "minItems": 1, "maxItems": 100},
+           "audio_policy": AUDIO_POLICY}, ["project", "shot_id", "version", "feedback", "additions", "shot_updates"]),
     _tool("propose_segments", "为已暂停且无在途任务的项目提出生成片段重分组，并打开网页等待用户本人审批。先查 project_status；已提交任务须先恢复原任务查询和下载。仅处理指定分集尚未启动的连续尾部，groups按原顺序完整覆盖该尾部全部ID；不合并的项用单项组保留。只合并同scene_id、动作和对白连续的相邻片段，合计10–15秒、内部镜头不超过3个、视觉参考不超过8张、声音参考不超过3条；复杂动作、独白、关键口型或转场可保持单项。不会更改已生成/已提交部分、资产、预算或现行计划，不生成视频；不能调用save_plan/install_plan替换旧计划。提案失败不重跑生成，模型不得批准，必须等待网页确认。",
           {"project": PATH, "episode_id": IDENTIFIER,
            "groups": {"type": "array", "minItems": 1, "maxItems": 100,
@@ -243,6 +256,7 @@ class MCPServer:
         self.review_errors = {}
         self.reviews = {}
         self.asset_review_versions = {}
+        self.review_gate_keys = {}
 
     def _project(self, value, new=False):
         path = _absolute(value)
@@ -288,13 +302,15 @@ class MCPServer:
             "approval": "请用 open_review 打开审片页，由用户本人批准规划、资产和每集成片。",
             "asset_creation": "首次生成资产前，请用户在网页选择由 GPT 决定或自行描述并提供参考图片；模型不能代替用户选择。",
             "segment_proposal": "重分组仅限暂停且无在途任务时的尚未启动尾部；用 propose_segments 保存候选，再由用户在网页确认。不能重跑资产或替换现有规划。",
+            "asset_amendment": "片段返修需要新资产时，使用 propose_asset_amendment；先由用户确认增补方案，再批准新增资产，最后确认返修提示词。不能调用 save_plan 替换旧计划。",
             "budget": "预算仅由用户在终端执行 nolan configure PROJECT --budget AMOUNT 设置；模型不能提高预算。",
             "configuration": "模型、单次调用价格上限及服务凭证须由用户通过本机配置设置。",
         }
         for public, asset in zip(result["assets"], state["assets"]):
             public["character_id"] = asset.get("character_id", "")
+            public["voice_only"] = asset.get("voice_only", False)
             if asset.get("kind") == "voice":
-                for key in ("audition_text", "audition_source", "audition_reason"):
+                for key in ("audition_text", "audition_source", "audition_reason", "audition_speaker"):
                     public[key] = asset.get(key, "")
                 if asset.get("audition_selection_error"):
                     public["audition_selection_error"] = _diagnostic(asset["audition_selection_error"])["message"]
@@ -315,8 +331,27 @@ class MCPServer:
                 result["review_url"] = f"http://127.0.0.1:{self.reviews[root][0].server_address[1]}"
         return result
 
-    def _open_review(self, root, *, asset_plan_version=None):
-        """Reuse one local server; an automatic gate opens once per plan version."""
+    @staticmethod
+    def _review_gate_key(state):
+        """Identify a saved human decision, excluding feedback and provider text."""
+        status = state.get("status")
+        if status == "awaiting_prompt_approval":
+            candidates = [(shot.get("id", ""), shot.get("prompt_candidate", {}).get("id", ""))
+                          for episode in state.get("episodes", []) for shot in episode.get("shots", [])
+                          if shot.get("status") == "awaiting_prompt_approval"]
+            return ("prompt", json.dumps(candidates, sort_keys=True))
+        if status == "awaiting_asset_amendment":
+            candidates = [(item.get("id", ""), item.get("version", 0))
+                          for item in state.get("asset_amendments", []) if item.get("status") == "candidate"]
+            return ("asset_amendment", json.dumps(candidates, sort_keys=True))
+        if status == "asset_generation_failed":
+            failures = [(asset.get("id", ""), asset.get("version", 0))
+                        for asset in state.get("assets", []) if asset.get("status") == "generation_failed"]
+            return ("asset_failure", json.dumps(failures, sort_keys=True))
+        return None
+
+    def _open_review(self, root, *, asset_plan_version=None, gate_key=None):
+        """Reuse one server; automatic gates open once for each saved candidate."""
         with self.lock:
             if self.closed:
                 raise ToolError("Nolan 会话已关闭。")
@@ -341,6 +376,10 @@ class MCPServer:
                            or self.asset_review_versions.get(root) != asset_plan_version)
             if asset_plan_version is not None:
                 self.asset_review_versions[root] = asset_plan_version
+            if gate_key is not None:
+                seen = self.review_gate_keys.setdefault(root, set())
+                should_open = gate_key not in seen
+                seen.add(gate_key)
         url = f"http://127.0.0.1:{server.server_address[1]}"
         opened = False
         if should_open:
@@ -380,6 +419,13 @@ class MCPServer:
                     except Exception:
                         # A local review window failure does not invalidate a
                         # successful production stop at the human input gate.
+                        with self.lock:
+                            if not self.closed:
+                                self.review_errors[root] = REVIEW_ERROR_MESSAGE
+                elif isinstance(state, dict) and (gate_key := self._review_gate_key(state)) is not None:
+                    try:
+                        self._open_review(root, gate_key=gate_key)
+                    except Exception:
                         with self.lock:
                             if not self.closed:
                                 self.review_errors[root] = REVIEW_ERROR_MESSAGE
@@ -467,6 +513,17 @@ class MCPServer:
                     self.review_errors[root] = REVIEW_ERROR_MESSAGE
             result = self._status(root)
             result["message"] = "重分组提案已保存，现行计划尚未改变；请用户本人在审片页确认后再继续制作。"
+            return result
+        elif name == "propose_asset_amendment":
+            core.propose_asset_amendment(root, arguments["shot_id"], arguments["version"], arguments["feedback"],
+                                         arguments["additions"], arguments["shot_updates"], arguments.get("audio_policy"))
+            try:
+                self._open_review(root)
+            except Exception:
+                with self.lock:
+                    self.review_errors[root] = REVIEW_ERROR_MESSAGE
+            result = self._status(root)
+            result["message"] = "资产增补候选已保存；旧资产和已有视频保留，请用户先在网页确认新资产，再审批返修提示词。"
             return result
         elif name == "set_creative_brief":
             with core.run_lock(root):

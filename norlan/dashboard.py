@@ -40,6 +40,9 @@ INPUT_ERRORS = frozenset({
     "生成失败记录尚未核实，不能再次提交；请先核实原调用结果",
     "本集仍有未经人工批准当前版本的视频片段",
     "视频文件不属于当前版本，请先恢复原生成任务并刷新后重新审阅",
+    "请先确认或取消新增资产方案。",
+    "请在片段下确认提示词后再生成。",
+    "请先查看资产失败原因，并明确提出重试意见。",
 })
 MEDIA_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".m4v", ".mov", ".webm", ".wav", ".mp3", ".m4a", ".ogg", ".srt", ".vtt"})
 
@@ -130,7 +133,7 @@ def _public_shot_failures(state, shot):
     recoverable = bool(not unknown and job.get("task_id") and job.get("state") in {"submitted", "download_pending"}
                        and isinstance(job.get("failure"), dict) and job["failure"])
     no_video = not _current_shot_artifact(shot)
-    failed = no_video and (shot.get("status") == "generation_failed" or
+    failed = no_video and shot.get("status") != "awaiting_prompt_approval" and (shot.get("status") == "generation_failed" or
                           shot.get("status") == "review_required" or
                           job.get("state") == "failed")
 
@@ -211,6 +214,74 @@ def _public_shot_continuity(state, episode, shot):
     job = _bound_shot_job(state, shot)
     if _current_shot_artifact(shot) and isinstance(job.get("official_tail_error"), dict) and job["official_tail_error"]:
         result["official_tail_warning"] = "本段视频可正常审阅；官方尾帧尚未保存，后续衔接需先恢复原任务素材。"
+    return result
+
+
+def _public_prompt_candidate(value):
+    """Expose the exact human-review prompt, never request config or URLs."""
+    if not isinstance(value, dict):
+        return None
+    result = _pick(value, ("id", "version", "revision", "prompt", "dialogue", "continuity_notes", "request_hash", "duration"))
+    manifest = value.get("reference_manifest")
+    context = manifest.get("context", manifest) if isinstance(manifest, dict) else {}
+    context = context if isinstance(context, dict) else {}
+    references = {}
+    for key in ("image_references", "audio_references", "video_references"):
+        rows = context.get(key, [])
+        if isinstance(rows, list):
+            references[key] = [_pick(row, ("index", "role", "asset_id", "character_id", "shot_id", "version"))
+                               for row in rows[:20] if isinstance(row, dict)]
+    previous = context.get("previous_actual")
+    if isinstance(previous, dict):
+        references["previous_actual"] = _pick(previous, ("shot_id", "reference_mode", "same_scene"))
+    assets = context.get("assets")
+    if isinstance(assets, list):
+        references["assets"] = [_pick(asset, ("id", "kind", "name", "version", "voice_only"))
+                                for asset in assets[:100] if isinstance(asset, dict)]
+    result["reference_manifest"] = references
+    return result
+
+
+def _public_asset_amendment(value):
+    if not isinstance(value, dict) or value.get("status") != "candidate":
+        return None
+    result = _pick(value, ("id", "status", "target_shot_id", "target_version", "feedback", "created_at"))
+    result["additions"] = [_pick(asset, ("id", "kind", "name", "prompt", "voice_only", "character_id", "audition_text", "audition_reason"))
+                           for asset in value.get("additions", []) if isinstance(asset, dict)]
+    result["shot_updates"] = [_pick(shot, ("id", "add_asset_ids", "prompt", "dialogue", "continuity_notes"))
+                              for shot in value.get("shot_updates", []) if isinstance(shot, dict)]
+    audio_policy = value.get("audio_policy")
+    broadcast = audio_policy.get("system_broadcast") if isinstance(audio_policy, dict) else None
+    if isinstance(broadcast, dict):
+        result["audio_policy"] = {"system_broadcast": _pick(broadcast, ("enabled", "character_id", "voice_id", "instruction"))}
+    return result
+
+
+def _public_asset_failure(state, asset):
+    """Keep failure diagnostics attached to the failed asset's own media job."""
+    if asset.get("status") != "generation_failed":
+        return {}
+    from .failures import sanitize_failure
+    value = asset.get("generation_error")
+    diagnostic = sanitize_failure({"message": value}) if isinstance(value, str) and value else {}
+    result = {"generation_error": diagnostic.get("message") or "本次资产生成失败，旧版本保留，等待你处理。"}
+    job = state.get("jobs", {}).get(asset.get("job_id"), {})
+    expected = "voice" if asset.get("kind") == "voice" else "image"
+    if (not isinstance(job, dict) or job.get("kind") != expected or job.get("item_id") != asset.get("id")):
+        result["can_retry"] = False
+        return result
+    failure = sanitize_failure(job.get("failure")) if isinstance(job.get("failure"), dict) else {}
+    uncertain = job.get("state") == "uncertain" or job.get("accounting") == "unknown"
+    if uncertain:
+        failure.update(uncertain=True)
+    if failure:
+        result["failure"] = failure
+    unsettled = any(isinstance(item, dict) and (item.get("accounting") in {"reserved", "unknown"}
+                    or item.get("state") in {"submitting", "submitted", "download_pending", "uncertain"})
+                    for item in state.get("jobs", {}).values())
+    result["can_retry"] = bool(not uncertain and not unsettled and not failure.get("uncertain")
+                               and job.get("state") == "failed" and job.get("accounting") in {"spent", "released"}
+                               and _version(asset.get("version")) > 0)
     return result
 
 
@@ -343,6 +414,10 @@ def _shot_progress(state, episode, shot, episode_status, stamp):
         result.update(stage="accepted", label="已生成，已通过")
     elif job.get("state") == "uncertain" or job.get("accounting") == "unknown":
         result.update(stage="unknown", label="调用结果待核实", waiting_for_human=True)
+    elif status == "awaiting_prompt_approval":
+        candidate = shot.get("prompt_candidate", {})
+        result.update(stage="awaiting_prompt_approval", label="提示词已准备，等待你确认生成", waiting_for_human=True,
+                      target_version=_version(candidate.get("version")) or version + 1)
     elif status == "generation_failed" or (status == "review_required" and not artifact) or job.get("state") == "failed":
         result.update(stage="failed", label="生成失败，等待处理", waiting_for_human=True)
     elif status == "review_required":
@@ -395,13 +470,19 @@ def public_state(state: dict) -> dict:
     from .core import now
     result["assets"] = []
     for asset in state.get("assets", []):
-        item = _pick(asset, ("id", "kind", "name", "prompt", "status", "version", "file", "audio_file", "feedback", "audition_profile"))
+        item = _pick(asset, ("id", "kind", "name", "prompt", "status", "version", "file", "audio_file", "feedback", "audition_profile", "voice_only", "character_id"))
         data = input_state(asset)
         item["creation_input"] = _pick(data, ("mode", "description", "revision", "confirmed"))
         item["creation_input"]["references"] = [_pick(ref, ("id", "file", "mime", "bytes")) for ref in data.get("references", [])]
-        item["input_editable"] = not has_started(state, asset)
+        item["input_editable"] = not has_started(state, asset) and not (asset.get("kind") == "character" and asset.get("voice_only") is True)
         item["input_required"] = item["input_editable"] and not confirmed(asset)
+        if asset.get("status") == "generation_failed":
+            item.pop("file", None)
+            item.pop("audio_file", None)
+            item.update(_public_asset_failure(state, asset))
         result["assets"].append(item)
+    result["asset_amendments"] = [candidate for value in state.get("asset_amendments", [])
+                                  if (candidate := _public_asset_amendment(value)) is not None]
     episodes = []
     stamp = now()
     for episode in state.get("episodes", []):
@@ -431,6 +512,14 @@ def public_state(state: dict) -> dict:
                 entry["subshots"] = [_pick(part, ("start", "end", "prompt"))
                                      for part in shot["subshots"] if isinstance(part, dict)]
             entry["version"] = _version(shot.get("version"))
+            amendment_id = shot.get("pending_asset_amendment")
+            if amendment_id and any(value.get("id") == amendment_id and value.get("status") in {"candidate", "awaiting_assets"}
+                                    for value in state.get("asset_amendments", []) if isinstance(value, dict)):
+                entry["asset_amendment_pending"] = True
+            if shot.get("status") == "awaiting_prompt_approval":
+                candidate = _public_prompt_candidate(shot.get("prompt_candidate"))
+                if candidate:
+                    entry["prompt_candidate"] = candidate
             entry.update(_public_shot_failures(state, shot))
             entry.update(_public_shot_continuity(state, episode, shot))
             if shot.get("continuity_review"):
@@ -571,10 +660,18 @@ class _Context:
             if self.running:
                 return False
             state = _core().load_project(self.project_dir)
+            if any(asset.get("status") == "generation_failed" for asset in state.get("assets", [])):
+                raise ValueError("请先查看资产失败原因，并明确提出重试意见。")
             if any(isinstance(episode.get("segment_proposal"), dict)
                    and episode["segment_proposal"].get("status") == "candidate"
                    for episode in state.get("episodes", [])):
                 raise ValueError("请先批准新的分段方案，或选择保留原分段，再继续制作。")
+            if any(isinstance(value, dict) and value.get("status") == "candidate"
+                   for value in state.get("asset_amendments", [])):
+                raise ValueError("请先确认或取消新增资产方案。")
+            if any(shot.get("status") == "awaiting_prompt_approval"
+                   for episode in state.get("episodes", []) for shot in episode.get("shots", [])):
+                raise ValueError("请在片段下确认提示词后再生成。")
             self.running = True
             self.worker_error = None
         try:
@@ -765,6 +862,27 @@ class _Handler(BaseHTTPRequestHandler):
                             or type(approve) is not bool):
                         raise ValueError
                     decide_segments(context.project_dir, item_id, proposal_id, approve)
+                    return self._json(200, context.state())
+                if action in {"approve_prompt", "reject_prompt"}:
+                    item_id, candidate_id, request_hash = data.get("id"), data.get("candidate_id"), data.get("request_hash")
+                    if (not isinstance(item_id, str) or not 0 < len(item_id) <= 128
+                            or not isinstance(candidate_id, str) or not 0 < len(candidate_id) <= 128
+                            or not _valid_sha(request_hash)):
+                        raise ValueError
+                    if action == "approve_prompt":
+                        _core().approve_prompt(context.project_dir, item_id, candidate_id, request_hash)
+                    else:
+                        feedback = data.get("feedback")
+                        if not isinstance(feedback, str) or not feedback.strip() or len(feedback) > 8000:
+                            raise ValueError
+                        _core().reject_prompt(context.project_dir, item_id, candidate_id, request_hash, feedback.strip())
+                    return self._json(200, context.state())
+                if action == "asset_amendment":
+                    amendment_id, decision = data.get("id"), data.get("decision")
+                    if (not isinstance(amendment_id, str) or not 0 < len(amendment_id) <= 128
+                            or decision not in {"approve", "reject"}):
+                        raise ValueError
+                    _core().apply_asset_amendment(context.project_dir, amendment_id, decision)
                     return self._json(200, context.state())
                 if action == "sync_costs":
                     if not context.launch_cost_sync():

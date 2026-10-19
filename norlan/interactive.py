@@ -15,7 +15,7 @@ import sys
 import tempfile
 import tomllib
 
-from .brain import BrainError, resolve_codex
+from .brain import BrainError, NEW_EPISODE_DURATION_RULES, resolve_codex
 from .segments import SEGMENT_PLAN_RULES
 
 
@@ -28,7 +28,7 @@ _MCP_TOOLS = (
     "project_status", "list_projects", "read_novel", "create_project", "save_plan",
     "run_production", "pause_production", "request_revision", "correct_captions",
     "set_voice_audition", "get_costs",
-    "open_review", "set_creative_brief", "propose_segments",
+    "open_review", "set_creative_brief", "propose_segments", "propose_asset_amendment",
 )
 _SERVICE_ENV = (
     "ARK_API_KEY", "OPENAI_API_KEY", "VOLC_ACCESS_KEY_ID", "VOLC_SECRET_ACCESS_KEY",
@@ -63,6 +63,13 @@ groups 必须按原顺序完整覆盖该尾部的全部 ID；保留不适合合�
 首次生成资产前必须先在网页由用户选择“由 GPT 自己决定”或“我来描述”（可粘贴参考图）；
 等待资产创作选择时提供审片页，让用户选择，不能用聊天内容代替网页上的选择或直接生成。
 声音资产必须绑定角色；画外声音也需要声源角色，并在镜头提示词明确该角色不出镜。
+制作中要求增加人物、场景、声音等资产，或在返修意见中要求新增资产时，使用 propose_asset_amendment，
+不能用 save_plan 重写旧计划；先提出增补方案，等待用户在网页采用，再确认新增资产/试听声音，
+全部批准后才应用对应片段修改。已有资产与已批准片段保留；画外系统播报可用 voice_only 声源，
+不用生成人物肖像。未来同类通知复用同一已批准声音，用 audio_policy 明确规则，不重复试音。
+真实制作每个片段的首次生成与返修，均先准备最终提示词并打开网页，等用户亲自点击确认后才提交视频。
+等待提示词审批时，继续、恢复或重新运行都不能代替点击确认；修改意见产生的新提示词也须重新确认。
+资产明确生成失败后展示具体原因并等待用户决定重试；普通继续或恢复不能自动再生成试音或图片。
 试音从该角色原剧本里选连续完整、较平稳的较长台词，保存原句、逐字来源和理由；
 以普通话中性语气确认音色，剧情情绪留在分镜。没有合适原句时解释缺口，不编测试句；
 用 set_voice_audition 保存另选的有效原句，候选或已批准声音须先按用户明确意见申请返工。
@@ -78,7 +85,7 @@ run_production 遵守项目预算、版本/文件哈希审批、未知提交禁�
 遇到审批、预算、密钥或供应商能力不足，说明当前状态与具体下一步。不要编造已生成的视频或声画检验结果。
 抽帧检查只支持已观察的画面，不能声称已听过音频或保证动作、口型、声音一致。
 启动时不自动读取或继续演示项目。普通对话的上下文由当前会话保存；/resume 恢复本连接下 Nolan 对话。
-""" + "\n" + SEGMENT_PLAN_RULES
+""" + "\n" + NEW_EPISODE_DURATION_RULES + "\n" + SEGMENT_PLAN_RULES
 
 
 def _data_root() -> Path:

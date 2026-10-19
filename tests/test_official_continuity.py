@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 from norlan import core, pipeline
 from norlan.billing import VIDEO_MODEL
 from norlan.providers import ArkProvider, ProviderError
-from test_pipeline import choose_gpt_assets, fake_media, write
+from test_pipeline import run_confirming_prompts, choose_gpt_assets, fake_media, write
 
 
 class OfficialContinuityTests(unittest.TestCase):
@@ -29,7 +29,7 @@ class OfficialContinuityTests(unittest.TestCase):
         core.install_plan(self.root, pipeline.demo_plan())
         core.approve(self.root, "plan", "plan", 1)
         choose_gpt_assets(self.root)
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         for asset in state["assets"]:
             core.approve(self.root, "asset", asset["id"], asset["version"])
         core.configure(self.root, {"ark": {"video_model": VIDEO_MODEL, "resolution": "720p"},
@@ -51,6 +51,9 @@ class OfficialContinuityTests(unittest.TestCase):
 
     @staticmethod
     def fake_brain(root, method, *args):
+        if method == "plan_revision":
+            return {"needs_assets": False, "additions": [], "shot_updates": [],
+                    "summary": "合成普通返修", "blockers": []}
         if method == "refine_shot":
             return {"prompt": "SYNTHETIC continuity prompt", "dialogue": "", "continuity_notes": "synthetic"}
         return {"verdict": "pass", "issues": [], "observed_end_state": "合成角色位于左侧", "repair_prompt": ""}
@@ -84,7 +87,7 @@ class OfficialContinuityTests(unittest.TestCase):
         return state["jobs"][self.shot(index)["job_id"]]
 
     def approve_first(self):
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         shot = self.shot()
         core.approve(self.root, "shot", shot["id"], shot["version"])
         return self.shot()
@@ -104,7 +107,7 @@ class OfficialContinuityTests(unittest.TestCase):
             job.pop("official_tail_error", None)
 
     def test_completed_video_saves_official_originals_with_task_and_hash(self):
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         shot, job = self.shot(), self.job()
         tail, origin = job["official_tail"], job["origin_video"]
         self.assertEqual(tail["source"], "ark_official_tail")
@@ -123,7 +126,7 @@ class OfficialContinuityTests(unittest.TestCase):
         first = self.approve_first()
         official = self.root / self.job()["official_tail"]["file"]
         local_tail = self.root / first["evidence"]["tail_frame"]
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         call = self.api.submit_video.call_args
         refs = [Path(path) for path in call.args[2]]
         self.assertIn(official, refs)
@@ -138,7 +141,7 @@ class OfficialContinuityTests(unittest.TestCase):
         self.forget_official_tail()
         self.with_tail = False
         original_jobs = set(core.load_project(self.root)["jobs"])
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "blocked")
         self.api.video_artifacts.assert_called_once_with(self.job()["task_id"])
         self.api.submit_video.assert_called_once()
@@ -149,7 +152,7 @@ class OfficialContinuityTests(unittest.TestCase):
     def test_missing_tail_can_be_recovered_by_get_before_one_new_submission(self):
         self.approve_first()
         self.forget_official_tail()
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         self.api.video_artifacts.assert_called_once_with(self.job()["task_id"])
         tail = self.root / self.job()["official_tail"]["file"]
         self.assertIn(tail, [Path(path) for path in self.api.submit_video.call_args.args[2]])
@@ -161,7 +164,7 @@ class OfficialContinuityTests(unittest.TestCase):
         changed = b"\xff\xd8\xffSYNTHETIC TAMPERED TAIL"
         tail.write_bytes(changed)
         downloads = self.api.download.call_count
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "blocked")
         self.api.submit_video.assert_called_once()
         self.api.video_artifacts.assert_not_called()
@@ -170,14 +173,14 @@ class OfficialContinuityTests(unittest.TestCase):
 
     def test_tail_download_failure_preserves_reviewable_video_and_never_reposts(self):
         self.download_tail_error = True
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         shot, job = self.shot(), self.job()
         self.assertTrue((self.root / shot["file"]).is_file())
         self.assertEqual(job["state"], "completed")
         self.assertTrue(job.get("official_tail_error"))
         self.assertFalse(job.get("official_tail"))
         for _ in range(2):
-            self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+            self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         self.api.submit_video.assert_called_once()
         core.approve(self.root, "shot", shot["id"], shot["version"])
         self.assertEqual(self.shot()["status"], "accepted")
@@ -186,7 +189,7 @@ class OfficialContinuityTests(unittest.TestCase):
         first = self.approve_first()
         original = (self.root / first["file"]).read_bytes()
         self.set_video_override()
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         call = self.api.submit_video.call_args
         self.assertEqual(call.kwargs["previous_video"], self.artifacts(self.job()["task_id"])["url"])
         refs = [Path(path) for path in call.args[2]]
@@ -204,7 +207,7 @@ class OfficialContinuityTests(unittest.TestCase):
         self.assertNotIn("SYNTHETIC-PRIVATE", (self.root / "project.json").read_text())
         self.assertEqual((self.root / first["file"]).read_bytes(), original)
         self.assertEqual(self.shot(), first)
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         self.assertEqual(self.api.submit_video.call_count, 2)
 
     def test_remote_original_video_hash_mismatch_blocks_without_replacing_approved_file(self):
@@ -212,7 +215,7 @@ class OfficialContinuityTests(unittest.TestCase):
         original = (self.root / first["file"]).read_bytes()
         self.set_video_override()
         self.video_bytes[self.job()["task_id"]] = b"SYNTHETIC MISMATCHED REMOTE VIDEO"
-        self.assertEqual(pipeline.run(self.root)["status"], "blocked")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "blocked")
         self.api.submit_video.assert_called_once()
         self.assertEqual((self.root / first["file"]).read_bytes(), original)
         self.assertEqual(self.shot(), first)
@@ -220,7 +223,7 @@ class OfficialContinuityTests(unittest.TestCase):
     def test_stale_revision_override_does_not_reuse_original_video_authorization(self):
         self.approve_first()
         self.set_video_override(stale=True)
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         call = self.api.submit_video.call_args
         self.assertIsNone(call.kwargs.get("previous_video"))
         official = self.root / self.job()["official_tail"]["file"]
@@ -231,7 +234,7 @@ class OfficialContinuityTests(unittest.TestCase):
         first = self.approve_first()
         self.set_video_override()
         self.api.poll_video.side_effect = ProviderError("合成测试：轮询暂时不可用。", stage="poll")
-        self.assertEqual(pipeline.run(self.root)["status"], "blocked")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "blocked")
         pending = self.job(1)
         self.assertEqual(pending["state"], "submitted")
         self.assertEqual(self.api.submit_video.call_count, 2)
@@ -239,7 +242,7 @@ class OfficialContinuityTests(unittest.TestCase):
         manifest = copy.deepcopy(self.shot(1)["reference_manifest"])
         self.api.video_artifacts.side_effect = AssertionError("Resume must not re-resolve prior inputs")
         self.api.poll_video.side_effect = self.artifacts
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         self.assertEqual(self.api.submit_video.call_count, 2)
         self.assertEqual(self.api.video_artifacts.call_count, source_calls)
         self.assertEqual(self.job(1)["task_id"], pending["task_id"])
@@ -247,7 +250,7 @@ class OfficialContinuityTests(unittest.TestCase):
         self.assertEqual(self.shot()["sha256"], first["sha256"])
 
     def test_completed_but_unpublished_original_is_not_replaced_on_resume(self):
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         first, job = self.shot(), self.job()
         original_provenance = copy.deepcopy(job["origin_video"])
         output = self.root / first["file"]
@@ -258,7 +261,7 @@ class OfficialContinuityTests(unittest.TestCase):
             shot["status"] = "generating"
             for field in ("file", "sha256", "evidence", "review"):
                 shot.pop(field, None)
-        self.assertEqual(pipeline.run(self.root)["status"], "blocked")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "blocked")
         self.api.submit_video.assert_called_once()
         self.assertEqual(self.job()["origin_video"], original_provenance)
         self.assertFalse(self.shot().get("file"))
@@ -269,7 +272,7 @@ class OfficialContinuityTests(unittest.TestCase):
         with core.transaction(self.root) as state:
             job = state["jobs"][state["episodes"][0]["shots"][0]["job_id"]]
             job["origin_video"]["created_at"] = self.created_at - 31 * 86400
-        self.assertEqual(pipeline.run(self.root)["status"], "blocked")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "blocked")
         self.api.submit_video.assert_called_once()
         self.api.video_artifacts.assert_not_called()
 
@@ -278,7 +281,7 @@ class OfficialContinuityTests(unittest.TestCase):
         with core.transaction(self.root) as state:
             job = state["jobs"][state["episodes"][0]["shots"][0]["job_id"]]
             job["official_tail"]["created_at"] = self.created_at - 31 * 86400
-        self.assertEqual(pipeline.run(self.root)["status"], "blocked")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "blocked")
         self.api.submit_video.assert_called_once()
         self.api.video_artifacts.assert_not_called()
 
@@ -286,7 +289,7 @@ class OfficialContinuityTests(unittest.TestCase):
         first = self.approve_first()
         self.set_video_override()
         (self.root / first["evidence"]["tail_frame"]).unlink()
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         context = [call.args[2] for call in self.brain.call_args_list if call.args[1] == "review"][-1]
         scope = context["review_scope"]
         self.assertNotIn("与前镜实际尾帧", scope)
@@ -300,13 +303,13 @@ class OfficialContinuityTests(unittest.TestCase):
         old_tail = self.root / old_job["official_tail"]["file"]
         old_bytes = old_tail.read_bytes()
         core.reject(self.root, "shot", first["id"], first["version"], "合成用户授权：修正站位一次。")
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         revised = self.shot()
         self.assertEqual(revised["version"], first["version"] + 1)
         new_tail = self.root / self.job()["official_tail"]["file"]
         self.assertNotEqual(old_tail, new_tail)
         core.approve(self.root, "shot", revised["id"], revised["version"])
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         refs = [Path(path) for path in self.api.submit_video.call_args.args[2]]
         self.assertIn(new_tail, refs)
         self.assertNotIn(old_tail, refs)
@@ -318,7 +321,7 @@ class OfficialContinuityTests(unittest.TestCase):
         self.set_video_override()
         with core.transaction(self.root) as state:
             state["episodes"][0]["shots"][1]["continuity_reference"]["source_sha256"] = "0" * 64
-        self.assertEqual(pipeline.run(self.root)["status"], "blocked")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "blocked")
         self.api.submit_video.assert_called_once()
         self.api.video_artifacts.assert_not_called()
 
@@ -328,7 +331,7 @@ class OfficialContinuityTests(unittest.TestCase):
         # First output reserves four. Six remain: enough for output alone,
         # insufficient for the four-second reference plus four-second output.
         core.configure(self.root, {}, limit=10)
-        self.assertEqual(pipeline.run(self.root)["status"], "blocked")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "blocked")
         self.api.submit_video.assert_called_once()
         self.assertFalse(self.shot(1).get("job_id"))
 
@@ -336,7 +339,7 @@ class OfficialContinuityTests(unittest.TestCase):
         with core.transaction(self.root) as state:
             state["mode"] = "demo"
         first = self.approve_first()
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         context = self.shot(1)["reference_manifest"]["context"]
         self.assertEqual(context["image_references"][-1]["role"], "previous_actual_tail")
         self.assertEqual(context["previous_actual"]["sha256"], first["sha256"])

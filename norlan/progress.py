@@ -136,12 +136,17 @@ def episode_progress(state, episode, *, now=None):
         return finish("awaiting_plan", "等待分集与分镜规划审批", waiting=True)
     if episode.get("segment_proposal", {}).get("status") == "candidate":
         return finish("awaiting_segment_plan", "等待你确认剩余内容的分段调整方案", waiting=True)
+    if any(isinstance(value, dict) and value.get("status") == "candidate"
+           for value in state.get("asset_amendments", [])):
+        return finish("awaiting_asset_amendment", "等待你确认新增资产方案；确认后先制作并审批新资产", waiting=True)
     episodes = state.get("episodes", [])
     index = next((index for index, item in enumerate(episodes) if item.get("id") == episode.get("id")), 0)
     if any(item.get("status") != "approved" for item in episodes[:index]):
         return finish("awaiting_previous_episode", "等待前集成片通过人工审批", waiting=True)
     if state.get("status") == "awaiting_asset_input":
         return finish("awaiting_asset_input", "等待选择资产创作方式", waiting=True)
+    if any(asset.get("status") == "generation_failed" for asset in state.get("assets", [])):
+        return finish("asset_generation_failed", "资产生成失败；请查看具体原因并明确提出重试意见", waiting=True)
     if any(asset.get("status") != "approved" for asset in state.get("assets", [])):
         return finish("awaiting_assets", "等待人物、场景和声音资产全部通过审批", waiting=True)
     if state.get("paused") or state.get("status") == "paused":
@@ -149,6 +154,11 @@ def episode_progress(state, episode, *, now=None):
         return finish("paused", label)
     if any(job.get("accounting") == "unknown" or job.get("state") == "uncertain" for job in jobs.values() if isinstance(job, dict)):
         return finish("unknown", "存在结果不明的调用，需核实原任务后继续", waiting=True)
+    prompt_shot = next((shot for shot in shots if shot.get("status") == "awaiting_prompt_approval"), None)
+    if prompt_shot:
+        result["current_shot"] = prompt_shot.get("id")
+        result["current_shot_index"] = shots.index(prompt_shot) + 1
+        return finish("awaiting_prompt_approval", f"片段 {result['current_shot_index']}/{total} 提示词已准备，请确认后生成", waiting=True)
     failed_shot = next((shot for shot in shots if shot.get("status") == "generation_failed" or
                        (shot.get("status") == "review_required" and not (shot.get("file") and shot.get("sha256")))), None)
     if failed_shot:

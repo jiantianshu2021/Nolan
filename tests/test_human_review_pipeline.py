@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from norlan import core, pipeline
 from norlan.providers import ProviderError
-from test_pipeline import choose_gpt_assets, fake_media, run_with_shot_approvals, write
+from test_pipeline import run_confirming_prompts, choose_gpt_assets, fake_media, run_with_shot_approvals, write
 
 
 class HumanReviewPipelineTests(unittest.TestCase):
@@ -20,7 +20,7 @@ class HumanReviewPipelineTests(unittest.TestCase):
         core.install_plan(self.root, pipeline.demo_plan())
         core.approve(self.root, "plan", "plan", 1)
         choose_gpt_assets(self.root)
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         for asset in state["assets"]:
             core.approve(self.root, "asset", asset["id"], asset["version"])
         core.configure(self.root, {"caps": {"video_second": 1}}, limit=100)
@@ -37,6 +37,9 @@ class HumanReviewPipelineTests(unittest.TestCase):
         self.brain = self.enterContext(patch.object(pipeline, "_brain", side_effect=self.fake_brain))
 
     def fake_brain(self, root, method, *args):
+        if method == "plan_revision":
+            return {"needs_assets": False, "additions": [], "shot_updates": [],
+                    "summary": "合成普通返修", "blockers": []}
         if method == "refine_shot":
             return {"prompt": "SYNTHETIC", "dialogue": "", "continuity_notes": "synthetic"}
         return {"verdict": self.verdict, "issues": ["[细节] 合成测试：纸角位置"] if self.verdict == "fail" else [],
@@ -46,7 +49,7 @@ class HumanReviewPipelineTests(unittest.TestCase):
         return core.load_project(self.root)["episodes"][0]["shots"][index]
 
     def test_fail_waits_and_resuming_never_repeats_video_or_report(self):
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "review_required")
         shot = self.shot()
         self.assertEqual(shot["version"], 1)
@@ -56,7 +59,7 @@ class HumanReviewPipelineTests(unittest.TestCase):
         before = copy.deepcopy(state["jobs"])
         calls = self.brain.call_count
         for _ in range(3):
-            self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+            self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         self.api.submit_video.assert_called_once()
         self.assertEqual(self.brain.call_count, calls)
         self.assertEqual(core.load_project(self.root)["jobs"], before)
@@ -64,7 +67,7 @@ class HumanReviewPipelineTests(unittest.TestCase):
 
     def test_pass_also_requires_human_decision(self):
         self.verdict = "pass"
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "review_required")
         self.assertEqual(self.shot()["status"], "review_required")
         self.assertEqual(self.shot(1).get("version", 0), 0)
@@ -72,14 +75,14 @@ class HumanReviewPipelineTests(unittest.TestCase):
 
     def test_uncertain_also_requires_human_decision(self):
         self.verdict = "uncertain"
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         self.api.submit_video.assert_called_once()
 
     def test_approve_failed_report_accepts_actual_state_without_regenerating_it(self):
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         original = self.shot()
         core.approve(self.root, "shot", original["id"], 1)
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         first, second = self.shot(), self.shot(1)
         self.assertEqual(first["sha256"], original["sha256"])
         self.assertEqual(first["version"], 1)
@@ -90,12 +93,12 @@ class HumanReviewPipelineTests(unittest.TestCase):
         self.assertEqual(self.api.submit_video.call_count, 2)
 
     def test_reject_authorizes_exactly_one_version_and_preserves_history(self):
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         original = self.shot()
         core.reject(self.root, "shot", original["id"], 1, "仅修改人物朝向，纸角保留")
         self.verdict = "pass"
-        pipeline.run(self.root)
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
+        run_confirming_prompts(self.root)
         shot = self.shot()
         self.assertEqual(shot["version"], 2)
         self.assertEqual(shot["status"], "review_required")
@@ -109,18 +112,18 @@ class HumanReviewPipelineTests(unittest.TestCase):
                 raise RuntimeError("synthetic report outage")
             return self.fake_brain(root, method, *args)
         self.brain.side_effect = broken_report
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "review_required")
         self.assertTrue(self.shot()["review"]["report_unavailable"])
         self.assertTrue((self.root / self.shot()["file"]).is_file())
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         self.api.submit_video.assert_called_once()
         self.assertEqual(self.brain.call_count, 2)
         core.approve(self.root, "shot", "E001-S001", 1)
         self.assertEqual(self.shot()["status"], "accepted")
 
     def _legacy_retry_fixture(self, *, stored_version=True):
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         original = self.shot()
         with core.transaction(self.root) as state:
             shot = state["episodes"][0]["shots"][0]
@@ -132,13 +135,13 @@ class HumanReviewPipelineTests(unittest.TestCase):
             for key in ("file", "sha256", "evidence", "review", "refined_prompt", "job_id"):
                 shot.pop(key, None)
             state["paused"] = True
-        self.assertEqual(pipeline.run(self.root)["status"], "paused")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "paused")
         restored = self.shot()
         self.assertEqual(restored["status"], "review_required")
         self.assertEqual(restored["sha256"], original["sha256"])
         self.assertEqual(restored["feedback"], "")
         core.set_paused(self.root, False)
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         self.api.submit_video.assert_called_once()
 
     def test_legacy_automatic_retry_is_restored_for_review_even_while_paused(self):
@@ -149,34 +152,34 @@ class HumanReviewPipelineTests(unittest.TestCase):
 
     def test_registered_download_recovers_same_job_then_waits(self):
         self.api.download.side_effect = ProviderError("synthetic network failure")
-        self.assertEqual(pipeline.run(self.root)["status"], "blocked")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "blocked")
         original_job = self.shot()["job_id"]
         self.api.download.side_effect = lambda url, output: write(output,
             b"\xff\xd8\xffSYNTHETIC OFFICIAL TAIL" if url.endswith(".jpg") else b"SYNTHETIC RECOVERED")
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         self.assertEqual(self.shot()["job_id"], original_job)
         self.assertEqual(self.shot()["version"], 1)
         self.api.submit_video.assert_called_once()
 
     def test_legacy_inflight_version_does_not_expose_or_approve_older_file(self):
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         original = self.shot()
         core.reject(self.root, "shot", original["id"], 1, "用户要求再做一版")
         self.api.download.side_effect = ProviderError("synthetic download failure")
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         with core.transaction(self.root) as state:
             shot = state["episodes"][0]["shots"][0]
             for key in ("file", "sha256", "evidence", "review"):
                 shot[key] = copy.deepcopy(original[key])
             state["paused"] = True
-        self.assertEqual(pipeline.run(self.root)["status"], "paused")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "paused")
         self.assertNotIn("file", self.shot())
         self.assertEqual(self.shot()["version"], 2)
         self.assertEqual(self.shot()["history"][0]["sha256"], original["sha256"])
         self.api.download.side_effect = lambda url, output: write(output,
             b"\xff\xd8\xffSYNTHETIC OFFICIAL TAIL" if url.endswith(".jpg") else b"SYNTHETIC V2 RECOVERY")
         core.set_paused(self.root, False)
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "review_required")
         self.assertEqual(self.shot()["version"], 2)
         self.assertEqual(self.shot()["review"]["version"], 2)
@@ -184,10 +187,10 @@ class HumanReviewPipelineTests(unittest.TestCase):
 
     def test_old_gpt_accepted_candidate_needs_human_but_no_new_generation(self):
         self.verdict = "pass"
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         with core.transaction(self.root) as state:
             state["episodes"][0]["shots"][0]["status"] = "accepted"
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(run_confirming_prompts(self.root)["status"], "review_required")
         self.api.submit_video.assert_called_once()
 
     def test_batch_report_cannot_revoke_human_decisions_or_replace_shot_reports(self):

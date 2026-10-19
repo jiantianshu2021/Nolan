@@ -31,6 +31,9 @@ def last_project():
 
 
 STATUS = {"initialized": "等待策划", "awaiting_plan": "等待批准分集规划", "awaiting_assets": "等待资产审批",
+    "awaiting_prompt_approval": "等待检查提示词并点击生成", "prompt_approved": "提示词已确认，等待提交",
+    "awaiting_asset_amendment": "等待确认新增资产方案",
+    "asset_generation_failed": "资产生成失败，等待处理",
     "awaiting_asset_input": "等待资产创作选择",
     "awaiting_episode_review": "等待本集审片", "review_required": "等待你审批片段",
     "generation_failed": "视频生成失败，等待处理",
@@ -283,7 +286,8 @@ def main(argv=None):
             print(json.dumps(state, ensure_ascii=False, indent=2))
         else:
             print(summary(state))
-        if args.command in {"run", "resume"} and state["status"] == "awaiting_asset_input":
+        if args.command in {"run", "resume"} and state["status"] in {
+                "awaiting_asset_input", "awaiting_prompt_approval", "awaiting_asset_amendment", "asset_generation_failed"}:
             from .dashboard import serve
             serve(root, port=0, open_browser=True)
         return 1 if state["status"] == "blocked" else 0

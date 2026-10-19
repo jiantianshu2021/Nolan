@@ -170,7 +170,7 @@ class ReportRenderingTests(unittest.TestCase):
     def test_reports_stay_below_their_video_and_buttons_never_follow_gpt_verdict(self):
         html = Path(dashboard.__file__).with_name("dashboard.html").read_text()
         sources = []
-        for name in ("el", "mediaURL", "appendPrompt", "failureDetails", "shotReview", "advisoryReport", "subshotPlan", "shotCard", "roughCutCard", "appendEpisodeProduction"):
+        for name in ("el", "mediaURL", "appendPrompt", "failureDetails", "shotReview", "advisoryReport", "subshotPlan", "promptApproval", "shotCard", "roughCutCard", "appendEpisodeProduction"):
             start = html.index("function " + name + "(")
             sources.append(html[start:html.index("\nfunction ", start + 1)])
         program = r'''

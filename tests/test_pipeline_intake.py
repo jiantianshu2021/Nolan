@@ -11,7 +11,8 @@ from norlan import core, dashboard, pipeline
 from norlan.billing import IMAGE_MODEL
 from norlan.progress import episode_progress
 from test_asset_inputs import data_url, png_data
-from test_pipeline import choose_gpt_assets, fake_media, write, run_with_shot_approvals
+from test_pipeline import choose_gpt_assets, fake_media, write, run_with_shot_approvals, run_confirming_prompts
+from test_subshot_pipeline import confirming_shot
 
 
 class PipelineIntakeTests(unittest.TestCase):
@@ -59,7 +60,7 @@ class PipelineIntakeTests(unittest.TestCase):
         provider.generate_image.side_effect = generate
         with patch.object(pipeline, "_ark", return_value=provider), \
              patch.object(pipeline, "_brain", side_effect=AssertionError("No GPT needed to preserve exact user input")):
-            state = pipeline.run(self.root)
+            state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "awaiting_assets", state.get("last_error"))
         self.assertEqual(provider.generate_image.call_count, 2)
         first = provider.generate_image.call_args_list[0]
@@ -92,10 +93,10 @@ class PipelineIntakeTests(unittest.TestCase):
         provider.generate_image.side_effect = generate
         feedback = "将人物的外套改为绿色，保留已经确定的发型。"
         with patch.object(pipeline, "_ark", return_value=provider):
-            state = pipeline.run(self.root)
+            state = run_confirming_prompts(self.root)
             asset = state["assets"][0]
             core.reject(self.root, "asset", asset["id"], asset["version"], feedback)
-            state = pipeline.run(self.root)
+            state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "awaiting_assets", state.get("last_error"))
         revision_prompt = provider.generate_image.call_args.args[0]
         with self.subTest("global style"):
@@ -118,7 +119,7 @@ class PipelineIntakeTests(unittest.TestCase):
         with patch.object(pipeline, "_ark") as provider, \
              patch.object(pipeline, "_brain") as brain, \
              patch.object(core, "reserve", wraps=core.reserve) as reserve:
-            state = pipeline.run(self.root)
+            state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "blocked")
         self.assertIn("参考图片缺失或内容已改变", state["last_error"])
         self.assertEqual(state["jobs"], {})
@@ -130,7 +131,7 @@ class PipelineIntakeTests(unittest.TestCase):
     def test_human_retry_moves_failed_clip_to_history_before_next_refinement(self):
         with fake_media():
             choose_gpt_assets(self.root)
-            state = pipeline.run(self.root)
+            state = run_confirming_prompts(self.root)
             for asset in state["assets"]:
                 core.approve(self.root, "asset", asset["id"], asset["version"])
             self.make_live()
@@ -144,6 +145,9 @@ class PipelineIntakeTests(unittest.TestCase):
             initial = core.load_project(self.root)["episodes"][0]["shots"][0]
 
             def brain(root, method, *args, **kwargs):
+                if method == "plan_revision":
+                    return {"needs_assets": False, "additions": [], "shot_updates": [],
+                            "summary": "合成普通位置修正，复用既有资产。", "blockers": []}
                 if method == "review":
                     return {"verdict": "fail", "issues": ["合成测试：人物位置不对"],
                             "observed_end_state": "synthetic", "repair_prompt": "修正人物位置"}
@@ -173,18 +177,18 @@ class PipelineIntakeTests(unittest.TestCase):
 
             with patch.object(pipeline, "_ark", return_value=provider), \
                  patch.object(pipeline, "_brain", side_effect=brain):
-                self.assertFalse(pipeline._shot(self.root, "E001", "E001-S001", None))
+                self.assertFalse(confirming_shot(self.root, "E001", "E001-S001", None))
                 self.assertEqual(refinements, [0])
                 core.reject(self.root, "shot", "E001-S001", 1, "修正人物位置")
                 with self.assertRaisesRegex(core.GateError, "Synthetic stop before second submission"):
-                    pipeline._shot(self.root, "E001", "E001-S001", None)
+                    confirming_shot(self.root, "E001", "E001-S001", None)
             self.assertEqual(refinements, [0, 1])
             provider.submit_video.assert_called_once()
 
     def test_live_episode_writes_observable_generation_and_postproduction_phases(self):
         with fake_media():
             choose_gpt_assets(self.root)
-            state = pipeline.run(self.root)
+            state = run_confirming_prompts(self.root)
             for asset in state["assets"]:
                 core.approve(self.root, "asset", asset["id"], asset["version"])
             self.make_live()

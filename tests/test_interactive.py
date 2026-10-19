@@ -86,6 +86,12 @@ class InteractiveTests(unittest.TestCase):
         self.assertNotIn("approve", config["mcp_servers"]["norlan"]["enabled_tools"])
         self.assertNotIn("budget", config["mcp_servers"]["norlan"]["enabled_tools"])
         self.assertIn("propose_segments", config["mcp_servers"]["norlan"]["enabled_tools"])
+        self.assertIn("propose_asset_amendment", config["mcp_servers"]["norlan"]["enabled_tools"])
+        from norlan.mcp_server import TOOLS
+        self.assertEqual(set(config["mcp_servers"]["norlan"]["enabled_tools"]),
+                         {tool["name"] for tool in TOOLS})
+        self.assertIn("不能用 save_plan 重写旧计划", config["developer_instructions"])
+        self.assertIn("等用户亲自点击确认后才提交视频", config["developer_instructions"])
         self.assertNotIn("approve_segments", config["mcp_servers"]["norlan"]["enabled_tools"])
         mcp_args = config["mcp_servers"]["norlan"]["args"]
         production_workspace = Path(mcp_args[mcp_args.index("--workspace") + 1])

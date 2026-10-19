@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from norlan import core, pipeline
-from test_pipeline import choose_gpt_assets, fake_media, write
+from test_pipeline import run_confirming_prompts, choose_gpt_assets, fake_media, write
 
 
 class CandidatePreviewTests(unittest.TestCase):
@@ -25,7 +25,7 @@ class CandidatePreviewTests(unittest.TestCase):
         core.install_plan(self.root, plan)
         core.approve(self.root, "plan", "plan", 1)
         choose_gpt_assets(self.root)
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         for asset in state["assets"]:
             core.approve(self.root, "asset", asset["id"], asset["version"])
         core.configure(self.root, {"caps": {"video_second": 1}, "batch_size": 30}, limit=200)
@@ -43,6 +43,9 @@ class CandidatePreviewTests(unittest.TestCase):
         pipeline.media.compose.reset_mock()
 
     def fake_brain(self, root, method, *args):
+        if method == "plan_revision":
+            return {"needs_assets": False, "additions": [], "shot_updates": [],
+                    "summary": "合成普通返修", "blockers": []}
         if method == "refine_shot":
             return {"prompt": "SYNTHETIC PREVIEW", "dialogue": "", "continuity_notes": "synthetic"}
         return {"verdict": "pass", "issues": [], "observed_end_state": "合成测试：人物站左侧", "repair_prompt": ""}
@@ -60,7 +63,7 @@ class CandidatePreviewTests(unittest.TestCase):
     def generate_through(self, index):
         """Generate the indexed candidate; preceding approvals are synthetic humans."""
         for current in range(index + 1):
-            state = pipeline.run(self.root)
+            state = run_confirming_prompts(self.root)
             self.assertEqual(state["status"], "review_required", state.get("last_error"))
             self.assertEqual(self.shot(current)["status"], "review_required")
             if current < index:
@@ -91,7 +94,7 @@ class CandidatePreviewTests(unittest.TestCase):
             return self.fake_brain(root, method, *args)
 
         self.brain.side_effect = inspect_report
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         self.assertEqual(len(inspected), 1)
         self.assertEqual(state["status"], "review_required", state.get("last_error"))
         self.assertEqual(self.shot(1)["status"], "review_required")
@@ -100,7 +103,7 @@ class CandidatePreviewTests(unittest.TestCase):
         self.assertEqual(self.api.submit_video.call_count, 2)
         self.assertEqual(pipeline.media.compose.call_count, 1)
         before_calls, before_jobs = self.brain.call_count, copy.deepcopy(state["jobs"])
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         self.assertEqual(self.brain.call_count, before_calls)
         self.assertEqual(core.load_project(self.root)["jobs"], before_jobs)
         self.assertEqual(self.api.submit_video.call_count, 2)
@@ -119,12 +122,12 @@ class CandidatePreviewTests(unittest.TestCase):
             return self.fake_brain(root, method, *args)
 
         self.brain.side_effect = broken_report
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "review_required", state.get("last_error"))
         self.assertTrue(self.shot(1)["review"]["report_unavailable"])
         cut = copy.deepcopy(self.preview())
         before_calls = self.brain.call_count
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         self.assertEqual(self.preview(), cut)
         self.assertEqual(self.brain.call_count, before_calls)
         self.assertEqual(self.api.submit_video.call_count, 2)
@@ -134,7 +137,7 @@ class CandidatePreviewTests(unittest.TestCase):
         self.generate_through(0)
         self.approve(0)
         with patch.object(pipeline.media, "compose", side_effect=RuntimeError("SYNTHETIC PRIVATE DETAIL")):
-            state = pipeline.run(self.root)
+            state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "review_required", state.get("last_error"))
         self.assertTrue(self.episode().get("preview_error"))
         self.assertNotIn("SYNTHETIC PRIVATE DETAIL", str(self.episode()["preview_error"]))
@@ -144,7 +147,7 @@ class CandidatePreviewTests(unittest.TestCase):
         before_review = copy.deepcopy(self.shot(1)["review"])
         before_calls = self.brain.call_count
         self.assertEqual(self.api.submit_video.call_count, 2)
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         self.assertEqual(self.preview()["shot_count"], 2)
         self.assertFalse(self.episode().get("preview_error"))
         self.assertEqual(self.shot(1)["review"], before_review)
@@ -165,7 +168,7 @@ class CandidatePreviewTests(unittest.TestCase):
         pipeline.media.compose.reset_mock()
         self.brain.reset_mock()
         self.api.reset_mock()
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "review_required", state.get("last_error"))
         self.assertEqual(self.preview()["shot_count"], 2)
         self.assertEqual(state["jobs"], before["jobs"])
@@ -182,7 +185,7 @@ class CandidatePreviewTests(unittest.TestCase):
         old_cuts = before["rough_cuts"]
         old_bytes = {cut["file"]: (self.root / cut["file"]).read_bytes() for cut in old_cuts}
         core.reject(self.root, "shot", before["shots"][1]["id"], 1, "合成测试：只修改第二段动作")
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "review_required", state.get("last_error"))
         after = self.episode()
         cut = self.preview()
@@ -200,7 +203,7 @@ class CandidatePreviewTests(unittest.TestCase):
             self.assertEqual(after["shots"][index]["status"], "review_required")
         self.assertEqual(self.api.submit_video.call_count, 5)
         before_calls = self.brain.call_count
-        pipeline.run(self.root)
+        run_confirming_prompts(self.root)
         self.assertEqual(self.api.submit_video.call_count, 5)
         self.assertEqual(self.brain.call_count, before_calls)
         self.assertEqual(self.preview(), cut)
@@ -212,7 +215,7 @@ class CandidatePreviewTests(unittest.TestCase):
         cut = copy.deepcopy(self.preview())
         self.approve(1)
         pipeline.media.compose.reset_mock()
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "awaiting_episode_review", state.get("last_error"))
         self.assertEqual(self.episode()["rough_cuts"], [cut])
         self.assertEqual(pipeline.media.compose.call_count, 1)  # final render only
@@ -228,7 +231,7 @@ class CandidatePreviewTests(unittest.TestCase):
         self.api.download.side_effect = lambda url, output: write(output,
             b"\xff\xd8\xffSYNTHETIC OFFICIAL TAIL" if url.endswith(".jpg") else old_video)
         pipeline.media.compose.reset_mock()
-        state = pipeline.run(self.root)
+        state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "review_required", state.get("last_error"))
         new_cut = self.preview()
         self.assertEqual(self.shot(1)["version"], 2)
@@ -291,7 +294,7 @@ class CandidatePreviewTests(unittest.TestCase):
 
         self.brain.reset_mock()
         with patch.object(pipeline.media, "extract_evidence", side_effect=broken_evidence):
-            state = pipeline.run(self.root)
+            state = run_confirming_prompts(self.root)
         self.assertEqual(state["status"], "blocked")
         self.assertEqual(self.episode().get("rough_cuts", []), [])
         self.assertNotIn("file", self.shot(1))

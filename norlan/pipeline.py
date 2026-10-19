@@ -10,7 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import core, media, official
+from . import core, media, official, prompt_gate
 from .billing import price_snapshot
 from .failures import exception_failure, sanitize_failure
 from .voice import (AuditionSelectionError, audition_duration, audition_profile,
@@ -55,6 +55,8 @@ def _pending_segment_plan(state):
 
 
 def _new_work_gate(state):
+    if any(item.get("status") == "candidate" for item in state.get("asset_amendments", [])):
+        raise core.GateError("新增资产方案等待确认；尚未提交新的生成任务。")
     if _pending_segment_plan(state):
         raise core.GateError("剩余生成段方案等待人工批准；批准前不会提交新的付费调用。")
 
@@ -360,7 +362,8 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
 def _select_audition(root, asset, character):
     """Select a sourced excerpt once per voice/feedback/source change."""
     novel = (Path(root) / "source/novel.txt").read_text(encoding="utf-8")
-    signature = audition_selection_key(asset, character["name"], core.digest(Path(root) / "source/novel.txt"))
+    speaker = asset.get("audition_speaker") or character.get("audition_speaker") or character["name"]
+    signature = audition_selection_key(asset, speaker, core.digest(Path(root) / "source/novel.txt"))
     if asset.get("audition_selection_key") == signature and asset.get("audition_selection_error"):
         raise core.GateError(asset["audition_selection_error"])
 
@@ -378,7 +381,7 @@ def _select_audition(root, asset, character):
         candidate = {**asset, **{key: selection[key] for key in ("audition_text", "audition_reason", "audition_source")}}
         if candidate["audition_text"].strip():
             try:
-                validate_audition(candidate, novel, character["name"])
+                validate_audition(candidate, novel, speaker)
             except AuditionSelectionError as exc:
                 invalid_selection(str(exc))
         elif candidate["audition_source"].strip() or not candidate["audition_reason"].strip():
@@ -389,10 +392,23 @@ def _select_audition(root, asset, character):
         _save_asset(root, asset["id"], **values)
         asset = {**asset, **values}
     try:
-        validate_audition(asset, novel, character["name"])
+        validate_audition(asset, novel, speaker)
     except AuditionSelectionError as exc:
         raise core.GateError(str(exc) + (" 选句说明：" + asset["audition_reason"] if asset.get("audition_reason") else "")) from None
     return asset
+
+
+def _asset_generation_failed(root, asset_id):
+    state = core.load_project(root)
+    asset = core._find(state, "asset", asset_id)
+    job = state["jobs"].get(asset.get("job_id"), {})
+    if job.get("item_id") != asset_id or job.get("kind") not in {"voice", "image"} or job.get("state") != "failed":
+        raise core.GateError("资产失败记录与当前版本不匹配，请核对原调用。")
+    detail = sanitize_failure(job.get("failure")) if job.get("failure") else {}
+    message = detail.get("message") or "旧资产调用未保存具体原因；不会再次提交，请填写意见后决定是否重试。"
+    _save_asset(root, asset_id, status="generation_failed", generation_error=message)
+    _set(root, status="asset_generation_failed", last_error=message)
+    return False
 
 
 def _assets(root):
@@ -404,7 +420,18 @@ def _assets(root):
         asset = core._find(s, "asset", original["id"])
         if asset["status"] in {"approved", "candidate"}:
             continue
+        if asset.get("kind") == "character" and asset.get("voice_only") is True:
+            # Voice-source definitions are not portraits. They receive a human
+            # definition decision; no image/video call can create that decision.
+            definition = dict(asset)
+            if asset.get("feedback", "").strip():
+                definition["prompt"] = asset["prompt"] + "\n本次声源定义修改：" + asset["feedback"].strip()
+            _save_asset(root, asset["id"], prompt=definition["prompt"], status="candidate",
+                        version=asset.get("version", 0) + 1, sha256=core.voice_only_digest(definition))
+            continue
         active_job = s["jobs"].get(asset.get("job_id", ""))
+        if active_job and active_job.get("state") == "failed" and asset["status"] != "rejected":
+            return _asset_generation_failed(root, asset["id"])
         recovering = bool(asset["status"] != "rejected" and active_job and active_job["state"] in {"submitted", "download_pending", "completed"})
         # An upgraded project can already have a submitted task while later
         # assets still lack the new choice. Recover that task without any new
@@ -432,6 +459,7 @@ def _assets(root):
                     a["history"].append({k: a[k] for k in ("file", "sha256", "version")})
                 a.update(version=version, status="generating")
                 a.pop("job_id", None)
+                a.pop("generation_error", None)
                 asset = copy.deepcopy(a)
         version = asset["version"]
         suffix = ".mp4" if asset["kind"] == "voice" else ".png"
@@ -445,16 +473,24 @@ def _assets(root):
             if character is None or character["status"] != "approved":
                 raise core.GateError("声音试音必须绑定一个已批准的角色，不能猜测说话人")
             core._check_artifact(root, character)
-            images = [core.safe_path(root, character["file"])]
-            voice_asset = {**asset, "prompt": compose_prompt(asset)}
+            images = [] if character.get("voice_only") is True else [core.safe_path(root, character["file"])]
+            voice_asset = {**asset, "prompt": compose_prompt(asset), "voice_only": character.get("voice_only") is True}
             voice_prompt = asset.get("audition_prompt", "已提交声音试片，仅恢复原任务") if recovering else (
                 "DEMO / SYNTHETIC PLACEHOLDER voice audition" if s["mode"] == "demo" else build_audition_prompt(voice_asset))
             duration = 5 if recovering or s["mode"] == "demo" else audition_duration(asset)
             if not recovering:
                 _save_asset(root, asset["id"], audition_profile=audition_profile(voice_asset), audition_prompt=voice_prompt)
-            _video(root, "voice", asset["id"], out, duration,
-                voice_prompt, images,
-                old_job=asset.get("job_id") if recovering else None)
+            try:
+                _video(root, "voice", asset["id"], out, duration,
+                    voice_prompt, images,
+                    old_job=asset.get("job_id") if recovering else None)
+            except Exception:
+                latest = core.load_project(root)
+                failed_asset = core._find(latest, "asset", asset["id"])
+                failed = latest["jobs"].get(failed_asset.get("job_id"), {})
+                if failed.get("state") == "failed" and failed.get("accounting") != "unknown":
+                    return _asset_generation_failed(root, asset["id"])
+                raise
             ev = _relative_evidence(root, media.extract_evidence(out, Path(root) / "evidence" / f"{asset['id']}-v{version}"))
             if not ev.get("audio"):
                 raise core.GateError("试音没有声音轨，不能批准为声音参考")
@@ -483,7 +519,9 @@ def _assets(root):
             except Exception as exc:
                 uncertain = getattr(exc, "uncertain", True)
                 core.update_job(root, job_id, state="uncertain" if uncertain else "failed",
-                                accounting="unknown" if uncertain else "spent")
+                                accounting="unknown" if uncertain else "spent", failure=exception_failure(exc, "submission"))
+                if not uncertain:
+                    return _asset_generation_failed(root, asset["id"])
                 raise
         if not out.is_file():
             raise core.GateError("已登记成功的素材文件缺失，请从供应商取回；不会重复生成")
@@ -513,7 +551,7 @@ def _shot_context(root, ep, shot, previous):
                 raise core.GateError("镜头声音参考未绑定到同镜引用的角色，不能猜测说话人")
             voices.append(core.safe_path(root, asset["audio_file"]))
             voice_manifest.append({"index": len(voices), "asset_id": asset["id"], "character_id": asset["character_id"], "sha256": asset["audio_sha256"]})
-        else:
+        elif asset.get("voice_only") is not True:
             images.append(core.safe_path(root, asset["file"]))
             image_manifest.append({"index": len(images), "role": "approved_asset", "asset_id": asset["id"], "sha256": asset["sha256"]})
     if shot.get("dialogue") and s["settings"]["require_voice_reference"] and not voices:
@@ -568,10 +606,11 @@ def _shot_context(root, ep, shot, previous):
             reference.update(details)
     context = {"episode": {k: ep.get(k) for k in ("id", "title", "summary", "feedback")},
         "style": s["plan"].get("style"), "assets": [{k: a.get(k) for k in
-            ("id", "kind", "name", "prompt", "character_id", "version", "sha256")} for a in assets],
+            ("id", "kind", "name", "prompt", "character_id", "version", "sha256", "voice_only")} for a in assets],
         "previous_actual": continuity, "feedback": shot.get("feedback", ""),
         "image_references": image_manifest, "audio_references": voice_manifest,
         "audio_strategy": "使用批准的声音参考，镜头不生成背景配乐；配乐在整集时间线统一添加。",
+        "audio_policy": copy.deepcopy(s.get("audio_policy", {})),
         "limitations": "尾帧是实际画面参考；不能保证身份、口型和音色绝对一致。"}
     return context, images, voices
 
@@ -590,6 +629,102 @@ def _observation_images(root, context, images, previous):
                              "sha256": core.digest(path), "sent_to_video_engine": False})
     context["observation_images"] = manifest
     return observed
+
+
+def _final_shot_prompt(state, shot, refined, context):
+    prompt = refined["prompt"]
+    if "subshots" in shot:
+        from .segments import timeline_prompt
+        prompt += "\n" + timeline_prompt(shot)
+    if shot.get("dialogue"):
+        prompt += "\n必须使用的原定对白：" + shot["dialogue"]
+    prompt += "\n不添加画面字幕，不添加背景配乐。"
+    if (context.get("previous_actual") or {}).get("reference_mode") == "original_video":
+        prompt += "\n视频1是已批准的上一段原始视频。仅承接其结尾继续本段剧情，保持人物、场景、动作方向和声音连续；不要重演已完成的动作或重复已说完的台词。"
+    policy = state.get("audio_policy", {}).get("system_broadcast", {})
+    if policy.get("enabled") is True and policy.get("voice_id") in shot["asset_ids"]:
+        reference = next((item for item in context.get("audio_references", [])
+                          if item.get("asset_id") == policy["voice_id"]), None)
+        if not reference:
+            raise core.GateError("系统播报必须传入已批准的女声参考，不能仅靠文字描述。")
+        prompt += (f"\n系统播音规则（覆盖旧分镜中与之冲突的无配音或不念字幕要求）：使用音频{reference['index']}"
+                   "作为固定系统女声，仅作画外播报，不生成可见播报员。" + policy.get("instruction", "") +
+                   "任务框播音与画面字幕是不同要求；不添加画面字幕不代表取消播音。只播读本片段明确安排的系统通知，"
+                   "不重复试音台词，不覆盖人物对白，不通过加速或截断强行压缩。")
+        prompt += "\n如果本片段没有明确系统通知，则该系统声源保持静默，不凭空增加播报内容；弹幕、直播标题与普通道具文字不自动当作系统通知。"
+    return prompt
+
+
+def _revision_analysis(root, shot):
+    """Resolve a human request for new assets before preparing a paid rework."""
+    if not shot.get("feedback", "").strip():
+        return True
+    # Parse the meaning once per human revision. A keyword rule would miss
+    # requests such as "让另一个女人说这些" or "换到沙漠里".
+    signature = hashlib.sha256(json.dumps([shot.get("revision", 0), shot["feedback"]], ensure_ascii=False).encode()).hexdigest()
+    old = shot.get("revision_analysis", {})
+    if old.get("signature") == signature:
+        if old.get("amendment_id"):
+            amendment = next((a for a in core.load_project(root).get("asset_amendments", [])
+                              if a.get("id") == old["amendment_id"]), {})
+            if amendment.get("status") == "rejected":
+                raise core.GateError("新增资产方案已取消。请修改返修意见后重新提出方案；尚未生成返修视频。")
+            return amendment.get("status") in {"applied", "activated"}
+        if old.get("blockers"):
+            raise core.GateError("；".join(old["blockers"]))
+        return True
+    state = _gate(root)
+    if state["mode"] == "demo":
+        return True
+    context = {"assets": state["assets"], "episodes": state["episodes"],
+               "novel": (Path(root) / "source/novel.txt").read_text(encoding="utf-8"),
+               "audio_policy": state.get("audio_policy", {})}
+    result = _brain(root, "plan_revision", shot, context, shot["feedback"])
+    if not isinstance(result, dict) or type(result.get("needs_assets")) is not bool:
+        raise core.GateError("返修需求分析结果不完整，尚未提交视频。")
+    record = {"signature": signature, "blockers": result.get("blockers", []), "summary": result.get("summary", "")}
+    if record["blockers"]:
+        _save_shot(root, shot["id"], revision_analysis=record)
+        raise core.GateError("；".join(record["blockers"]))
+    policy = result.get("audio_policy") or {}
+    previous_policy = state.get("audio_policy", {})
+    policy_changed = bool(policy.get("system_broadcast", {}).get("enabled")
+                          or previous_policy.get("system_broadcast", {}).get("enabled")) and policy != previous_policy
+    references_changed = any(set(update.get("add_asset_ids", [])) - set(core._find(state, "shot", update["id"])["asset_ids"])
+                             for update in result.get("shot_updates", []))
+    if result["needs_assets"] or references_changed or policy_changed:
+        changed = core.propose_asset_amendment(root, shot["id"], shot.get("version", 0), shot["feedback"],
+                    result["additions"], result["shot_updates"], audio_policy=policy or None, already_locked=True)
+        amendment = changed["asset_amendments"][-1]
+        record["amendment_id"] = amendment["id"]
+        _save_shot(root, shot["id"], revision_analysis=record)
+        _set(root, status="awaiting_asset_amendment")
+        return False
+    _save_shot(root, shot["id"], revision_analysis=record)
+    return True
+
+
+def _system_voice_reference(root, shot):
+    """A user-approved global voice rule must never silently lose its source.
+
+    Carry the fixed reference even in a silent segment; the final prompt makes
+    it explicit that only written system notifications may be spoken. This
+    avoids guessing from keywords whether a task interface appears on screen.
+    """
+    state = core.load_project(root)
+    policy = state.get("audio_policy", {}).get("system_broadcast", {})
+    if policy.get("enabled") is not True:
+        return shot
+    required = [policy.get("character_id"), policy.get("voice_id")]
+    for identifier in required:
+        asset = core._find(state, "asset", identifier)
+        if asset["status"] != "approved":
+            raise core.GateError("固定系统播报声源尚未人工批准，不能继续准备片段。")
+        core._check_artifact(root, asset)
+    if not set(required) <= set(shot["asset_ids"]):
+        _save_shot(root, shot["id"], asset_ids=list(dict.fromkeys(shot["asset_ids"] + required)))
+        return core._find(core.load_project(root), "shot", shot["id"])
+    return shot
 
 
 def _shot(root, ep_id, shot_id, previous):
@@ -618,13 +753,20 @@ def _shot(root, ep_id, shot_id, previous):
         _refresh_candidate_preview(root, ep_id)
         _set(root, status="review_required")
         return False
+    if shot["status"] == "awaiting_prompt_approval":
+        _set(root, status="awaiting_prompt_approval")
+        return False
     recovering = bool(active and active["state"] in {"submitted", "download_pending", "completed"})
     attempted = bool(active and active.get("state") == "failed") or any(
         attempt.get("revision", 0) == shot.get("revision", 0) for attempt in shot.get("attempts", []))
     if not recovering and attempted:
         return _shot_generation_failed(root, shot_id)
+    approved_candidate = prompt_gate.approved(root, shot) if not recovering and shot.get("status") == "prompt_approved" else None
     if not recovering:
         _new_work_gate(s)
+        shot = _system_voice_reference(root, shot)
+        if not _revision_analysis(root, shot):
+            return False
         _progress(root, ep_id, "shot_preparation", shot_id)
     previous_video, reference_duration = None, 0
     if recovering:
@@ -649,11 +791,30 @@ def _shot(root, ep_id, shot_id, previous):
             previous_video, reference_duration, video_manifest = official.resolve_video(root, previous, _ark(root))
             context["video_references"] = [video_manifest]
         observations = _observation_images(root, context, images, previous)
-    if not recovering:
+    if not recovering and shot.get("status") == "prompt_approved":
+        candidate = approved_candidate
+        refined = candidate["refined"]
+        prompt = candidate["prompt"]
+        manifest = {"images": [_rel(root, f) for f in images], "audio": [_rel(root, f) for f in voices],
+                    "context": context, "observations": [_rel(root, f) for f in observations]}
+        actual_hash = prompt_gate._hash(prompt_gate.specification(core.load_project(root), shot, prompt, manifest))
+        if actual_hash != candidate["request_hash"]:
+            prompt_gate.invalidate(root, shot_id)
+            raise core.GateError("实际生成素材与已确认提示词不一致，请重新准备提示词。")
+        version = candidate["version"]
+        _save_shot(root, shot_id, refined_prompt=refined, version=version, status="generating", generation_error=None,
+                   reference_manifest=manifest)
+        shot = core._find(core.load_project(root), "shot", shot_id)
+    elif not recovering:
         if s["mode"] == "demo":
             refined = {"prompt": shot["prompt"] + " " + shot.get("feedback", ""), "dialogue": "", "continuity_notes": "Synthetic demo"}
         else:
             refined = _brain(root, "refine_shot", shot, context, observations)
+        if s["mode"] == "live":
+            manifest = {"images": [_rel(root, f) for f in images], "audio": [_rel(root, f) for f in voices],
+                        "context": context, "observations": [_rel(root, f) for f in observations]}
+            prompt_gate.prepare(root, shot_id, refined, _final_shot_prompt(s, shot, refined, context), manifest)
+            return False
         version = shot.get("version", 0) + 1
         _save_shot(root, shot_id, refined_prompt=refined, version=version, status="generating", generation_error=None,
             reference_manifest={"images": [_rel(root, f) for f in images],
@@ -669,16 +830,8 @@ def _shot(root, ep_id, shot_id, previous):
             stored = core._find(current, "shot", shot_id)
             if not _archive_stale_shot_file(stored):
                 raise core.GateError("当前视频文件与生成任务路径不一致，请先核实原任务；不会重新提交。")
-    prompt = shot["refined_prompt"]["prompt"]
-    if "subshots" in shot:
-        from .segments import timeline_prompt
-        prompt += "\n" + timeline_prompt(shot)
-    # Refined text must not be treated as approved story changes.
-    if shot.get("dialogue"):
-        prompt += "\n必须使用的原定对白：" + shot["dialogue"]
-    prompt += "\n不添加画面字幕，不添加背景配乐。"
-    if (context.get("previous_actual") or {}).get("reference_mode") == "original_video":
-        prompt += "\n视频1是已批准的上一段原始视频。仅承接其结尾继续本段剧情，保持人物、场景、动作方向和声音连续；不要重演已完成的动作或重复已说完的台词。"
+    prompt = (shot.get("prompt_candidate", {}).get("prompt")
+              if shot.get("prompt_approval") else _final_shot_prompt(s, shot, shot["refined_prompt"], context))
     try:
         _video(root, "video", shot_id, out, shot["duration"], prompt, images, voices,
                old_job=shot.get("job_id") if recovering else None,
@@ -1033,6 +1186,9 @@ def run(root):
             _recover(root)
             s = _gate(root)
             _set(root, last_error=None)
+            if any(item.get("status") == "candidate" for item in s.get("asset_amendments", [])):
+                _set(root, status="awaiting_asset_amendment")
+                return core.load_project(root)
             if _pending_segment_plan(s) and not any(
                     job.get("state") in {"submitted", "download_pending"} for job in s["jobs"].values()):
                 _set(root, status="awaiting_segment_plan")
@@ -1051,6 +1207,9 @@ def run(root):
                 return core.load_project(root)
             if not _assets(root):
                 return core.load_project(root)
+            for amendment in core.load_project(root).get("asset_amendments", []):
+                if amendment.get("status") == "awaiting_assets":
+                    core.activate_asset_amendment(root, amendment["id"])
             s = _gate(root)
             for ep in s["episodes"]:
                 if ep["status"] != "approved":

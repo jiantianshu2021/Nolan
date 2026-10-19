@@ -26,10 +26,31 @@ def choose_gpt_assets(root):
                              input_state(asset)["revision"], "gpt", "")
 
 
+def run_confirming_prompts(root):
+    """Explicit synthetic human consent for fixtures testing downstream behavior.
+
+    Use the real consent API against each exact saved candidate. Demo runs are
+    unchanged, and video or asset candidates are never approved by this helper.
+    Prompt-gate tests call ``pipeline.run`` directly to inspect the consent stop.
+    """
+    for _ in range(20):
+        state = pipeline.run(root)
+        if state.get("mode") != "live" or state.get("status") != "awaiting_prompt_approval":
+            return state
+        pending = [shot for episode in state["episodes"] for shot in episode["shots"]
+                   if shot.get("status") == "awaiting_prompt_approval"]
+        if not pending:
+            raise AssertionError("Synthetic fixture has no prompt candidate for a human to approve")
+        shot = pending[0]
+        candidate = shot["prompt_candidate"]
+        core.approve_prompt(root, shot["id"], candidate["id"], candidate["request_hash"])
+    raise AssertionError("Synthetic fixture exceeded its bounded prompt approval loop")
+
+
 def run_with_shot_approvals(root):
     """Synthetic human decisions for fixtures that need a rendered episode."""
     for _ in range(20):
-        state = pipeline.run(root)
+        state = run_confirming_prompts(root)
         if state["status"] != "review_required":
             return state
         pending = [shot for episode in state["episodes"] for shot in episode["shots"]
@@ -319,14 +340,20 @@ class PipelineTests(unittest.TestCase):
             api = Mock()
             api.submit_video.side_effect = ProviderError("rejected", uncertain=False)
             refinement = {"prompt": "new", "dialogue": "", "continuity_notes": "none"}
-            with patch.object(pipeline, "_ark", return_value=api), patch.object(pipeline, "_brain", return_value=refinement):
-                state = pipeline.run(self.root)
+            def brain(root, method, *args, **kwargs):
+                if method == "plan_revision":
+                    return {"needs_assets": False, "additions": [], "shot_updates": [],
+                            "summary": "合成普通重试，复用既有资产。", "blockers": []}
+                self.assertEqual(method, "refine_shot")
+                return refinement
+            with patch.object(pipeline, "_ark", return_value=api), patch.object(pipeline, "_brain", side_effect=brain):
+                state = run_confirming_prompts(self.root)
                 pipeline.run(self.root)
                 state = pipeline.run(self.root)
                 self.assertEqual(state["status"], "generation_failed")
                 self.assertEqual(api.submit_video.call_count, 1)
                 core.reject(self.root, "shot", "E001-S001", 1, "用户要求再试一次")
-                state = pipeline.run(self.root)
+                state = run_confirming_prompts(self.root)
                 pipeline.run(self.root)
             self.assertEqual(api.submit_video.call_count, 2)
             self.assertEqual(state["status"], "generation_failed")
