@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 from . import core, media, official, prompt_gate
+from .brain import task_asset_summary, task_context_summary, task_shot_summary
 from .billing import price_snapshot
 from .failures import exception_failure, sanitize_failure
 from .voice import (AuditionSelectionError, audition_duration, audition_profile,
@@ -75,15 +76,35 @@ def _brain(root, method, *args, **kwargs):
         raise core.GateError("GPT API 制作调用需要你先设置项目预算及 caps.llm 每次调用费用上限；尚未提交请求。")
     job_id = "gpt-" + uuid.uuid4().hex[:12]
     target = (args[0].get("advisory_target") if method == "review" and args and isinstance(args[0], dict) else None)
-    core.reserve(root, job_id, "llm", method, amount, advisory_target=target)
+    submitted = False
+
+    def before_submit():
+        nonlocal submitted
+        if submitted:
+            raise core.GateError("同一次 GPT 工作不能重复提交；请先核实原调用。")
+        core.reserve(root, job_id, "llm", method, amount, advisory_target=target)
+        submitted = True
+
+    client = Brain(config)
+    client.before_submit = before_submit
     try:
-        result = getattr(Brain(config), method)(*args, **kwargs)
+        result = getattr(client, method)(*args, **kwargs)
+        if not submitted:
+            # For example, review() returns an explicitly uncertain local
+            # report when there are no frames. It consumes no model request.
+            return result
         cached = {"review_result": copy.deepcopy(result), "review_result_hash": core._json_digest(result)} if method == "review" else {}
         core.update_job(root, job_id, state="completed", accounting="spent", **cached)
         return result
-    except Exception:
-        # A response/schema error does not imply a free request.
-        core.update_job(root, job_id, state="failed", accounting="spent")
+    except Exception as exc:
+        if submitted:
+            # Local validation made no request. Once submission begins, an
+            # uncertain outcome must block a repeat instead of being spent.
+            uncertain = getattr(exc, "uncertain", False) is True
+            failure = exception_failure(exc, "submission")
+            failure["stage"] = "submission"
+            core.update_job(root, job_id, state="uncertain" if uncertain else "failed",
+                            accounting="unknown" if uncertain else "spent", failure=failure)
         raise
 
 
@@ -663,6 +684,23 @@ def _assets(root):
     return True
 
 
+def _previous_actual_context(previous, shot):
+    """One accepted predecessor, without embedding its complete saved report."""
+    report = previous.get("review", {})
+    report = report if (report.get("sha256") == previous.get("sha256") and
+                       report.get("version", previous.get("version")) == previous.get("version")) else {}
+    summary = {"shot_id": previous["id"], "version": previous.get("version"), "sha256": previous.get("sha256"),
+        "file": previous.get("file"), "observed_end_state": report.get("observed_end_state", "未核实"),
+        "same_scene": previous.get("scene_id") == shot.get("scene_id")}
+    if core.human_approved_shot(previous):
+        summary["human_decision"] = task_shot_summary(previous).get("human_decision") or {
+            "decision": "approved", "version": previous.get("version"), "sha256": previous.get("sha256"),
+            "at": previous.get("approved_at"), "source": "legacy_human_approval"}
+        summary["accepted_deviations"] = copy.deepcopy(report.get("issues", []))
+        summary["acceptance_note"] = "用户已接受这个视频版本；报告中的疑点未必被用户逐项证实。以实际已接受画面承接，不擅自纠正其既有细节。"
+    return summary
+
+
 def _shot_context(root, ep, shot, previous):
     s = _gate(root)
     assets = [a for a in s["assets"] if a["id"] in shot["asset_ids"]]
@@ -686,18 +724,7 @@ def _shot_context(root, ep, shot, previous):
         if previous["status"] != "accepted":
             raise core.GateError("前镜头未被接受，不能成为连续性参考")
         core._check_artifact(root, previous)
-        report = previous.get("review", {})
-        report = report if (report.get("sha256") == previous["sha256"] and
-                           report.get("version", previous.get("version")) == previous.get("version")) else {}
-        continuity = {"shot_id": previous["id"], "sha256": previous["sha256"],
-            "observed_end_state": report.get("observed_end_state", "未核实"),
-            "same_scene": previous["scene_id"] == shot["scene_id"]}
-        if core.human_approved_shot(previous):
-            continuity["human_decision"] = copy.deepcopy(previous.get("human_decision") or {
-                "decision": "approved", "version": previous.get("version"), "sha256": previous["sha256"],
-                "at": previous.get("approved_at"), "source": "legacy_human_approval"})
-            continuity["accepted_deviations"] = copy.deepcopy(report.get("issues", []))
-            continuity["acceptance_note"] = "用户已接受这个视频版本；报告中的疑点未必被用户逐项证实。以实际已接受画面承接，不擅自纠正其既有细节。"
+        continuity = _previous_actual_context(previous, shot)
         if continuity["same_scene"]:
             override = shot.get("continuity_reference", {})
             use_video = (isinstance(override, dict) and override.get("mode") == "original_video"
@@ -730,8 +757,7 @@ def _shot_context(root, ep, shot, previous):
                 raise core.GateError("声音原件在准备参考时发生变化，不能提交未批准的音频")
             reference.update(details)
     context = {"episode": {k: ep.get(k) for k in ("id", "title", "summary", "feedback")},
-        "style": s["plan"].get("style"), "assets": [{k: a.get(k) for k in
-            ("id", "kind", "name", "prompt", "character_id", "version", "sha256", "voice_only")} for a in assets],
+        "style": s["plan"].get("style"), "assets": [task_asset_summary(a) for a in assets],
         "previous_actual": continuity, "feedback": shot.get("feedback", ""),
         "image_references": image_manifest, "audio_references": voice_manifest,
         "audio_strategy": "使用批准的声音参考，镜头不生成背景配乐；配乐在整集时间线统一添加。",
@@ -813,10 +839,17 @@ def _revision_analysis(root, shot):
     state = _gate(root)
     if state["mode"] == "demo":
         return True
-    context = {"assets": state["assets"], "episodes": state["episodes"],
+    context = task_context_summary({"assets": state["assets"], "episodes": state["episodes"],
                "novel": (Path(root) / "source/novel.txt").read_text(encoding="utf-8"),
-               "audio_policy": state.get("audio_policy", {})}
-    result = _brain(root, "plan_revision", shot, context, shot["feedback"])
+               "audio_policy": state.get("audio_policy", {})})
+    ordered = [item for episode in state["episodes"] for item in episode["shots"]]
+    target_index = next((index for index, item in enumerate(ordered) if item["id"] == shot["id"]), None)
+    if target_index is not None and target_index > 0:
+        previous = ordered[target_index - 1]
+        if previous.get("status") == "accepted" and core.human_approved_shot(previous):
+            core._check_artifact(root, previous)
+            context["previous_actual"] = _previous_actual_context(previous, shot)
+    result = _brain(root, "plan_revision", task_shot_summary(shot), context, shot["feedback"])
     if not isinstance(result, dict) or type(result.get("needs_assets")) is not bool:
         raise core.GateError("返修需求分析结果不完整，尚未提交视频。")
     record = {"signature": signature, "blockers": result.get("blockers", []), "summary": result.get("summary", "")}
@@ -902,9 +935,9 @@ def _shot(root, ep_id, shot_id, previous):
     if not recovering:
         _new_work_gate(s)
         shot = _system_voice_reference(root, shot)
+        _progress(root, ep_id, "shot_preparation", shot_id)
         if not _revision_analysis(root, shot):
             return False
-        _progress(root, ep_id, "shot_preparation", shot_id)
     previous_video, reference_duration = None, 0
     if recovering:
         # Already-submitted jobs need only their original task ID, even after
@@ -946,7 +979,7 @@ def _shot(root, ep_id, shot_id, previous):
         if s["mode"] == "demo":
             refined = {"prompt": shot["prompt"] + " " + shot.get("feedback", ""), "dialogue": "", "continuity_notes": "Synthetic demo"}
         else:
-            refined = _brain(root, "refine_shot", shot, context, observations)
+            refined = _brain(root, "refine_shot", task_shot_summary(shot), task_context_summary(context), observations)
         if s["mode"] == "live":
             manifest = {"images": [_rel(root, f) for f in images], "audio": [_rel(root, f) for f in voices],
                         "context": context, "observations": [_rel(root, f) for f in observations]}
@@ -995,7 +1028,7 @@ def _shot(root, ep_id, shot_id, previous):
                           for item in context.get("observation_images", []) if isinstance(item, dict))
     prior_scope = ("含前段实际尾帧参考。" if has_prior_frame else "未提供前段实际画面，不能核实跨段画面衔接。")
     current_shot = core._find(core.load_project(root), "shot", shot_id)
-    review_context = {**context, "shot": shot, "actual": relative, "advisory_target": _shot_review_target(current_shot),
+    review_context = {**task_context_summary(context), "shot": task_shot_summary(current_shot), "actual": relative, "advisory_target": _shot_review_target(current_shot),
         "current_frame_image_indices": list(range(len(observations) + 1, len(review_images) + 1)),
         "current_frame_samples": [{"image_index": len(observations) + index + 1, "time_seconds": instant}
                                   for index, instant in enumerate(evidence.get("sample_times", []))],
@@ -1275,7 +1308,7 @@ def _episode(root, ep_id):
             try:
                 review = ({"verdict": "pass", "issues": [], "observed_end_state": "Synthetic demo",
                            "repair_prompt": ""} if s["mode"] == "demo" else
-                          _brain(root, "review", {"episode": ep_id, "shots": fresh["shots"][:count],
+                          _brain(root, "review", {"episode": ep_id, "shots": [task_shot_summary(item) for item in fresh["shots"][:count]],
                               "advisory_target": _cut_review_target(ep_id, rough_cut),
                               "scope": "分段粗剪抽帧检查；听觉未评估，运动过程未完整评估。",
                               "evidence": _relative_evidence(root, ev)}, [Path(f) for f in ev["frames"]]))

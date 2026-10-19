@@ -409,6 +409,62 @@ def _current_planning_block(state):
     return None
 
 
+def _public_production_stop(state):
+    """Explain the current stopped phase without borrowing an earlier shot hint."""
+    if (state.get("status") != "blocked" or _current_planning_block(state)
+            or any(episode.get("segment_proposal", {}).get("status") == "candidate"
+                   for episode in state.get("episodes", []))):
+        return None
+    from .core import asset_ready, blocking_unknown_jobs, execution_unsettled, human_approved_shot
+    from .failures import sanitize_failure
+    raw = state.get("last_error")
+    message = sanitize_failure({"provider_message": raw}).get("provider_message", "")
+    result = {"message": message or "制作已停止，未记录到可安全展示的具体原因。",
+              "stage": "production", "stage_label": "制作流程", "can_retry": False}
+    if blocking_unknown_jobs(state):
+        result.update(stage="unknown", stage_label="核实原调用结果")
+        return result
+    if state.get("plan", {}).get("status") != "approved":
+        result.update(stage="planning", stage_label="准备分集策划")
+        return result
+    if (any(not asset_ready(asset) for asset in state.get("assets", [])) or
+            any(value.get("status") in {"candidate", "awaiting_assets"}
+                for value in state.get("asset_amendments", []) if isinstance(value, dict))):
+        result.update(stage="assets", stage_label="准备或核对资产")
+        return result
+    for episode_index, episode in enumerate(state.get("episodes", []), 1):
+        if episode.get("status") == "approved":
+            continue
+        result.update(episode_id=episode.get("id"), episode_index=episode_index)
+        current = next(((index, shot) for index, shot in enumerate(episode.get("shots", []), 1)
+                        if not human_approved_shot(shot)), None)
+        if current is None:
+            stage = episode.get("progress_stage", {}).get("stage")
+            labels = {"music": "准备配乐", "subtitles": "准备字幕", "rendering": "合成本集",
+                      "batch_assembly": "拼接累计预览", "batch_review": "审查累计预览"}
+            if stage in labels:
+                result.update(stage=stage, stage_label=labels[stage])
+            return result
+        index, shot = current
+        result.update(shot_id=shot.get("id"), shot_index=index, version=_version(shot.get("version")))
+        if shot.get("status") == "planned" and not shot.get("file") and not shot.get("job_id"):
+            result.update(stage="shot_preparation", stage_label="准备提示词",
+                          can_retry=not state.get("paused") and not any(execution_unsettled(job)
+                              for job in state.get("jobs", {}).values() if isinstance(job, dict)))
+        else:
+            job = _bound_shot_job(state, shot)
+            labels = {"submitting": ("shot_submission", "提交视频请求"), "submitted": ("shot_generation", "查询原视频任务"),
+                      "download_pending": ("shot_download", "下载原视频结果"), "failed": ("shot_generation", "视频生成"),
+                      "completed": ("shot_review", "检查已生成视频")}
+            if job.get("state") in labels:
+                stage, label = labels[job["state"]]
+                result.update(stage=stage, stage_label=label)
+            elif shot.get("file"):
+                result.update(stage="shot_review", stage_label="核对已生成视频")
+        return result
+    return result
+
+
 def _public_shot_history(shot):
     history, seen = [], set()
     for record in shot.get("history", []):
@@ -567,10 +623,12 @@ def public_state(state: dict) -> dict:
                                          if result["pending_advisory_count"] else "")
     result["plan"] = _pick(state.get("plan", {}), ("status", "version", "style", "ratio", "feedback"))
     if state.get("last_error"):
-        message = str(state["last_error"])[:1500]
-        message = re.sub(r"(?i)\b(?:sk|ark)[-_][A-Za-z0-9_-]{12,}", "[已隐藏凭据]", message)
-        message = re.sub(r"(?i)(api[_ -]?key|authorization|secret|token)\s*[:=]\s*[^\s,;]+", r"\1=[已隐藏]", message)
-        result["last_error"] = message
+        from .failures import sanitize_failure
+        result["last_error"] = sanitize_failure({"provider_message": state["last_error"]}).get(
+            "provider_message", "制作已停止，未记录到可安全展示的具体原因。")
+    production_stop = _public_production_stop(state)
+    if production_stop:
+        result["production_stop"] = production_stop
     from .billing import summarize_costs
     budget = state.get("budget", {})
     result["budget"] = _pick(budget, ("limit", "spent", "reserved", "unknown", "currency", "available"))
@@ -622,6 +680,13 @@ def public_state(state: dict) -> dict:
         if episode.get("preview_error"):
             item["preview_error"] = "累计拼接预览暂未生成成功；片段已保留，可以重试本地拼接后再决定。"
         item["progress"] = episode_progress(state, episode, now=stamp)
+        preparation_failed = bool(production_stop and production_stop.get("stage") == "shot_preparation"
+                                  and production_stop.get("episode_id") == episode.get("id"))
+        if preparation_failed:
+            item["progress"].update(stage="preparation_failed",
+                label=f"片段 {production_stop['shot_index']}/{len(episode.get('shots', []))} 准备提示词失败，制作已停止",
+                current_shot=production_stop["shot_id"], current_shot_index=production_stop["shot_index"],
+                elapsed_seconds=None, is_working=False, waiting_for_human=True)
         item["rough_cuts"] = _public_rough_cuts(episode)
         proposal = episode.get("segment_proposal")
         if isinstance(proposal, dict) and proposal.get("status") == "candidate":
@@ -660,6 +725,10 @@ def public_state(state: dict) -> dict:
                 if report:
                     entry["review"] = report
             entry["progress"] = _shot_progress(state, episode, shot, item["progress"], stamp)
+            if preparation_failed and production_stop.get("shot_id") == shot.get("id"):
+                entry["preparation_failure"] = _pick(production_stop, ("message", "stage", "stage_label", "can_retry", "version"))
+                entry["progress"].update(stage="preparation_failed", label="准备提示词失败，尚未提交视频生成",
+                    elapsed_seconds=None, stage_elapsed_seconds=None, is_working=False, waiting_for_human=True)
             if entry.get("planning_block") and entry["progress"]["stage"] not in {"failed", "unknown"}:
                 entry["progress"].update(stage="planning_blocked", label="等待你调整制作要求，尚未提交生成",
                                           waiting_for_human=True, is_working=False)

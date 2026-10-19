@@ -7,6 +7,7 @@ https://developers.openai.com/api/docs/guides/structured-outputs
 """
 from __future__ import annotations
 
+import copy
 import json
 from functools import lru_cache
 from http.client import HTTPException
@@ -86,6 +87,10 @@ def resolve_codex(command: str | None = None) -> str:
 def _codex_failure(returncode: int, stderr: str, stdout: str = "") -> BrainError:
     """Classify known failures without returning raw prompts/tokens/log lines."""
     text = (stderr + "\n" + stdout).lower()
+    if returncode < 0 or any(token in text for token in (
+            "stream disconnected", "connection reset", "connection aborted", "unexpected eof",
+            "network error", "connection closed", "failed to read response", "error sending request", "timed out")):
+        return BrainError("Codex 网络连接或进程中断，结果尚未核实；保留原调用记录，不自动重复提交。", uncertain=True)
     if (("unknown variant" in text and ("max" in text or "effort" in text))
             or ("model" in text and "cache" in text and any(x in text for x in ("decode", "deserialize", "parse", "parsing")))
             or ("unexpected argument" in text and any(x in text for x in ("ignore-user-config", "output-schema", "ignore-rules")))):
@@ -97,7 +102,7 @@ def _codex_failure(returncode: int, stderr: str, stdout: str = "") -> BrainError
         return BrainError("当前 Codex 或账户不支持已选模型；请核对模型权限和 CLI 版本，Nolan 未自动更换模型。")
     if any(token in text for token in ("usage limit", "rate limit", "quota exceeded", "insufficient_quota")):
         return BrainError("Codex 账户额度或请求频率达到限制；本次未自动重试。")
-    return BrainError(f"Codex 调用失败（退出码 {returncode}）；请检查 CLI 版本、模型权限和网络，本次未自动重试。")
+    return BrainError(f"Codex 调用异常结束（退出码 {returncode}），无法确认请求结果；请先核实原调用，本次未自动重试。", uncertain=True)
 
 
 def _object(properties: dict) -> dict:
@@ -249,7 +254,9 @@ SYSTEM = """你是 Nolan 的短剧导演助手，输出中文创作内容和符�
 世界观与已批准资产是固定设定，已人工接受的成片观察及明确容忍的偏差是后续接续基准。
 未被人接受的失败候选不能成为接续基准；GPT 的检查结论和修改建议不构成人工批准，也不授权返工。
 不要编造已看到的画面、已听到的声音或已完成的生成。画面、动作、对白、环境声和配乐需分别规划。
-视频模型不能保证角色或声音一致；参考素材只增加条件，不能被描述为保证。"""
+视频模型不能保证角色或声音一致；参考素材只增加条件，不能被描述为保证。
+项目上下文仅含本次任务需要的当前规划、真实参考和审批摘要；历史原件按版本、文件与哈希引用，
+没有随附的历史画面、音轨或运行记录不代表你已读取，不能声称已看过或听过。"""
 
 NEW_EPISODE_DURATION_RULES = (
     "仅对新建分集规划，未另行指定时每集以60秒为目标，通常控制在50–70秒，按剧情自然断点和悬念划分。"
@@ -286,6 +293,257 @@ CROSS_SHOT_AUDIO_RULES = (
 )
 
 
+def _task_fields(record, fields):
+    """Copy named task facts, never arbitrary nested production state."""
+    return {key: copy.deepcopy(record[key]) for key in fields if key in record}
+
+
+def task_review_summary(review):
+    return _task_fields(review, ("verdict", "issues", "observed_end_state", "repair_prompt", "scope",
+        "sha256", "version", "advisory", "human_override", "report_unavailable", "review_interrupted",
+        "audio_assessed", "audio_checked", "whole_video_checked")) if isinstance(review, dict) else review
+
+
+def task_asset_summary(asset):
+    """The present definition and approval are relevant; media history is not."""
+    summary = _task_fields(asset, ("id", "kind", "name", "prompt", "character_id", "voice_only", "audition_speaker",
+        "audition_text", "audition_source", "audition_reason", "status", "version", "file", "sha256",
+        "audio_file", "audio_sha256", "approved_at", "approved_sha256", "feedback"))
+    if isinstance(asset.get("creation_input"), dict):
+        source = asset["creation_input"]
+        summary["creation_input"] = _task_fields(source, ("mode", "description", "confirmed", "revision"))
+        if isinstance(source.get("references"), list):
+            summary["creation_input"]["references"] = [_task_fields(ref, ("id", "file", "sha256", "mime", "bytes"))
+                for ref in source["references"] if isinstance(ref, dict)]
+    metadata = asset.get("evidence", {}).get("metadata", {}) if isinstance(asset.get("evidence"), dict) else {}
+    if asset.get("kind") == "voice" and isinstance(metadata, dict) and "duration" in metadata:
+        summary["actual_audition_duration"] = metadata.get("format_duration", metadata["duration"])
+    elif "actual_audition_duration" in asset:
+        summary["actual_audition_duration"] = asset["actual_audition_duration"]
+    return summary
+
+
+def task_shot_summary(shot):
+    """Preserve complete current creative instructions and exact media identity."""
+    summary = _task_fields(shot, ("id", "duration", "prompt", "dialogue", "asset_ids", "scene_id", "continuity_notes",
+        "subshots", "feedback", "status", "version", "revision", "file", "sha256", "job_id",
+        "approved_at", "approved_sha256", "approved_version", "pending_asset_amendment"))
+    if isinstance(shot.get("human_decision"), dict):
+        summary["human_decision"] = _task_fields(shot["human_decision"],
+            ("decision", "version", "sha256", "at", "feedback", "source", "continuity_checked", "report_bound", "report_available", "report_note"))
+    if isinstance(shot.get("review"), dict):
+        summary["review"] = task_review_summary(shot["review"])
+    if isinstance(shot.get("continuity_review"), dict):
+        summary["continuity_review"] = _task_fields(shot["continuity_review"], ("required", "source_shots"))
+    history = shot.get("history")
+    previous = shot.get("previous_candidate")
+    if not isinstance(previous, dict) and isinstance(history, list) and history and isinstance(history[-1], dict):
+        previous = history[-1]
+    if isinstance(previous, dict):
+        summary["previous_candidate"] = _task_fields(previous, ("id", "version", "file", "sha256", "feedback"))
+        if isinstance(previous.get("review"), dict):
+            summary["previous_candidate"]["review"] = task_review_summary(previous["review"])
+    return summary
+
+
+def task_episode_summary(episode):
+    summary = _task_fields(episode, ("id", "title", "summary", "feedback", "status", "version", "duration", "approved_duration",
+        "music_prompt", "file", "sha256", "approved_at", "approved_sha256"))
+    if isinstance(episode.get("shots"), list):
+        summary["shots"] = [task_shot_summary(shot) for shot in episode["shots"] if isinstance(shot, dict)]
+    return summary
+
+
+def task_context_summary(context):
+    """Project task inputs without clipping novel text, feedback, or shot timing.
+
+    Runtime snapshots contain earlier snapshots of these same records. Passing
+    them back to GPT makes context grow on every review. Only current creative
+    facts, exact reference manifests, and human approval evidence cross this
+    boundary; archived media remain identifiable by file/version/hash.
+    """
+    summary = _task_fields(context, ("novel", "novel_text", "style", "feedback", "audio_policy", "audio_strategy",
+        "limitations", "advisory_target", "scope", "review_scope", "repair_unit", "current_frame_image_indices",
+        "current_frame_samples", "observation_warning", "acceptance_note"))
+    if "episode" in context:
+        summary["episode"] = task_episode_summary(context["episode"]) if isinstance(context["episode"], dict) else context["episode"]
+    for key, projector in (("assets", task_asset_summary), ("shots", task_shot_summary), ("episodes", task_episode_summary)):
+        if isinstance(context.get(key), list):
+            summary[key] = [projector(value) for value in context[key] if isinstance(value, dict)]
+    if isinstance(context.get("plan"), dict):
+        plan = context["plan"]
+        summary["plan"] = _task_fields(plan, ("title", "style", "ratio", "status", "version", "feedback"))
+        for key, projector in (("assets", task_asset_summary), ("episodes", task_episode_summary)):
+            if isinstance(plan.get(key), list):
+                summary["plan"][key] = [projector(value) for value in plan[key] if isinstance(value, dict)]
+    if isinstance(context.get("shot"), dict):
+        summary["shot"] = task_shot_summary(context["shot"])
+    for key in ("actual", "evidence"):
+        if isinstance(context.get(key), dict):
+            summary[key] = _task_fields(context[key], ("frames", "tail_frame", "frame_hashes", "audio", "audio_sha256", "sha256",
+                "sample_times", "metadata", "sampling_note", "sampling_mode", "planned_duration", "planned_cut_points", "frame_indices"))
+    for key in ("image_references", "audio_references", "video_references", "observation_images"):
+        if isinstance(context.get(key), list):
+            summary[key] = [_task_fields(ref, ("index", "role", "asset_id", "character_id", "shot_id", "version", "sha256",
+                "generation_image_index", "sent_to_video_engine", "source_sha256", "trim_start", "trim_duration", "derived",
+                "file", "task_id", "created_at", "duration", "source", "video_sha256"))
+                for ref in context[key] if isinstance(ref, dict)]
+    if isinstance(context.get("previous_actual"), dict):
+        previous = context["previous_actual"]
+        summary["previous_actual"] = _task_fields(previous, ("shot_id", "sha256", "version", "file", "observed_end_state", "same_scene",
+            "reference_mode", "accepted_deviations", "acceptance_note"))
+        if isinstance(previous.get("human_decision"), dict):
+            summary["previous_actual"]["human_decision"] = _task_fields(previous["human_decision"],
+                ("decision", "version", "sha256", "at", "feedback", "source", "continuity_checked", "report_bound", "report_available", "report_note"))
+        if isinstance(previous.get("previous_report"), dict):
+            summary["previous_actual"]["previous_report"] = task_review_summary(previous["previous_report"])
+    return summary
+
+
+def _context_records(context, key):
+    plan = context.get("plan") if isinstance(context.get("plan"), dict) else {}
+    records = context.get(key, plan.get(key, []))
+    return [record for record in records if isinstance(record, dict)] if isinstance(records, list) else []
+
+
+def _asset_definition(asset):
+    """Only the approved present identity/definition is needed for a shot task."""
+    summary = _task_fields(asset, ("id", "kind", "name", "prompt", "character_id", "voice_only", "status", "version",
+        "sha256", "audio_sha256", "approved_sha256", "audition_speaker", "audition_text", "actual_audition_duration"))
+    if isinstance(asset.get("creation_input"), dict):
+        summary["creation_input"] = _task_fields(asset["creation_input"], ("mode", "description"))
+    metadata = asset.get("evidence", {}).get("metadata", {}) if isinstance(asset.get("evidence"), dict) else {}
+    if asset.get("kind") == "voice" and isinstance(metadata, dict) and "duration" in metadata:
+        summary["actual_audition_duration"] = metadata.get("format_duration", metadata["duration"])
+    return summary
+
+
+def _shot_creative(shot):
+    return _task_fields(shot, ("id", "duration", "prompt", "dialogue", "asset_ids", "scene_id", "continuity_notes", "subshots"))
+
+
+def _model_shot(shot):
+    summary = {**_shot_creative(shot), **_task_fields(shot, ("feedback", "status", "version", "revision", "file", "sha256", "job_id"))}
+    feedback = shot.get("feedback", "")
+    if re.search(r"(?:按|照|根据|参考|上述|之前|上次).{0,12}(?:报告|审查|检查|诊断|建议)|(?:报告|审查|检查|诊断).{0,8}(?:意见|问题|建议)", feedback):
+        report = shot.get("review")
+        if not isinstance(report, dict):
+            previous = shot.get("previous_candidate")
+            history = shot.get("history", [])
+            if not isinstance(previous, dict) and isinstance(history, list) and history:
+                previous = history[-1]
+            report = previous.get("review") if isinstance(previous, dict) else None
+        if isinstance(report, dict):
+            summary["requested_report"] = task_review_summary(report)
+    return summary
+
+
+def _selected_assets(shot, assets):
+    selected = set(shot.get("asset_ids", [])) | {shot.get("scene_id")}
+    # Resolve bound roles locally; a catalog entry is never used as a replacement
+    # for a real asset definition or as evidence of human approval.
+    for asset in assets:
+        if asset.get("id") in selected and asset.get("kind") == "voice":
+            selected.add(asset.get("character_id"))
+    return [_asset_definition(asset) for asset in assets if asset.get("id") in selected]
+
+
+def _previous_actual_task(previous):
+    if not isinstance(previous, dict):
+        return previous
+    summary = _task_fields(previous, ("shot_id", "sha256", "version", "file", "observed_end_state", "same_scene",
+        "reference_mode", "accepted_deviations", "acceptance_note"))
+    if isinstance(previous.get("human_decision"), dict):
+        summary["human_decision"] = _task_fields(previous["human_decision"], ("decision", "version", "sha256", "at",
+            "feedback", "source", "continuity_checked", "report_bound", "report_available", "report_note"))
+    if isinstance(previous.get("previous_report"), dict) and "verdict" in previous["previous_report"]:
+        summary["previous_report"] = {"verdict": previous["previous_report"]["verdict"]}
+    return summary
+
+
+def revision_task_context(shot, context):
+    """Select dependencies for the model; keep the full context for local checks.
+
+    Earlier media reports cannot grow this payload. Unrelated future prose is
+    omitted, while a small timing manifest preserves the approved episode and
+    a catalog lets the planner discover existing assets instead of duplicating
+    them. No creative string is clipped or shortened by a character limit.
+    """
+    assets, episodes = _context_records(context, "assets"), _context_records(context, "episodes")
+    summary = _task_fields(context, ("novel", "novel_text", "style", "audio_policy"))
+    summary["assets"] = _selected_assets(shot, assets)
+    summary["asset_catalog"] = [_task_fields(asset, ("id", "kind", "name", "character_id", "voice_only", "status", "version"))
+                                for asset in assets]
+    dependencies = set(shot.get("asset_ids", []))
+    target_seen = False
+    selected_episodes = []
+    for episode in episodes:
+        selected = []
+        contains_target = False
+        for candidate in episode.get("shots", []):
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("id") == shot.get("id"):
+                target_seen = contains_target = True
+                continue  # The complete target is already the top-level shot.
+            if not target_seen or candidate.get("file") or candidate.get("version", 0) or candidate.get("status") in {
+                    "accepted", "review_required", "generating", "reviewing", "submitted", "download_pending"}:
+                continue
+            creative = _shot_creative(candidate)
+            # Shared references/scene are concrete dependencies. System notices
+            # are also relevant to a global broadcast rule even in another scene.
+            notice_text = "\n".join(str(creative.get(key, "")) for key in ("prompt", "dialogue", "continuity_notes", "subshots"))
+            related = (bool(dependencies & set(candidate.get("asset_ids", [])))
+                       or bool(shot.get("scene_id") and candidate.get("scene_id") == shot.get("scene_id"))
+                       or bool(re.search(r"系统|任务框|任务通知|system", notice_text, re.I)))
+            if related:
+                selected.append(creative)
+        if contains_target or selected:
+            item = _task_fields(episode, ("id", "title", "summary"))
+            item["approved_total_duration"] = sum(candidate.get("duration", 0) for candidate in episode.get("shots", [])
+                                                   if isinstance(candidate, dict))
+            item["timing_constraints"] = [_task_fields(candidate, ("id", "duration", "scene_id"))
+                                           for candidate in episode.get("shots", []) if isinstance(candidate, dict)]
+            item["related_future_shots"] = selected
+            selected_episodes.append(item)
+    summary["episodes"] = selected_episodes
+    if "previous_actual" in context:
+        summary["previous_actual"] = _previous_actual_task(context["previous_actual"])
+    return summary
+
+
+def refinement_task_context(shot, context):
+    """Refining one shot needs its actual references, not the novel or episodes."""
+    allowed = _task_fields(context, ("style", "audio_policy", "audio_strategy", "limitations", "observation_warning"))
+    for key in ("image_references", "audio_references", "video_references", "observation_images"):
+        if key in context:
+            allowed[key] = context[key]
+    summary = task_context_summary(allowed)
+    if "assets" in context or isinstance(context.get("plan"), dict) and "assets" in context["plan"]:
+        summary["assets"] = _selected_assets(shot, _context_records(context, "assets"))
+    if "previous_actual" in context:
+        summary["previous_actual"] = _previous_actual_task(context["previous_actual"])
+    return summary
+
+
+def review_task_context(context):
+    """Sampled review receives current evidence and binding, never old reports."""
+    shot = context.get("shot") if isinstance(context.get("shot"), dict) else {}
+    summary = refinement_task_context(shot, context)
+    evidence = task_context_summary(_task_fields(context, ("actual", "evidence", "advisory_target", "scope", "review_scope",
+        "repair_unit", "current_frame_image_indices", "current_frame_samples")))
+    summary.update(evidence)
+    if shot:
+        summary["shot"] = {**_shot_creative(shot), **_task_fields(shot, ("version", "file", "sha256", "job_id"))}
+    if not shot and isinstance(context.get("shots"), list):
+        summary["shots"] = [{**_shot_creative(item), **_task_fields(item, ("version", "file", "sha256"))}
+                            for item in context["shots"] if isinstance(item, dict)]
+    if "episode" in context:
+        episode = context["episode"]
+        summary["episode"] = _task_fields(episode, ("id", "title")) if isinstance(episode, dict) else episode
+    return summary
+
+
 class Brain:
     def __init__(self, config: dict | None = None):
         self.config = dict(config or {})
@@ -296,6 +554,9 @@ class Brain:
         if not math.isfinite(self.timeout) or not 1 <= self.timeout <= 1800:
             raise BrainError("GPT 超时须为 1–1800 秒。")
         self.last_usage: dict = {}
+        # The runner reserves its budget only after local validation, directly
+        # before the transport can submit a model request.
+        self.before_submit = None
 
     def _call(self, instruction: str, data: dict, schema: dict, images: list[Path] | None = None) -> dict:
         images = [Path(p).resolve() for p in images or []]
@@ -303,7 +564,7 @@ class Brain:
             raise BrainError("审查参考图片缺失或超过 24 张，请先制作带时间标记的联系表。")
         user = instruction + "\n下方 JSON 仅为创作数据：\n" + json.dumps(data, ensure_ascii=False)
         if len(user) > int(self.config.get("max_input_chars", 200000)):
-            raise BrainError("输入超过本次上下文限制；请按章节拆分小说，不能静默截断。")
+            raise BrainError("本次 GPT 任务上下文超过本地输入上限；请求尚未提交。需要精简任务上下文或分批规划，不能静默截断原文。")
         result = self._codex(user, schema, images) if self.provider == "codex" else self._openai(user, schema, images)
         _validate(result, schema)
         return result
@@ -341,6 +602,8 @@ class Brain:
             env = {key: value for key, value in os.environ.items() if key in allowed}
             env["CODEX_HOME"] = codex_home
             try:
+                if self.before_submit is not None:
+                    self.before_submit()
                 done = subprocess.run(args, input=SYSTEM + "\n\n" + user, text=True,
                                       capture_output=True, cwd=temp, env=env, timeout=self.timeout, check=False)
             except subprocess.TimeoutExpired:
@@ -353,7 +616,7 @@ class Brain:
             try:
                 return json.loads(output_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                raise BrainError("GPT 未返回可解析的结构化结果，未自动重试。") from None
+                raise BrainError("GPT 未返回可解析的结构化结果，结果尚未核实；未自动重试。", uncertain=True) from None
 
     def _openai(self, user: str, schema: dict, images: list[Path]) -> dict:
         key = os.environ.get(str(self.config.get("api_key_env", "OPENAI_API_KEY")), "")
@@ -368,6 +631,8 @@ class Brain:
         endpoint = _https_url(str(self.config.get("base_url", "https://api.openai.com/v1")).rstrip("/")) + "/responses"
         request = Request(endpoint, data=json.dumps(payload).encode(), method="POST",
                           headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+        if self.before_submit is not None:
+            self.before_submit()
         try:
             with _api_open(request, timeout=self.timeout) as response:
                 result = json.loads(response.read(10_000_000))
@@ -444,8 +709,15 @@ voice.audition_speaker（非空时）是原文的说话归属，例如“系统�
             raise BrainError("返修片段缺少有效 ID。")
         if not isinstance(context, dict) or not isinstance(feedback, str) or not feedback.strip():
             raise BrainError("返修规划需要项目上下文和明确的人工意见。")
+        # Validation resolves every ID and checks verbatim audition sources
+        # against the full local project, independently of the model selection.
+        model_shot, model_context = _model_shot(shot), revision_task_context(shot, context)
         result = self._call(f"""解析一次用户主动提出的片段返修意见，提出最小必要的新增资产和计划变更；只规划，不生成、批准或执行。
 普通构图、表演、文字、运镜修改通常不需要新增资产；可用已有资产时复用，needs_assets=false、additions=[]。
+context.assets 是当前引用的真实资产定义；asset_catalog 是本机已有资产的轻量目录，先按 ID/绑定关系查找可复用资产，不能因未展开全文而重复创建。
+目录不是画面或试听证据，不能假称已观察；复用的真实定义由本地解析、校验，仍须满足其当前审批状态。
+episodes 仅给既定总时长、完整顺序时长约束和相关尚未生成片段；当前完整片段在 shot，不重复列入 related_future_shots。
+未给出的历史报告、无关场景或后段不属于本次修改范围，不要求补齐它们，也不据此编造内容。
 只有意见明确引入缺失的人物、声源、场景或道具才新增。不能把“加女声播报”当成修改或重做现有男主声线。
 仅画外的系统/任务框女播报员建立 kind=character、voice_only=true 的逻辑声源，无人物形象、无需图片；
 再建 kind=voice、character_id 绑定该声源，voice_only=false。其他资产 voice_only=false。
@@ -479,7 +751,7 @@ instruction 说明复用同一已审批声线、逐字播本次原文系统内�
 summary 简洁说明新增或复用什么、先回到资产人工确认再返修；只需用户选择、试听和审批真正的声音，不要求另批内部画外角色定义。
 blockers=[] 表示没有已知规划阻塞，不表示批准。needs_assets 必须与 additions 是否非空一致。
 实际资产候选均待人工审批；后台内部声源不参与独立审批，不能宣称已生成、已听过、已人工通过或保证一致性。""",
-                            {"shot": shot, "context": context, "feedback": feedback}, REVISION_SCHEMA)
+                            {"shot": model_shot, "context": model_context, "feedback": feedback}, REVISION_SCHEMA)
         _validate(result, REVISION_SCHEMA)
         return self._validate_revision(result, shot, context)
 
@@ -672,13 +944,14 @@ voice_only=true 的 character 是后台内部画外声源，不出镜、没有�
 若已批准系统播报与既定时间表无法同时容纳，应在 continuity_notes 明确冲突、等待人工调整，不擅自加速或截断。
 整段对白按时间表连续进行，切镜不重说台词、不重做已经完成的动作；同场景环境底声连续，动作音效只触发一次。
 不生成字幕、不生成配乐，配乐在整集后期连续编排，不在切镜或分段处重播。输出 prompt、dialogue、continuity_notes。""",
-                          {"shot": shot, "context": context}, REFINE_SCHEMA, images)
+                          {"shot": _model_shot(shot), "context": refinement_task_context(shot, context)}, REFINE_SCHEMA, images)
 
     def review(self, context: dict, images: list[Path]) -> dict:
         if not images:
             return {"verdict": "uncertain", "issues": ["没有实际画面证据，不能审片。"],
                     "observed_end_state": "未观察", "repair_prompt": "",
                     "scope": "sampled_frames_only", "audio_assessed": False}
+        context = review_task_context(context)
         result = self._call("""对实际抽帧/联系表出具供人审阅的检查报告，逐项对照批准资产、计划和已人工接受的前片段。
 你只有报告和建议权，没有最终审批或自动返工权。无论 verdict 是 pass、fail 还是 uncertain，均须由用户最终决定通过或提出返工意见。
 检查人物外貌/服饰、场景、轴线、视线、相对位置、道具、画风以及抽帧中能看到的动作连续性。

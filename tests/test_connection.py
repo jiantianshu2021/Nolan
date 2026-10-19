@@ -116,8 +116,17 @@ class ConnectionTests(unittest.TestCase):
         core.configure(project, {"caps": {"llm": 1}}, limit=3)
         config = {"provider": "codex", "billing": "api", "codex_home": "/isolated/api", "model": "chosen"}
         def check_reserved(_):
+            before = core.load_project(project)
+            self.assertFalse(before["jobs"])
+            self.assertEqual(before["llm_calls"], 0)
+            # Fake transport explicitly reaches the real pre-submit callback;
+            # construction/local validation must not reserve budget by itself.
+            brain.return_value.before_submit()
             state = core.load_project(project)
             self.assertEqual(state["budget"]["reserved"], 1)
+            self.assertEqual(state["llm_calls"], 1)
+            job = list(state["jobs"].values())[-1]
+            self.assertEqual((job["state"], job["accounting"]), ("submitting", "reserved"))
             return {"ok": True}
         with patch("norlan.connection.production_brain_config", return_value=config), patch("norlan.brain.Brain") as brain:
             brain.return_value.plan.side_effect = check_reserved

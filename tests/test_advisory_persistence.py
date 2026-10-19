@@ -35,11 +35,17 @@ class AdvisoryPersistenceTests(unittest.TestCase):
                   "repair_prompt": "仅供参考", "scope": "sampled_frames_only", "audio_assessed": False}
 
         def answer(*args):
+            before = core.load_project(self.root)
+            self.assertFalse(any(job["kind"] == "llm" for job in before["jobs"].values()))
+            self.assertEqual(before["llm_calls"], 0)
+            # Simulate the transport boundary after local request preparation.
+            self.brain.return_value.before_submit()
             job = list(core.load_project(self.root)["jobs"].values())[-1]
             self.assertEqual(job["state"], "submitting")
             self.assertEqual(job["purpose"], "advisory_review")
             self.assertEqual(job["advisory_target"], self.target)
             self.assertNotIn("review_result", job)
+            self.assertEqual(core.load_project(self.root)["llm_calls"], 1)
             return report
 
         self.brain.return_value.review.side_effect = answer
@@ -55,7 +61,11 @@ class AdvisoryPersistenceTests(unittest.TestCase):
         self.ark.assert_not_called()
 
     def test_process_interruption_keeps_unknown_budget_and_does_not_repeat_review(self):
-        self.brain.return_value.review.side_effect = KeyboardInterrupt("synthetic process interruption")
+        def interrupted_after_submit(*args):
+            self.brain.return_value.before_submit()
+            raise KeyboardInterrupt("synthetic process interruption after request began")
+
+        self.brain.return_value.review.side_effect = interrupted_after_submit
         with self.assertRaises(KeyboardInterrupt):
             pipeline._brain(self.root, "review", {"advisory_target": self.target}, [])
         original = list(core.load_project(self.root)["jobs"].values())[-1]
