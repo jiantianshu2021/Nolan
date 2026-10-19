@@ -777,14 +777,22 @@ def approve(root, kind, item_id, version):
     return load_project(root)
 
 
-def _invalidate_shot(shot, reason):
+def _invalidate_shot(shot, reason, *, increment_revision=True):
+    from . import storyboard_revision
     if shot.get("file"):
         shot.setdefault("history", []).append({k: copy.deepcopy(shot[k]) for k in
             ("file", "sha256", "evidence", "review", "version", "human_decision", "approved_at",
-             "approved_sha256", "approved_version", "continuity_review") if k in shot})
+             "approved_sha256", "approved_version", "continuity_review", "job_id", "prompt", "dialogue",
+             "duration", "scene_id", "subshots", "continuity_notes", "asset_ids", "refined_prompt",
+             "reference_manifest", "prompt_candidate", "prompt_approval", "storyboard_revision",
+             "storyboard_revision_binding", "source_shot_ids", "source_shot_instructions") if k in shot})
     if shot.get("prompt_candidate"):
         shot.setdefault("prompt_history", []).append(copy.deepcopy(shot["prompt_candidate"]))
-    shot.update(status="planned", revision=shot.get("revision", 0) + 1, feedback=reason)
+    if shot.get("revision_analysis"):
+        shot.setdefault("revision_analysis_history", []).append({**copy.deepcopy(shot["revision_analysis"]),
+            "superseded_at": now(), "resolution": "human_revision"})
+    storyboard_revision.discard(shot, reason=reason, stamp=now())
+    shot.update(status="planned", revision=shot.get("revision", 0) + int(increment_revision), feedback=reason)
     for key in ("file", "sha256", "evidence", "review", "job_id", "refined_prompt", "approved_at", "approved_sha256", "approved_version", "generation_error",
                 "prompt_candidate", "prompt_approval", "revision_analysis"):
         shot.pop(key, None)
@@ -838,6 +846,27 @@ def _check_shot_rejection(root, state, shot):
             failed.get("item_id") != shot["id"] or failed.get("kind") != "video" or
             type(shot.get("version")) is not int or shot["version"] < 1):
         raise GateError("生成失败记录尚未核实，不能再次提交；请先核实原调用结果")
+
+
+def can_edit_shot_revision(state, shot):
+    """A queued human rework may receive new feedback without a media POST."""
+    if (shot.get("status") != "planned" or type(shot.get("version")) is not int or shot["version"] < 1
+            or shot.get("file") or shot.get("job_id") or shot.get("pending_asset_amendment")
+            or any(execution_unsettled(job) for job in state.get("jobs", {}).values())
+            or any(amendment.get("status") in {"candidate", "awaiting_assets"}
+                   and (amendment.get("target_shot_id") == shot.get("id")
+                        or any(update.get("id") == shot.get("id") for update in amendment.get("shot_updates", [])))
+                   for amendment in state.get("asset_amendments", []))):
+        return False
+    if any(isinstance(old, dict) and old.get("file") and old.get("sha256")
+           and type(old.get("version")) is int and 1 <= old["version"] <= shot["version"]
+           for old in shot.get("history", [])):
+        return True
+    return any(state.get("jobs", {}).get(attempt.get("job_id"), {}).get("kind") == "video"
+               and state["jobs"][attempt["job_id"]].get("item_id") == shot.get("id")
+               and state["jobs"][attempt["job_id"]].get("state") == "failed"
+               and state["jobs"][attempt["job_id"]].get("accounting") in {"spent", "released"}
+               for attempt in shot.get("attempts", []) if isinstance(attempt, dict))
 
 
 def _invalidate_episode(ep, reason, shot_ids=None):
@@ -917,7 +946,9 @@ def reject(root, kind, item_id, version, feedback, shot_ids=None):
                 _check_shot_rejection(root, s, shot)
             for shot in targets:
                 if shot.get("status") == "planned" and not shot.get("file") and not shot.get("job_id"):
-                    shot["feedback"] = feedback
+                    # Supplemental episode feedback edits the already queued
+                    # attempt; it does not create another generation authority.
+                    _invalidate_shot(shot, feedback, increment_revision=False)
                 else:
                     _request_shot_revision(s, shot, feedback)
             _invalidate_render(item, feedback)
@@ -925,9 +956,11 @@ def reject(root, kind, item_id, version, feedback, shot_ids=None):
         elif kind == "shot":
             if item.get("pending_asset_amendment"):
                 raise GateError("本片段已有资产增补方案，请先完成或拒绝该方案")
-            if item["status"] not in {"review_required", "accepted", "generation_failed"}:
+            queued = can_edit_shot_revision(s, item)
+            if item["status"] not in {"review_required", "accepted", "generation_failed"} and not queued:
                 raise GateError("镜头不在人工复核阶段")
-            _check_shot_rejection(root, s, item)
+            if not queued:
+                _check_shot_rejection(root, s, item)
             _request_shot_revision(s, item, feedback)
         event(s, "human_rejected", kind=kind, id=item_id, version=version,
               feedback=feedback, shot_ids=shot_ids)
@@ -1256,7 +1289,8 @@ def _validate_amendment(state, root, shot_id, version, feedback, additions, shot
     return target
 
 
-def propose_asset_amendment(root, shot_id, version, feedback, additions, shot_updates, audio_policy=None, *, already_locked=False):
+def propose_asset_amendment(root, shot_id, version, feedback, additions, shot_updates, audio_policy=None, *, already_locked=False,
+                            revision_analysis=None):
     """Save a local candidate; never replace a plan, approve an asset or call a provider."""
     with (nullcontext() if already_locked else run_lock(root)), transaction(root) as state:
         _amendment_idle(state)
@@ -1273,6 +1307,17 @@ def propose_asset_amendment(root, shot_id, version, feedback, additions, shot_up
             amendment["audio_policy"] = copy.deepcopy(audio_policy)
         state.setdefault("asset_amendments", []).append(amendment)
         target["pending_asset_amendment"] = amendment["id"]
+        if revision_analysis is not None:
+            from .storyboard_revision import feedback_signature
+            if (not isinstance(revision_analysis, dict)
+                    or revision_analysis.get("signature") != feedback_signature(target)):
+                raise GateError("资产增补与本次返修分析不一致，请重新提交意见。")
+            old = target.get("revision_analysis")
+            if isinstance(old, dict) and old and old.get("signature") != revision_analysis["signature"]:
+                target.setdefault("revision_analysis_history", []).append({**copy.deepcopy(old), "superseded_at": now()})
+            # Keep the camera plan in the same atomic write as its asset gate;
+            # a restart must never approve assets while losing this redesign.
+            target["revision_analysis"] = {**copy.deepcopy(revision_analysis), "amendment_id": amendment["id"]}
         state["status"] = "awaiting_asset_amendment"
         state["last_error"] = None
         event(state, "asset_amendment_proposed", id=amendment["id"], shot_id=shot_id, version=version,
@@ -1328,6 +1373,14 @@ def activate_asset_amendment(root, amendment_id):
             raise GateError("请先由用户确认资产增补方案")
         _amendment_idle(state)
         target = _check_amendment_baseline(state, amendment)
+        from . import storyboard_revision
+        cached_analysis = copy.deepcopy(target.get("revision_analysis", {}))
+        cached_redesign = cached_analysis.get("storyboard_revision")
+        if cached_redesign is not None:
+            if (cached_analysis.get("signature") != storyboard_revision.feedback_signature(target)
+                    or cached_analysis.get("storyboard_baseline") != storyboard_revision.baseline(target)):
+                raise GateError("资产增补绑定的局部分镜方案已过期，请重新提交返修意见。")
+            storyboard_revision.validate_plan(target, cached_redesign)
         for definition in amendment["additions"]:
             asset = _find(state, "asset", definition["id"])
             if not asset_ready(asset):
@@ -1342,6 +1395,13 @@ def activate_asset_amendment(root, amendment_id):
             if not asset_ready(asset):
                 return False
             _check_artifact(root, asset)
+        # Retire the old media with its actual creative definition before any
+        # approved amendment edits the canonical prompt/voice references.
+        if target.get("status") == "planned" and not target.get("file") and not target.get("job_id"):
+            target["feedback"] = amendment["feedback"]
+            target.pop("refined_prompt", None)
+        else:
+            _request_shot_revision(state, target, amendment["feedback"])
         for update in amendment["shot_updates"]:
             shot = _find(state, "shot", update["id"])
             shot["asset_ids"] = list(dict.fromkeys(shot["asset_ids"] + update["add_asset_ids"]))
@@ -1351,11 +1411,6 @@ def activate_asset_amendment(root, amendment_id):
             # A prompt prepared against the former asset set cannot be reused.
             shot.pop("prompt_candidate", None)
             shot.pop("prompt_approval", None)
-        if target.get("status") == "planned" and not target.get("file") and not target.get("job_id"):
-            target["feedback"] = amendment["feedback"]
-            target.pop("refined_prompt", None)
-        else:
-            _request_shot_revision(state, target, amendment["feedback"])
         target.pop("pending_asset_amendment", None)
         for update in amendment["shot_updates"]:
             shot = _find(state, "shot", update["id"])
@@ -1372,6 +1427,9 @@ def activate_asset_amendment(root, amendment_id):
                                                         ensure_ascii=False).encode()).hexdigest(),
                 "amendment_id": amendment_id, "blockers": [],
                 "summary": "资产与片段更新方案已获人工确认，沿用已批准素材准备提示词，仍须确认后才生成。"}
+            if shot is target and cached_redesign is not None:
+                shot["revision_analysis"].update(storyboard_revision=cached_redesign,
+                    storyboard_baseline=storyboard_revision.baseline(shot))
         if amendment.get("audio_policy"):
             state.setdefault("audio_policy", {}).update(copy.deepcopy(amendment["audio_policy"]))
         amendment.update(status="applied", applied_at=now())
@@ -1442,6 +1500,8 @@ def submit_planning_feedback(root, shot_id, feedback, expected_version, analysis
                 "invalidation_reason": "用户补充规划意见，须重新准备并确认提示词"})
         for key in ("revision_analysis", "prompt_approval", "refined_prompt"):
             shot.pop(key, None)
+        from .storyboard_revision import discard
+        discard(shot, reason=feedback, stamp=stamp)
         shot.update(status="planned", revision=revision + 1, feedback=combined)
         state.update(status="paused" if state["paused"] else "ready", last_error=None)
         event(state, "human_planning_feedback", id=shot_id, version=expected_version, revision=shot["revision"],

@@ -10,7 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import broadcast, core, media, official, prompt_gate
+from . import broadcast, core, media, official, prompt_gate, storyboard_revision
 from .brain import task_asset_summary, task_context_summary, task_shot_summary
 from .billing import price_snapshot
 from .failures import exception_failure, sanitize_failure
@@ -848,7 +848,7 @@ def _save_revision_analysis(root, shot_id, record):
 
 
 def _revision_analysis(root, shot):
-    """Resolve a human request for new assets before preparing a paid rework."""
+    """Route one feedback to asset approval, local camera redesign, or refinement."""
     if not shot.get("feedback", "").strip():
         return True
     # Parse the meaning once per human revision. A keyword rule would miss
@@ -861,9 +861,13 @@ def _revision_analysis(root, shot):
                               if a.get("id") == old["amendment_id"]), {})
             if amendment.get("status") == "rejected":
                 raise core.GateError("新增资产方案已取消。请修改返修意见后重新提出方案；尚未生成返修视频。")
-            return amendment.get("status") in {"applied", "activated"}
+            ready = amendment.get("status") in {"applied", "activated"}
+            if ready:
+                storyboard_revision.apply(root, shot["id"], old)
+            return ready
         if old.get("blockers"):
             raise core.GateError("；".join(old["blockers"]))
+        storyboard_revision.apply(root, shot["id"], old)
         return True
     state = _gate(root)
     if state["mode"] == "demo":
@@ -882,6 +886,14 @@ def _revision_analysis(root, shot):
     if not isinstance(result, dict) or type(result.get("needs_assets")) is not bool:
         raise core.GateError("返修需求分析结果不完整，尚未提交视频。")
     record = {"signature": signature, "blockers": result.get("blockers", []), "summary": result.get("summary", "")}
+    try:
+        redesign = storyboard_revision.validate_plan(shot, result.get("storyboard_revision"))
+    except ValueError as exc:
+        record["blockers"] = [str(exc)]
+        _save_revision_analysis(root, shot["id"], record)
+        raise core.GateError(str(exc)) from None
+    if redesign is not None:
+        record.update(storyboard_revision=redesign, storyboard_baseline=storyboard_revision.baseline(shot))
     if record["blockers"]:
         _save_revision_analysis(root, shot["id"], record)
         raise core.GateError("；".join(record["blockers"]))
@@ -901,13 +913,14 @@ def _revision_analysis(root, shot):
                              for update in result.get("shot_updates", []))
     if result["needs_assets"] or references_changed or policy_changed:
         changed = core.propose_asset_amendment(root, shot["id"], shot.get("version", 0), shot["feedback"],
-                    result["additions"], result["shot_updates"], audio_policy=policy or None, already_locked=True)
+                    result["additions"], result["shot_updates"], audio_policy=policy or None, already_locked=True,
+                    revision_analysis=record)
         amendment = changed["asset_amendments"][-1]
         record["amendment_id"] = amendment["id"]
-        _save_revision_analysis(root, shot["id"], record)
         _set(root, status="awaiting_asset_amendment")
         return False
     _save_revision_analysis(root, shot["id"], record)
+    storyboard_revision.apply(root, shot["id"], record)
     return True
 
 
@@ -977,6 +990,11 @@ def _shot(root, ep_id, shot_id, previous):
         _progress(root, ep_id, "shot_preparation", shot_id)
         if not _revision_analysis(root, shot):
             return False
+        # Revision routing may have staged a new camera schedule or applied an
+        # approved asset amendment. Never refine from the stale pre-analysis copy.
+        s = _gate(root)
+        ep = core._find(s, "episode", ep_id)
+        shot = core._find(s, "shot", shot_id)
     previous_video, reference_duration = None, 0
     if recovering:
         # Already-submitted jobs need only their original task ID, even after

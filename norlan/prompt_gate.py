@@ -224,6 +224,13 @@ def specification(state, shot, prompt, manifest, refined=None):
             "audio_policy": copy.deepcopy(state.get("audio_policy", {})),
             "provider": {"mode": state["mode"], "ratio": state["plan"].get("ratio", "16:9"),
                          **{key: ark.get(key) for key in ("provider", "base_url", "video_model", "resolution", "generate_audio")}}}
+    from .storyboard_revision import public
+    try:
+        redesign = public(shot)
+    except ValueError as exc:
+        raise core.GateError(str(exc)) from None
+    if redesign is not None:
+        specification["storyboard_revision"] = redesign
     proposal = validate_timing_proposal(shot, refined or {})
     if proposal is not None:
         specification["timing_proposal"] = proposal
@@ -237,6 +244,13 @@ def specification(state, shot, prompt, manifest, refined=None):
 
 
 def _validate_candidate_timing(shot, candidate):
+    from .storyboard_revision import public
+    try:
+        redesign = public(shot)
+    except ValueError as exc:
+        raise core.GateError(str(exc)) from None
+    if candidate.get("storyboard_revision") != redesign:
+        raise core.GateError("局部分镜说明已变化，请重新准备并确认完整提示词。")
     refined = candidate.get("refined", {})
     broadcast = validate_broadcast_proposal(shot, refined)
     if broadcast != candidate.get("broadcast_proposal"):
@@ -312,6 +326,13 @@ def prepare(root, shot_id, refined, prompt, manifest):
                      "continuity_notes": refined.get("continuity_notes", ""),
                      "refined": copy.deepcopy(refined), "reference_manifest": copy.deepcopy(manifest),
                      "created_at": core.now()}
+        from .storyboard_revision import public
+        try:
+            redesign = public(shot)
+        except ValueError as exc:
+            raise core.GateError(str(exc)) from None
+        if redesign is not None:
+            candidate["storyboard_revision"] = redesign
         proposal = validate_timing_proposal(shot, refined)
         broadcast = validate_broadcast_proposal(shot, refined, state)
         if broadcast is not None:
@@ -361,9 +382,14 @@ def reject(root, shot_id, candidate_id, request_hash, feedback):
         shot.setdefault("prompt_history", []).append(copy.deepcopy(candidate))
         shot.pop("prompt_candidate", None)
         shot.pop("prompt_approval", None)
+        from .storyboard_revision import discard
+        discard(shot, reason=feedback.strip(), stamp=core.now())
         shot["feedback"] = (shot.get("feedback", "") + "\n提示词修改意见：" + feedback.strip()).strip()
         shot.update(status="planned", revision=shot.get("revision", 0) + 1)
-        shot.pop("revision_analysis", None)
+        analysis = shot.pop("revision_analysis", None)
+        if analysis:
+            shot.setdefault("revision_analysis_history", []).append({**copy.deepcopy(analysis),
+                "superseded_at": core.now(), "resolution": "human_rejected_prompt"})
         state.update(status="ready", last_error=None)
         core.event(state, "human_rejected_prompt", id=shot_id, candidate_id=candidate_id)
     return core.load_project(root)

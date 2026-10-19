@@ -159,6 +159,11 @@ REVISION_ASSET_SCHEMA = _object({**ASSET_SCHEMA["properties"],
                                  "voice_only": {"type": "boolean"}, "audition_speaker": STRING})
 SYSTEM_BROADCAST_SCHEMA = _object({"enabled": {"type": "boolean"}, "character_id": STRING,
                                     "voice_id": STRING, "instruction": STRING})
+STORYBOARD_REVISION_SCHEMA = _object({
+    "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "duration": {"type": "integer", "minimum": 4, "maximum": 15},
+    "subshots": _array(SUBSHOT_SCHEMA, minItems=1, maxItems=3),
+})
 REVISION_SCHEMA = _object({
     "needs_assets": {"type": "boolean"},
     "additions": _array(REVISION_ASSET_SCHEMA, maxItems=20),
@@ -166,6 +171,7 @@ REVISION_SCHEMA = _object({
                                      "prompt": STRING, "dialogue": STRING,
                                      "continuity_notes": STRING}), maxItems=100),
     "audio_policy": _object({"system_broadcast": SYSTEM_BROADCAST_SCHEMA}),
+    "storyboard_revision": {"anyOf": [STORYBOARD_REVISION_SCHEMA, {"type": "null"}]},
     "summary": STRING, "blockers": _array(STRING, maxItems=30),
 })
 REVIEW_SCHEMA = _object({"verdict": {"type": "string", "enum": ["pass", "fail", "uncertain"]},
@@ -188,6 +194,10 @@ MUSIC_CUE_SCHEMA = _object({"summary": STRING, "cues": _array(_object({
 
 def _validate(value, schema: dict, path: str = "output") -> None:
     """Validate the small schema subset used here, even after structured output."""
+    # Wire responses must include the new nullable field. Older saved results
+    # and fixtures mean no storyboard change; keep their returned shape intact.
+    if schema is REVISION_SCHEMA and isinstance(value, dict) and "storyboard_revision" not in value:
+        value = {"storyboard_revision": None, **value}
     if "anyOf" in schema:
         for variant in schema["anyOf"]:
             try:
@@ -220,7 +230,11 @@ def _validate(value, schema: dict, path: str = "output") -> None:
         if not schema.get("minLength", 0) <= len(value) <= schema.get("maxLength", 100000) or ("pattern" in schema and not re.fullmatch(schema["pattern"], value)):
             raise BrainError(f"GPT 输出字段 {path} 格式不合规。")
     elif kind in {"integer", "number"}:
-        if not math.isfinite(value) or not schema.get("minimum", -math.inf) <= value <= schema.get("maximum", math.inf):
+        try:
+            finite = math.isfinite(value)
+        except (OverflowError, TypeError):
+            finite = False
+        if not finite or not schema.get("minimum", -math.inf) <= value <= schema.get("maximum", math.inf):
             raise BrainError(f"GPT 输出字段 {path} 数值越界。")
 
 
@@ -293,6 +307,8 @@ NEW_EPISODE_DURATION_RULES = (
     "用户创作要求明确指定其他单集时长时尊重该要求；默认60秒不能覆盖用户指定时长。"
     "这只是新规划的默认值，不能追溯修改已有或已批准的分集、片段 duration 或 subshots；"
     "例如已经批准的130秒第一集保持130秒，不为了新默认重新分集、裁短或重做。"
+    "用户之后主动要求局部重新分镜时，可按其反馈另拟目标片段的新时长与镜头草稿；"
+    "整集仅随目标片段的新时长变化，其他段不变，完整提示词仍须人工确认。"
     "不要把整部小说塞进一集。"
 )
 
@@ -381,6 +397,9 @@ def task_shot_summary(shot):
     summary = _task_fields(shot, ("id", "duration", "prompt", "dialogue", "asset_ids", "scene_id", "continuity_notes",
         "subshots", "feedback", "status", "version", "revision", "file", "sha256", "job_id",
         "approved_at", "approved_sha256", "approved_version", "pending_asset_amendment"))
+    storyboard = _storyboard_task_summary(shot)
+    if storyboard is not None:
+        summary["storyboard_revision"] = storyboard
     if isinstance(shot.get("human_decision"), dict):
         summary["human_decision"] = _task_fields(shot["human_decision"],
             ("decision", "version", "sha256", "at", "feedback", "source", "continuity_checked", "report_bound", "report_available", "report_note"))
@@ -471,8 +490,18 @@ def _asset_definition(asset):
     return summary
 
 
+def _storyboard_task_summary(shot):
+    """The present draft is useful; old timelines and execution bindings are not."""
+    revision = shot.get("storyboard_revision")
+    return _task_fields(revision, ("summary", "signature")) if isinstance(revision, dict) else None
+
+
 def _shot_creative(shot):
-    return _task_fields(shot, ("id", "duration", "prompt", "dialogue", "asset_ids", "scene_id", "continuity_notes", "subshots"))
+    summary = _task_fields(shot, ("id", "duration", "prompt", "dialogue", "asset_ids", "scene_id", "continuity_notes", "subshots"))
+    storyboard = _storyboard_task_summary(shot)
+    if storyboard is not None:
+        summary["storyboard_revision"] = storyboard
+    return summary
 
 
 def _model_shot(shot):
@@ -765,7 +794,7 @@ voice.audition_speaker（非空时）是原文的说话归属，例如“系统�
         return result
 
     def plan_revision(self, shot: dict, context: dict, feedback: str) -> dict:
-        """Plan requested extra assets; never create media, approve, or mutate state."""
+        """Route one feedback into asset and/or internal-storyboard drafts only."""
         if not isinstance(shot, dict) or not isinstance(shot.get("id"), str):
             raise BrainError("返修片段缺少有效 ID。")
         if not isinstance(context, dict) or not isinstance(feedback, str) or not feedback.strip():
@@ -774,6 +803,20 @@ voice.audition_speaker（非空时）是原文的说话归属，例如“系统�
         # against the full local project, independently of the model selection.
         model_shot, model_context = _model_shot(shot), revision_task_context(shot, context)
         result = self._call(f"""解析一次用户主动提出的片段返修意见，提出最小必要的新增资产和计划变更；只规划，不生成、批准或执行。
+同一个 feedback 是唯一入口，按完整语义自主判断普通内容修改、局部重新分镜、资产增补或组合需求，不靠固定关键词决定路线，不要求用户换表单。
+storyboard_revision=null 表示保留当前内部镜头结构与时长；普通构图、表演、运镜或声音细化不构成新增切镜授权。
+当意见要求调整当前片段内部镜头数量、摄影切点、各镜头叙事内容或片段时长时，先重新分镜，输出 storyboard_revision={{summary,duration,subshots:[{{start,end,prompt}}]}}。
+只重设计当前 shot 的内部镜头，保持该片段 id、scene_id、人物 canonical dialogue、其他片段及其已有成片不变。
+本次需要局部重新分镜时，用户已授权 GPT 按反馈、自然对白和动作节奏自主确定当前片段合理时长，不必保留旧 duration，也不再要求用户确认秒数。
+duration 必须是视频引擎单次支持的4–15秒整数；新 subshots 为1–3个镜头，从0开始无间隙、无重叠覆盖本次 duration。
+如正常对白与必要动作确实超过15秒，写入 blockers 说明需另行拆段，不把 duration 假写15来掩盖超时，不加速、删改对白或隐式新增视频 API 任务。
+整集总时长随目标片段的新时长相应变化，其他片段不变；不得为凑回旧130秒而裁短别段、加速或重分集。
+每个 prompt 具体写景别、运镜、人物方位、动作起止、所属原对白和切镜承接；不得用“同上”代替完整可执行内容。
+这是同一个视频 API 任务的内部时间表，不拆成多个生成任务，不宣称只修某一镜就能保留其他镜成片。
+storyboard_revision.summary 说明镜头数量、时长、内容与切点如何回应本次意见，明确新分镜和后续完整提示词均尚未批准。
+需要重新分镜时必须填写该结构字段；不能把改镜头数量或切点只藏在 shot_updates.prompt、continuity_notes 或 summary 中而返回 null。
+重新分镜不自动新增人物、声源、场景或道具。确需缺失资产时，同一次规划同时填写 additions、shot_updates 和 storyboard_revision，先走资产人工确认，再以新分镜准备完整提示词待确认。
+已有 shot.storyboard_revision 只说明本次在用的草稿；shot.subshots 是当前最新时间表，旧 prompt 中冲突的镜头数量/切点应由它替代，不能按历史草稿再次增改镜头。
 普通构图、表演、文字、运镜修改通常不需要新增资产；可用已有资产时复用，needs_assets=false、additions=[]。
 context.assets 是当前引用的真实资产定义；asset_catalog 是本机已有资产的轻量目录，先按 ID/绑定关系查找可复用资产，不能因未展开全文而重复创建。
 目录不是画面或试听证据，不能假称已观察；复用的真实定义由本地解析、校验，仍须满足其当前审批状态。
@@ -792,17 +835,19 @@ additions 每项含 id、kind、name、prompt、character_id、voice_only、audi
 如果没有合格原句则保留空 text/source、reason 说明缺口，同时在 blockers 写明须补充或选择原文，不能先提交生成。
 shot_updates 仅使用 {{id,add_asset_ids,prompt,dialogue,continuity_notes}}，只添加实际需要的引用，保留原有全部引用。
 当前片段及其后尚未生成的相关片段可更新；已有成片的其他片段不变，也不安排它们重新生成。
-严格保留全部片段 duration、scene_id、subshots 的数量、顺序、start/end 和既有画面动作；不得通过输出字段偷偷改动摄影时间表。
+严格保留其他片段 duration 和全部片段 scene_id；除本次明确需要重设计的当前片段外，保留 subshots 的数量、顺序、start/end 和既有画面动作。
+当前片段只有通过非 null storyboard_revision 才能提出新的摄影时间表和镜头内容，shot_updates 不携带 subshots、duration、scene_id 等结构字段。
+本次明确要求并已由 storyboard_revision 提出的新时长与切点属于授权规划范围，下文声音规则中的“原时长、原切点”对此指新时间表；不能把用户要求的局部重新分镜本身再次列为阻塞。
 旧子镜中声音/UI的起止文字可在同段内提出合理替代草稿，以便完整自然播报，摄影切点与动作因果不变。
 {CROSS_SHOT_AUDIO_RULES}
 {SYSTEM_BROADCAST_EDITORIAL_RULES}
 以最新明确的人工意见为准；旧 revision_analysis 或其历史只是先前诊断，不是新的人工要求，
 不能把已采用资产方案中的历史反馈再次当作新增资产授权，也不能把“增强科技感”推断为同意提前播音已经执行；同段内合理草稿仍可先准备待审。
-新规划每集约60秒的默认值不适用于本次返修，不能据此重新分集、改变已批准的整集总时长或压缩对白；
-例如已经批准的130秒第一集继续保持130秒，新增声音或资产不能成为裁短旧集、删剧情或加速台词的理由。
+新规划每集约60秒的默认值不适用于本次返修，不能据此重新分集或压缩对白；
+新增声音或资产本身不是裁短旧集、删剧情或加速台词的理由。本次明确重分镜时，整集仅按目标片段的新时长增减，其他段不变。
 prompt 写清新声源仅画外、系统原文与其在既有动作中的位置，去掉旧 prompt 中“系统无配音/不念任务框”等与用户要求相冲突的限制。
 continuity_notes 注明新播报规则覆盖旧内部镜头里相冲突的无配音文字，但原切点和动作不变。
-非目标角色原对白逐字保留，不能为省时删减、改写或加速；系统短播的内容取舍按以上项目专项规则由 GPT 决定，无须再次征求逐句/秒数选择。
+人物原对白逐字保留，不能为省时删减、改写或加速；系统短播的内容取舍按以上项目专项规则由 GPT 决定，无须再次征求逐句/秒数选择。
 将系统框文字变为播报时，canonical dialogue 中明确写“系统播报员：完整原文”，与主角对白分别标明归属；
 完整系统来源保留到最终细化，由 broadcast_proposal 选择短播、保留完整界面规则，不能在返修规划中先丢掉系统来源。
 按正常语速约每秒4个汉字并留标点停顿，核对实际声音起止时窗和整段时长；不能因一句话跨摄影切点就认定超时。
@@ -826,6 +871,35 @@ blockers=[] 表示没有已知规划阻塞，不表示批准。needs_assets 必�
     @staticmethod
     def _validate_revision(result: dict, shot: dict, context: dict) -> dict:
         """Reject model guesses that could corrupt assets or bypass review gates."""
+        _validate(result, REVISION_SCHEMA)
+        storyboard = result.get("storyboard_revision")
+        if storyboard is not None:
+            if not storyboard["summary"].strip() or "\x00" in storyboard["summary"]:
+                raise BrainError("局部重新分镜缺少有效说明，不能包含空字符。")
+            try:
+                validate_subshots({"duration": storyboard["duration"], "subshots": storyboard["subshots"]})
+            except ValueError as exc:
+                raise BrainError(f"局部重新分镜无效：{exc}") from None
+        else:
+            # The structural field is the sole execution contract. A response
+            # must not advertise a new cut list only in free-form prose. This
+            # checks explicit output claims, not the human intent/routing.
+            claims = [result.get("summary", "")]
+            claims.extend(value for update in result.get("shot_updates", [])
+                          for key in ("prompt", "continuity_notes")
+                          if isinstance((value := update.get(key)), str))
+            claim_pattern = (r"(?:重新分镜|重做分镜|重新设计(?:内部)?(?:分镜|镜头)|"
+                             r"(?:改为|改成|调整为|调整成|拆成|拆为|合并为|合成|新增|增加|删去|删除)"
+                             r"\s*[一二三四五六七八九十两\d]+\s*(?:个)?(?:内部)?镜头|"
+                             r"(?:切点|切镜(?:时间|时点)?)\s*(?:改为|改成|调整到|调整为|提前到|延后到))")
+            def claims_change(text):
+                for match in re.finditer(claim_pattern, text):
+                    prefix = text[max(0, match.start() - 12):match.start()]
+                    if not re.search(r"(?:不|未|无须|无需|不用|不能|不得|尚未|没有|保留原有).{0,4}$", prefix):
+                        return True
+                return False
+            if any(claims_change(text) for text in claims):
+                raise BrainError("返修规划声称重新分镜，却没有提供 storyboard_revision；原分镜保持不变。")
         if result["needs_assets"] != bool(result["additions"]):
             raise BrainError("返修规划的新增资产标记与资产列表不一致。")
         if not result["summary"].strip():
@@ -920,6 +994,16 @@ blockers=[] 表示没有已知规划阻塞，不表示批准。needs_assets 必�
                 system_labels = (set(candidate_policy.get("speaker_labels", []))
                                  if candidate_policy.get("enabled") is True
                                  and candidate_policy.get("voice_id") in combined else set())
+                if storyboard is not None and shot_id == shot["id"]:
+                    def character_lines(dialogue):
+                        lines = []
+                        for line in dialogue.splitlines():
+                            label = re.match(r"\s*([^：:\n]{1,60})[：:]", line)
+                            if not label or label.group(1).strip() not in system_labels:
+                                lines.append(line)
+                        return lines
+                    if character_lines(update["dialogue"]) != character_lines(original.get("dialogue", "")):
+                        raise BrainError("局部重新分镜不能改写、删除、新增或更换说话人的人物原对白。")
                 lines = []
                 for line in update["dialogue"].splitlines():
                     label = re.match(r"\s*([^：:\n]{1,60})[：:]", line)
@@ -929,8 +1013,10 @@ blockers=[] 表示没有已知规划阻塞，不表示批准。needs_assets 必�
                 units = sum(2 if token[0].isascii() and token[0].isalpha() else len(token)
                             for token in re.findall(r"[\u3400-\u9fff]|[A-Za-z]+(?:'[A-Za-z]+)?|\d+", spoken))
                 seconds = units / 4 + len(re.findall(r"[，,。；;！？!?…]", spoken)) * .25 + .5
-                if isinstance(original.get("duration"), (int, float)) and seconds > original["duration"]:
-                    result["blockers"].append(f"片段 {shot_id} 新对白按正常语速约需 {seconds:.1f} 秒，超过既定 {original['duration']} 秒；须先人工调整规划，未授权加速、截断或延长。")
+                duration = (storyboard["duration"] if storyboard is not None and shot_id == shot["id"]
+                            else original.get("duration"))
+                if isinstance(duration, (int, float)) and seconds > duration:
+                    result["blockers"].append(f"片段 {shot_id} 新对白按正常语速约需 {seconds:.1f} 秒，超过既定 {duration} 秒；须调整规划，未授权加速、截断或超出引擎上限。")
         if result["needs_assets"] and shot["id"] not in seen_updates:
             raise BrainError("新增资产规划缺少当前返修片段的引用更新。")
         policy = result["audio_policy"]["system_broadcast"]
@@ -1034,13 +1120,18 @@ summary简述选曲和衔接理由，具体听觉效果最终由用户看带字�
 
     def refine_shot(self, shot: dict, context: dict, images: list[Path]) -> dict:
         result = self._call(f"""根据已批准的原始生成片段、已批准资产和实际前片段观察，准备这一整段尚未批准的最终视频提示词候选。
+本次若有 shot.storyboard_revision，它只说明已按本次人工返修意见拟出的局部重新分镜草稿，尚未人工批准。
+shot.subshots 是本次最新有效的镜头数量、内容、切点；优先于旧 shot.prompt 中冲突的旧镜头描述，也优先于旧 source_shot_instructions 中的镜数与秒点，不能在最终提示词中恢复旧分镜。
+按新 subshots 的每一镜完整编写景别、运镜、站位、动作、对白与衔接，保持同一 id、scene_id、本次已应用的 shot.duration、人物原对白及上下段连续性；全部完整提示词仍待用户确认。
+本次局部重分镜可能已经合理调整片段时长，当前 shot.duration 和 subshots 优先于旧 prompt 或旧 approved_duration；不得按旧130秒整集约束撤回新时长，也不能改其他段来凑旧总长。
+没有本次新分镜时，继续保持既有时长和分镜；无论是否重新分镜，细化阶段都不能再次自行变动当前 shot.subshots 的数量、顺序或切点。
 shot 是一次视频 API 任务，subshots 是其内部镜头时间表。保持 subshots 的数量、顺序、start/end 和 duration 完全不变，
 不得自行新增、删去、合并镜头或改变切点；按原时间表逐段写景别、运镜、人物方位、动作起止及衔接，输出 prompt 中保留原时间标记。
-返工意见若要求改变既定摄影切点或片段总时长，应留待修改规划，不能在细化提示词时偷偷更改。
+返工意见中的摄影切点变动若已纳入当前 shot.subshots，就按新时间表执行本次细化，不重复要求用户确认秒数或返回规划；其他尚未规划的切点或总时长变动不能在细化时偷偷更改。
 {CROSS_SHOT_AUDIO_RULES}
 {SYSTEM_BROADCAST_EDITORIAL_RULES}
-新规划每集约60秒的默认值不适用于本次细化；已批准的整集总时长、片段时长和切点保持原样。
-例如已经批准的130秒第一集继续保持130秒，不重新分集、不裁短、不删剧情，也不加速或压缩原对白来凑一分钟。
+新规划每集约60秒的默认值不适用于本次细化；保持当前片段已应用的新时长和切点，不再二次修改。
+不重新分集，不裁短其他段、不删剧情，也不加速或压缩原对白来凑一分钟或旧整集时长。
 旧项目没有 subshots 时保留原单段结构，不擅自拆镜或增加任务。一次人工返工仅生成一个新版本，之后重新等待人工审批。
 一个视频任务对应整个片段；不能声称能单独重做内镜头，也不能因 GPT 检查报告自行安排下一轮生成。
 视频生成引擎的图片编号严格对应 context.image_references，明确哪些锁人物/场景、哪些是官方尾帧；不能凭空声称有参考视频。

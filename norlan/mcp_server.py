@@ -39,6 +39,24 @@ def _compact_music_status(library):
             "tracks": [{key: track.get(key) for key in ("id", "title", "version", "status")} for track in tracks[:12]]}
 
 
+def _compact_storyboard_status(value):
+    """Keep the conversational gate small; the browser shows the camera plan."""
+    if not isinstance(value, dict):
+        return None
+    result = {"summary": str(value.get("summary", ""))[:2000]}
+    count = value.get("before_count")
+    if type(count) is int and 1 <= count <= 3:
+        result["before_count"] = count
+    parts = value.get("subshots")
+    if isinstance(parts, list):
+        result["proposed_count"] = len(parts)
+    for key in ("before_duration", "duration"):
+        seconds = value.get(key)
+        if type(seconds) in (int, float) and math.isfinite(seconds) and 4 <= seconds <= 15:
+            result[key] = seconds
+    return result
+
+
 class ToolError(ValueError):
     """An intentionally public, credential-free diagnostic."""
 
@@ -136,7 +154,7 @@ TOOLS = [
                       "items": {"type": "array", "items": IDENTIFIER, "minItems": 1, "maxItems": 3}}}),
     _tool("run_production", "后台推进项目到下一审批、预算或配置关卡，立即返回。同项目不会重复启动。每个视频版本完成后仅提供GPT审查报告，等待用户本人在网页通过或填写意见返工；不能因GPT报告不通过而重生成。审查报告中断不表示视频失败；已有视频通过文件/版本校验后恢复原报告，缺失则标记未完成交给用户审批，不自动重新审查或生成。审查调用的未知费用保持待核实，不能无凭据要求对账成已花费或未收费。请先说明用户要求的生成工作；不自动批准、不增加预算。", {"project": PATH}),
     _tool("pause_production", "请求暂停明确项目；已提交供应商的任务可能继续，保留任务记录以便恢复。", {"project": PATH}),
-    _tool("request_revision", "按用户明确意见对当前版本申请返工，自动使依赖结果失效。声音资产返工仅调整稳定声线属性，保持原文试音段落及中性语气；若选句不合适，先重新确认该角色的原文段落，不能把自由反馈直接当作台词。剧情表演意见应修改对应分镜。必须先查状态取得版本；不批准或自动启动。",
+    _tool("request_revision", "按用户明确意见对当前版本申请返工，自动使依赖结果失效。片段反馈由同一规划器判断普通修改、局部重新分镜及新增资产；可改为1–3个内部镜头和新内容，GPT按反馈决定4–15秒片段时长，整集总时长相应更新，不自动改其他片段。先完成必要的资产审批，再准备完整提示词供用户确认，不用save_plan替换旧计划。声音资产返工仅调整稳定声线属性，保持原文试音段落及中性语气；若选句不合适，先重新确认该角色的原文段落，不能把自由反馈直接当作台词。必须先查状态取得版本；不批准或自动启动。",
           {"project": PATH, "kind": {"type": "string", "enum": ["plan", "asset", "episode", "shot"]},
            "id": IDENTIFIER, "version": VERSION, "feedback": NONEMPTY,
            "shot_ids": {"type": "array", "items": IDENTIFIER, "minItems": 1, "maxItems": 100}},
@@ -316,6 +334,7 @@ class MCPServer:
             "asset_creation": "首次生成资产前，请用户在网页选择由 GPT 决定或自行描述并提供参考图片；模型不能代替用户选择。",
             "segment_proposal": "重分组仅限暂停且无在途任务时的尚未启动尾部；用 propose_segments 保存候选，再由用户在网页确认。不能重跑资产或替换现有规划。",
             "asset_amendment": "片段返修需要新资产时，使用 propose_asset_amendment；先由用户确认增补方案，再批准新增资产，最后确认返修提示词。不能调用 save_plan 替换旧计划。",
+            "storyboard_revision": "在同一个片段返修意见框提出镜头数量与内容要求，GPT先局部重新分镜并根据内容决定4–15秒时长，再准备完整提示词供用户确认。仅改单片段内部1–3个镜头和时长，整集总长相应更新，不自动调整其他段；新增资产先审批。不能用save_plan或尾部propose_segments代替已有片段返修，也不能替用户确认生成。",
             "advisory_review": "GPT 审查报告中断不等于视频失败；有已核实视频时请 open_review 供用户看片审批，不自动重新审查或生成。未知审查费用保留待核实，不要求用户无凭据对账成已花费或未收费。",
             "planning_feedback": "当前片段提示词准备有冲突时，请用 open_review；用户在片段卡填写调整意见并重新准备提示词，再确认生成。普通继续、建议或未答复都不是调整时间安排的同意；不能清掉阻塞后直接提交视频。",
             "budget": "预算仅由用户在终端执行 nolan configure PROJECT --budget AMOUNT 设置；模型不能提高预算。",
@@ -345,6 +364,9 @@ class MCPServer:
                 for key in ("dialogue", "asset_ids", "scene_id", "continuity_notes", "revision", "subshots"):
                     if key in shot:
                         pshot[key] = shot[key]
+                for item in (pshot, pshot.get("prompt_candidate", {})):
+                    if "storyboard_revision" in item:
+                        item["storyboard_revision"] = _compact_storyboard_status(item["storyboard_revision"])
         with self.lock:
             worker = self.workers.get(root)
             result["background"] = {"running": bool(worker and worker.is_alive()),

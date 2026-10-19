@@ -292,6 +292,8 @@ def _public_prompt_candidate(value, shot=None):
         result["broadcast_proposal"] = _public_broadcast_proposal(value, shot)
     if "timing_proposal" in value:
         result["timing_proposal"] = _public_timing_proposal(value, shot)
+    if "storyboard_revision" in value:
+        result["storyboard_revision"] = _public_storyboard_revision(value.get("storyboard_revision"), shot)
     manifest = value.get("reference_manifest")
     context = manifest.get("context", manifest) if isinstance(manifest, dict) else {}
     context = context if isinstance(context, dict) else {}
@@ -321,6 +323,38 @@ def _public_prompt_candidate(value, shot=None):
                                            if row.get("asset_id") not in internal_ids]
     result["reference_manifest"] = references
     return result
+
+
+def _public_storyboard_revision(value, shot):
+    """Expose only this segment's bounded draft, never prior plans or bindings."""
+    if not isinstance(value, dict) or not isinstance(shot, dict):
+        return None
+    summary, rows = value.get("summary"), value.get("subshots")
+    before = value.get("before_count")
+    before_duration, duration = value.get("before_duration"), value.get("duration")
+    if (not isinstance(summary, str) or not summary.strip() or len(summary) > 2000 or "\x00" in summary
+            or type(before) is not int or not 1 <= before <= 3
+            or not isinstance(rows, list) or not 1 <= len(rows) <= 3):
+        return None
+    if (type(before_duration) not in (int, float) or not 0 < before_duration <= 3600
+            or type(duration) is not int or not 4 <= duration <= 15 or duration != shot.get("duration")):
+        return None
+    safe_rows, end = [], 0
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        start, stop, prompt = row.get("start"), row.get("end"), row.get("prompt")
+        if (type(start) not in (int, float) or type(stop) not in (int, float)
+                or not 0 <= start < stop <= duration
+                or start != end
+                or not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 2000 or "\x00" in prompt):
+            return None
+        safe_rows.append({"start": start, "end": stop, "prompt": prompt})
+        end = stop
+    if end != duration:
+        return None
+    return {"summary": summary, "before_count": before, "after_count": len(safe_rows),
+            "before_duration": before_duration, "duration": duration, "subshots": safe_rows}
 
 
 def _public_voice_source(asset, assets, audio_policy=None):
@@ -893,7 +927,12 @@ def public_state(state: dict) -> dict:
             if isinstance(shot.get("subshots"), list):
                 entry["subshots"] = [_pick(part, ("start", "end", "prompt"))
                                      for part in shot["subshots"] if isinstance(part, dict)]
+            storyboard = _public_storyboard_revision(shot.get("storyboard_revision"), shot)
+            if storyboard:
+                entry["storyboard_revision"] = storyboard
             entry["version"] = _version(shot.get("version"))
+            editor = getattr(_core(), "can_edit_shot_revision", None)
+            entry["can_edit_revision"] = bool(callable(editor) and editor(state, shot))
             if planning_block and planning_block["shot_id"] == shot.get("id"):
                 entry["planning_block"] = dict(planning_block)
             amendment_id = shot.get("pending_asset_amendment")

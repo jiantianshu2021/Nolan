@@ -17,6 +17,13 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
 - Keep keys out of project state, logs, tests and version control.
 - Use argv for subprocesses, never shell commands from GPT output.
 - Keep original media immutable and decisions bound to version and file hash.
+- Route segment feedback through the same revision planner for ordinary edits,
+  local storyboarding and asset additions. A new storyboard may change only the
+  target segment's internal shots and duration within provider limits. GPT
+  chooses timing from the user's requested content; update the episode total
+  accordingly rather than silently retiming other segments.
+  Finish any asset approval first, then require the complete final prompt's
+  existing human approval before submitting the new video version.
 - Synthetic tests are visibly marked as such. Do not contact paid providers in CI.
 
 Run `python3 -m unittest discover -s tests -v` (FFmpeg integration tests require
