@@ -90,7 +90,7 @@ class LegacyAssetRecoveryTests(unittest.TestCase):
             core._find(state, 'asset', 'hero')['status'] = 'candidate'
         state = pipeline.run(self.root)
         self.assertEqual(state['status'], 'blocked')
-        self.assertIn('已批准的角色', state['last_error'])
+        self.assertIn('已批准的可见角色', state['last_error'])
         self.provider.poll_video.assert_not_called()
         self.provider.submit_video.assert_not_called()
         core.approve(self.root, 'asset', 'hero', 1)

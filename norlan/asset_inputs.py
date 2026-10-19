@@ -52,8 +52,10 @@ def confirmed(asset):
 
 
 def pending_assets(state):
+    from .core import is_internal_voice_source
     return [asset for asset in state.get("assets", [])
-            if not has_started(state, asset) and not confirmed(asset)]
+            if not is_internal_voice_source(asset)
+            and not has_started(state, asset) and not confirmed(asset)]
 
 
 def compose_prompt(asset, style=""):

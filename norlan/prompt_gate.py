@@ -36,7 +36,7 @@ def specification(state, shot, prompt, manifest):
 def _validate_inputs(root, state, shot, candidate):
     if state["paused"]:
         raise core.GateError("项目已暂停，请先明确恢复，再确认提示词。")
-    if any(a.get("status") != "approved" for a in state["assets"]):
+    if any(not core.asset_ready(a) for a in state["assets"]):
         raise core.GateError("尚有新增或变更资产未批准，不能确认视频生成。")
     if any(a.get("status") in {"candidate", "awaiting_assets"} for a in state.get("asset_amendments", [])):
         raise core.GateError("资产变更尚未完成，请先确认新增资产。")

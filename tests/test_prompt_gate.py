@@ -147,7 +147,8 @@ class PromptGateTests(unittest.TestCase):
         self.assertEqual(pipeline.run(self.root)["status"], "awaiting_asset_input")
         source = core._find(core.load_project(self.root), "asset", "system-speaker")
         self.assertNotIn("file", source)
-        core.approve(self.root, "asset", source["id"], source["version"])
+        self.assertEqual(source["status"], "internal")
+        self.assertNotIn("approved_at", source)
         choose_gpt_assets(self.root)
         self.assertEqual(pipeline.run(self.root)["status"], "awaiting_assets")
         self.api.submit_video.assert_called_once()  # voice audition only
@@ -186,6 +187,7 @@ class PromptGateTests(unittest.TestCase):
                          audio_file=str(audio.relative_to(self.root)), audio_sha256=core.digest(audio), approved_at=core.now())
             voice["approved_sha256"] = voice["sha256"]
             state["assets"] += definitions
+        core.normalize_voice_sources(self.root)
         original_assets = copy.deepcopy(core.load_project(self.root)["assets"])
         pipeline.run(self.root)
         shot = self.shot(); candidate = shot["prompt_candidate"]

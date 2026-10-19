@@ -26,7 +26,8 @@ class Response(io.BytesIO):
 def plan():
     return {"title": "测试", "style": "二维动画", "ratio": "16:9",
             "assets": [{"id": "hero", "kind": "character", "name": "主角", "prompt": "蓝色外套", "character_id": "",
-                        "audition_text": "", "audition_reason": "", "audition_source": ""}],
+                        "audition_text": "", "audition_reason": "", "audition_source": "",
+                        "voice_only": False, "audition_speaker": ""}],
             "episodes": [{"id": "E001", "title": "开端", "summary": "寻找信封", "music_prompt": "钢琴淡入",
                           "shots": [{"id": "S001", "duration": 5, "prompt": "向右走", "dialogue": "找到你了。",
                                      "asset_ids": ["hero"], "scene_id": "room", "continuity_notes": "右手拿信封",

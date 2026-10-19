@@ -62,7 +62,7 @@ class AssetAmendmentTests(unittest.TestCase):
         return core.propose_asset_amendment(self.root, **values)["asset_amendments"][-1]
 
     def approve_new_assets(self):
-        core.approve(self.root, "asset", "system-source", 1)
+        self.assertTrue(core.asset_ready(core._find(core.load_project(self.root), "asset", "system-source")))
         with core.transaction(self.root) as state:
             asset = core._find(state, "asset", "system-voice")
             asset.update(self.artifact("media/system-voice-v1.mp4"), status="candidate", version=1)
@@ -89,7 +89,7 @@ class AssetAmendmentTests(unittest.TestCase):
         state = core.apply_asset_amendment(self.root, proposal["id"], "approve")
         self.assertEqual(state["asset_amendments"][-1]["status"], "awaiting_assets")
         source = core._find(state, "asset", "system-source")
-        self.assertEqual((source["status"], source["version"]), ("candidate", 1))
+        self.assertEqual((source["status"], source["version"]), ("internal", 1))
         self.assertNotIn("file", source)
         self.assertEqual(core._find(state, "asset", "system-voice")["status"], "planned")
         current = core._find(state, "shot", self.target)
@@ -97,7 +97,7 @@ class AssetAmendmentTests(unittest.TestCase):
             self.assertEqual(current.get(key), original.get(key))
         self.assertFalse(core.activate_asset_amendment(self.root, proposal["id"]))
 
-    def test_initial_plan_voice_only_source_is_reviewable_without_image_generation(self):
+    def test_initial_plan_voice_only_source_is_internal_without_image_generation(self):
         other = Path(self.temp.name) / "initial-voice-source"
         core.create_project(other, "系统：" + self.line)
         plan = pipeline.demo_plan()
@@ -105,17 +105,18 @@ class AssetAmendmentTests(unittest.TestCase):
         plan["episodes"][0]["shots"][0]["asset_ids"] += ["system-source", "system-voice"]
         core.install_plan(other, plan)
         source = core._find(core.load_project(other), "asset", "system-source")
-        self.assertEqual((source["status"], source["version"]), ("candidate", 1))
+        self.assertEqual((source["status"], source["version"]), ("internal", 1))
         self.assertEqual(source["sha256"], core.voice_only_digest(source))
         self.assertNotIn("file", source)
         core.approve(other, "plan", "plan", 1)
-        core.approve(other, "asset", "system-source", 1)
+        with self.assertRaises(core.GateError):
+            core.approve(other, "asset", "system-source", 1)
 
     def test_all_assets_must_be_approved_then_only_target_is_queued_once(self):
         before = core.load_project(self.root)
         proposal = self.propose()
         core.apply_asset_amendment(self.root, proposal["id"], "approve")
-        core.approve(self.root, "asset", "system-source", 1)
+        self.assertTrue(core.asset_ready(core._find(core.load_project(self.root), "asset", "system-source")))
         self.assertFalse(core.activate_asset_amendment(self.root, proposal["id"]))
         self.approve_new_assets_without_source()
         self.assertTrue(core.activate_asset_amendment(self.root, proposal["id"]))
@@ -157,6 +158,7 @@ class AssetAmendmentTests(unittest.TestCase):
             audio = self.artifact("media/existing-system-voice-v3.wav", b"synthetic approved existing voice")
             voice.update(audio_file=audio["file"], audio_sha256=audio["sha256"], approved_sha256=voice["sha256"])
             state["assets"].extend([source, voice])
+        core.normalize_voice_sources(self.root)
 
     def test_existing_voice_reuse_requires_scheme_and_changes_no_asset_or_paid_job(self):
         self.add_existing_approved_system_voice()

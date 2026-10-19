@@ -72,6 +72,8 @@ def episode_progress(state, episode, *, now=None):
     ``now`` accepts an ISO timestamp or datetime; without it elapsed counters
     are null, keeping this function deterministic for the supplied state.
     """
+    from .core import asset_ready, is_internal_voice_source
+    public_assets = [asset for asset in state.get("assets", []) if not is_internal_voice_source(asset)]
     shots = episode.get("shots", [])
     weights = [_weight(shot) for shot in shots]
     accepted = [_accepted(shot) for shot in shots]
@@ -145,9 +147,9 @@ def episode_progress(state, episode, *, now=None):
         return finish("awaiting_previous_episode", "等待前集成片通过人工审批", waiting=True)
     if state.get("status") == "awaiting_asset_input":
         return finish("awaiting_asset_input", "等待选择资产创作方式", waiting=True)
-    if any(asset.get("status") == "generation_failed" for asset in state.get("assets", [])):
+    if any(asset.get("status") == "generation_failed" for asset in public_assets):
         return finish("asset_generation_failed", "资产生成失败；请查看具体原因并明确提出重试意见", waiting=True)
-    if any(asset.get("status") != "approved" for asset in state.get("assets", [])):
+    if any(not asset_ready(asset) for asset in public_assets):
         return finish("awaiting_assets", "等待人物、场景和声音资产全部通过审批", waiting=True)
     if state.get("paused") or state.get("status") == "paused":
         label = "已暂停；已提交的视频任务可能仍在生成" if active_jobs else "本集制作已暂停"

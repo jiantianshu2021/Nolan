@@ -17,7 +17,7 @@ import threading
 import webbrowser
 
 from . import __version__, core, dashboard, pipeline
-from .brain import NEW_EPISODE_DURATION_RULES
+from .brain import INTERNAL_VOICE_SOURCE_RULES, NEW_EPISODE_DURATION_RULES
 from .voice import VOICE_PLAN_RULES
 from .segments import MAX_SUBSHOT_PROMPT_CHARS, SEGMENT_PLAN_RULES
 
@@ -57,7 +57,7 @@ PATH = {"type": "string", "minLength": 1, "maxLength": 4096,
 IDENTIFIER = {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"}
 VERSION = {"type": "integer", "minimum": 0}
 ASSET = _object({"id": IDENTIFIER, "kind": {"type": "string", "enum": ["character", "location", "prop", "voice"]},
-                 "voice_only": {"type": "boolean", "description": "仅 character 可为 true，表示仅定义画外声源、不生成可见人物。其他类型省略或 false。"},
+                 "voice_only": {"type": "boolean", "description": "仅 character 可为 true，表示后台内部画外声源，不生成可见人物、不作为单独资产或人工审批对象。用户只选择、试听和审批绑定的 voice 声音。其他类型省略或 false。"},
                  "audition_speaker": {"type": "string", "maxLength": 200, "description": "voice 在原文中的真实说话人标记，如系统；可与声源资产显示名不同。非 voice 省略或空串。"},
                  "name": NONEMPTY, "prompt": {**NONEMPTY, "description": VOICE_PLAN_RULES}, "character_id": {
                      **TEXT, "description": "kind=voice 时必填，指向已定义的 character 资产 ID；其他类型省略或填空字符串，角色不能填自身 ID。画外声音也需绑定声源角色，并在提示词说明不入画。"},
@@ -113,8 +113,8 @@ TOOLS = [
           {"project": PATH, "novel_text": {"type": "string", "minLength": 1, "maxLength": MAX_NOVEL_BYTES},
            "source_path": PATH, "title": {"type": "string", "minLength": 1, "maxLength": 300},
            "brief": TEXT, "mode": {"type": "string", "enum": ["live", "demo"], "default": "live"}}, ["project"]),
-    _tool("save_plan", "保存候选分集/资产/生成片段规划并等待人工审批。" + NEW_EPISODE_DURATION_RULES + SEGMENT_PLAN_RULES + "voice 必须绑定已定义角色，非 voice 的 character_id 省略或为空；生成片段引用声音须同时引用其角色，画外声在 prompt 标明不入画。" + VOICE_PLAN_RULES + "校验失败返回字段路径和修复建议，不修改项目。不能写 approved、file、settings 或预算。", {"project": PATH, "plan": PLAN}),
-    _tool("propose_asset_amendment", "在分镜或返修阶段提出新增声音/人物/场景等资产，或复用已有资产及声音规则的关联片段更新，打开网页供用户确认。只创建候选，不覆盖save_plan、不修改旧资产或已有媒体、不批准、不生成。additions可为空，此时必须实际追加已有资产引用或改变audio_policy，不能提交空方案。用户采用后先确认新增资产定义/试听，全部批准后才应用片段修改并等待生成确认；复用已批准资产不重新制作。仅更新目标及后续未启动片段；系统女播音可新增voice_only=true的character声源与绑定voice，用audition_speaker标明原文说话人。试音必须来自原文，不得编造。audio_policy可要求以后任务框统一播报。不得自己批准提案或资产。",
+    _tool("save_plan", "保存候选分集/资产/生成片段规划并等待人工审批。" + NEW_EPISODE_DURATION_RULES + SEGMENT_PLAN_RULES + INTERNAL_VOICE_SOURCE_RULES + "voice 必须绑定已定义角色，非 voice 的 character_id 省略或为空；生成片段引用声音须同时引用其角色，画外声在 prompt 标明不入画。" + VOICE_PLAN_RULES + "校验失败返回字段路径和修复建议，不修改项目。不能写 approved、file、settings 或预算。", {"project": PATH, "plan": PLAN}),
+    _tool("propose_asset_amendment", "在分镜或返修阶段提出新增声音/人物/场景等资产，或复用已有资产及声音规则的关联片段更新，打开网页供用户确认。只创建候选，不覆盖save_plan、不修改旧资产或已有媒体、不批准、不生成。additions可为空，此时必须实际追加已有资产引用或改变audio_policy，不能提交空方案。用户采用方案后，只需选择、试听和审批真正的声音等实际资产，全部通过后才应用片段修改并等待生成确认；复用已批准资产不重新制作。仅更新目标及后续未启动片段；系统女播音可后台新增voice_only=true的character内部声源与绑定voice，不把内部定义单独交给用户审批。" + INTERNAL_VOICE_SOURCE_RULES + "用audition_speaker标明原文说话人。试音必须来自原文，不得编造。audio_policy可要求以后任务框统一播报。不得自己批准提案或实际资产。",
           {"project": PATH, "shot_id": IDENTIFIER, "version": VERSION, "feedback": NONEMPTY,
            "additions": {"type": "array", "items": ASSET, "minItems": 0, "maxItems": 30},
            "shot_updates": {"type": "array", "items": AMENDMENT_SHOT_UPDATE, "minItems": 1, "maxItems": 100},
@@ -306,7 +306,9 @@ class MCPServer:
             "budget": "预算仅由用户在终端执行 nolan configure PROJECT --budget AMOUNT 设置；模型不能提高预算。",
             "configuration": "模型、单次调用价格上限及服务凭证须由用户通过本机配置设置。",
         }
-        for public, asset in zip(result["assets"], state["assets"]):
+        assets_by_id = {asset["id"]: asset for asset in state["assets"]}
+        for public in result["assets"]:
+            asset = assets_by_id[public["id"]]
             public["character_id"] = asset.get("character_id", "")
             public["voice_only"] = asset.get("voice_only", False)
             if asset.get("kind") == "voice":

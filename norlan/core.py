@@ -309,8 +309,8 @@ def install_plan(root, plan):
                          "history": [], "feedback": "", "creation_input": empty_input()}
                         for a in plan["assets"]]
         for asset in s["assets"]:
-            if asset.get("kind") == "character" and asset.get("voice_only") is True:
-                asset.update(status="candidate", version=1, sha256=voice_only_digest(asset))
+            if is_internal_voice_source(asset):
+                _register_voice_source(asset)
         s["episodes"] = []
         for ep in plan["episodes"]:
             ep = copy.deepcopy(ep)
@@ -347,7 +347,7 @@ def _check_version(item, version):
 
 
 def voice_only_digest(asset):
-    """Bind approval of an offscreen voice source to its exact public definition."""
+    """Bind an internal offscreen source to its exact logical definition."""
     return _json_digest({key: asset.get(key) for key in ("id", "kind", "name", "prompt", "voice_only")})
 
 
@@ -356,10 +356,97 @@ def _json_digest(value):
                                      separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
 
 
+def is_internal_voice_source(asset):
+    """Only explicit offscreen character roles are internal; portraits never are."""
+    return isinstance(asset, dict) and asset.get("kind") == "character" and asset.get("voice_only") is True
+
+
+def asset_ready(asset):
+    """Human approval applies to real media; logical source roles have no human decision."""
+    if is_internal_voice_source(asset):
+        return (asset.get("status") == "internal" and asset.get("internal_role") is True
+                and asset.get("sha256") == voice_only_digest(asset))
+    return asset.get("status") == "approved"
+
+
+def _register_voice_source(asset):
+    """Register bookkeeping, never synthesize or manufacture a human approval."""
+    if not is_internal_voice_source(asset):
+        raise ValueError("仅显式画外声源可登记为内部角色")
+    expected = voice_only_digest(asset)
+    if asset.get("sha256") not in {None, expected}:
+        raise GateError("画外声源定义哈希已改变，请先核实原定义；不会自动登记变化后的声源")
+    approval_keys = ("approved_at", "approved_sha256", "approved_version", "human_decision", "human_decisions")
+    prior = {key: copy.deepcopy(asset[key]) for key in approval_keys if key in asset}
+    if asset.get("status") != "internal" or prior:
+        asset.setdefault("internal_role_history", []).append({"status": asset.get("status"), "version": asset.get("version", 0),
+            **prior, "reason": "改为内部声源绑定；真实声音资产仍须人工试听批准", "recorded_at": now()})
+    for key in approval_keys:
+        asset.pop(key, None)
+    version = asset.get("version", 0)
+    asset.update(status="internal", internal_role=True, version=version if type(version) is int and version > 0 else 1,
+                 sha256=expected)
+
+
+def normalize_voice_sources(root, *, already_locked=False):
+    """Idempotently migrate old offscreen definitions, preserving genuine asset gates.
+
+    Old amendment baselines are refreshed only when they matched the complete
+    original asset snapshot before this semantic migration. A previously stale
+    proposal remains stale; unrelated asset changes are never blessed here.
+    """
+    with (nullcontext() if already_locked else run_lock(root)), transaction(root) as state:
+        sources = [asset for asset in state["assets"] if is_internal_voice_source(asset) and
+                   (not asset_ready(asset) or any(key in asset for key in
+                    ("approved_at", "approved_sha256", "approved_version", "human_decision", "human_decisions")))]
+        if not sources:
+            return state
+        source_ids = {asset["id"] for asset in sources}
+        for job in state["jobs"].values():
+            if job.get("accounting") == "unknown" or job.get("state") == "uncertain":
+                raise GateError("存在结果不明的调用，请先核实原任务；内部声源记录暂不迁移")
+            if job.get("item_id") in source_ids and (job.get("accounting") == "reserved" or
+                    job.get("state") in {"submitting", "submitted", "download_pending"}):
+                raise GateError("声源自身尚有未完成的旧素材任务，请先恢复原任务；内部绑定暂不迁移")
+        valid_baselines = []
+        for amendment in state.get("asset_amendments", []):
+            if amendment.get("status") not in {"candidate", "awaiting_assets"}:
+                continue
+            ids = set(amendment.get("baseline_asset_ids", []))
+            old_assets = [asset for asset in state["assets"] if asset["id"] in ids]
+            if _json_digest(old_assets) == amendment.get("baseline_assets_sha256"):
+                valid_baselines.append((amendment, ids))
+        for asset in sources:
+            _register_voice_source(asset)
+        invalidated = []
+        for episode in state["episodes"]:
+            for shot in episode["shots"]:
+                if shot.get("status") not in {"awaiting_prompt_approval", "prompt_approved"} or not source_ids.intersection(shot.get("asset_ids", [])):
+                    continue
+                job = state["jobs"].get(shot.get("job_id"), {})
+                submitted = (job.get("kind") == "video" and job.get("item_id") == shot["id"] and job.get("task_id")
+                             and job.get("state") in {"submitted", "download_pending", "completed"})
+                if submitted:
+                    continue
+                candidate = shot.pop("prompt_candidate", None)
+                if candidate:
+                    shot.setdefault("prompt_history", []).append({**candidate, "status": "invalidated",
+                        "invalidation_reason": "内部声源记录升级，须重新准备并确认本次提示词"})
+                shot.pop("prompt_approval", None)
+                shot["status"] = "planned"
+                invalidated.append(shot["id"])
+        for amendment, ids in valid_baselines:
+            amendment["baseline_assets_sha256"] = _json_digest([asset for asset in state["assets"] if asset["id"] in ids])
+        if invalidated and state.get("status") == "awaiting_prompt_approval":
+            state["status"] = "paused" if state["paused"] else "ready"
+        event(state, "voice_sources_internalized", ids=[asset["id"] for asset in sources], invalidated_prompts=invalidated)
+    return load_project(root)
+
+
 def _check_artifact(root, item):
-    if item.get("kind") == "character" and item.get("voice_only") is True:
+    if is_internal_voice_source(item):
         if item.get("sha256") != voice_only_digest(item):
-            raise GateError("画外声源定义已改变，请重新确认当前定义")
+            raise GateError("内部声源定义校验失败，请核实并修复声音绑定记录")
         return
     if not item.get("file"):
         raise GateError("素材文件缺失，不能审批")
@@ -379,6 +466,8 @@ def _editable_asset_input(state, asset_id, asset_version, input_revision):
     if state["plan"].get("status") != "approved":
         raise GateError("请先批准当前策划，再确认资产生成方式或上传参考图。")
     asset = _find(state, "asset", asset_id)
+    if is_internal_voice_source(asset):
+        raise GateError("画外声源是内部绑定，无需选择图片或生成方式；请设置对应声音资产")
     _check_version(asset, asset_version)
     data = input_state(asset)
     if (isinstance(input_revision, bool) or not isinstance(input_revision, int)
@@ -402,6 +491,8 @@ def set_remaining_asset_inputs_gpt(root, plan_version):
             raise GateError("尚有在途或结果不明的调用，请等待落盘或完成对账后再修改资产输入。")
         selected = []
         for asset in state["assets"]:
+            if is_internal_voice_source(asset):
+                continue
             if has_started(state, asset) or asset.get("status") != "planned":
                 continue
             data = input_state(asset)
@@ -595,6 +686,8 @@ def approve(root, kind, item_id, version):
             if item["status"] != "candidate":
                 raise GateError("规划当前不可审批")
         elif kind == "asset":
+            if is_internal_voice_source(item):
+                raise GateError("画外声源是内部绑定，无需单独审批；请试听并批准对应声音资产")
             if item["status"] != "candidate":
                 raise GateError("只有已生成候选的资产可以审批")
             _check_artifact(root, item)
@@ -612,7 +705,7 @@ def approve(root, kind, item_id, version):
             used_assets = {ref for sh in item["shots"] for ref in sh["asset_ids"]}
             for asset in s["assets"]:
                 if asset["id"] in used_assets:
-                    if asset["status"] != "approved":
+                    if not asset_ready(asset):
                         raise GateError("本集依赖的资产不再处于已批准状态")
                     _check_artifact(root, asset)
             rendered = item.get("render_manifest", {}).get("clips", [])
@@ -734,6 +827,8 @@ def reject(root, kind, item_id, version, feedback, shot_ids=None):
                 raise GateError("已有生成素材，请使用资产或分集返工")
             item.update(status="rejected", feedback=feedback)
         elif kind == "asset":
+            if is_internal_voice_source(item):
+                raise GateError("画外声源是内部绑定；请在对应声音资产中提出音色修改要求")
             if item["status"] not in {"candidate", "approved", "rejected", "generation_failed"}:
                 raise GateError("资产尚未生成")
             if item["status"] == "generation_failed":
@@ -996,8 +1091,8 @@ def apply_asset_amendment(root, amendment_id, decision):
             for definition in amendment["additions"]:
                 asset = {"character_id": "", **copy.deepcopy(definition), "status": "planned", "version": 0,
                          "history": [], "feedback": "", "creation_input": empty_input(), "amendment_id": amendment_id}
-                if asset.get("kind") == "character" and asset.get("voice_only") is True:
-                    asset.update(status="candidate", version=1, sha256=voice_only_digest(asset))
+                if is_internal_voice_source(asset):
+                    _register_voice_source(asset)
                 state["assets"].append(asset)
             amendment.update(status="awaiting_assets", decided_at=now())
             state["status"] = "awaiting_assets"
@@ -1022,11 +1117,18 @@ def activate_asset_amendment(root, amendment_id):
         target = _check_amendment_baseline(state, amendment)
         for definition in amendment["additions"]:
             asset = _find(state, "asset", definition["id"])
-            if asset.get("status") != "approved":
+            if not asset_ready(asset):
                 return False
             _check_artifact(root, asset)
-            if asset.get("approved_sha256") != asset.get("sha256"):
+            if not is_internal_voice_source(asset) and asset.get("approved_sha256") != asset.get("sha256"):
                 raise GateError("新增资产审批与当前定义或媒体不符，请重新确认")
+        required_ids = {identifier for update in amendment["shot_updates"]
+                        for identifier in (_find(state, "shot", update["id"])["asset_ids"] + update["add_asset_ids"])}
+        for identifier in required_ids:
+            asset = _find(state, "asset", identifier)
+            if not asset_ready(asset):
+                return False
+            _check_artifact(root, asset)
         for update in amendment["shot_updates"]:
             shot = _find(state, "shot", update["id"])
             shot["asset_ids"] = list(dict.fromkeys(shot["asset_ids"] + update["add_asset_ids"]))

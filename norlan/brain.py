@@ -112,7 +112,8 @@ STRING = {"type": "string"}
 ID = {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"}
 ASSET_SCHEMA = _object({"id": ID, "kind": {"type": "string", "enum": ["character", "location", "prop", "voice"]},
                         "name": STRING, "prompt": STRING, "character_id": STRING,
-                        "audition_text": STRING, "audition_reason": STRING, "audition_source": STRING})
+                        "audition_text": STRING, "audition_reason": STRING, "audition_source": STRING,
+                        "voice_only": {"type": "boolean"}, "audition_speaker": STRING})
 SUBSHOT_SCHEMA = _object({"start": {"type": "number", "minimum": 0, "maximum": 15},
                           "end": {"type": "number", "minimum": 0, "maximum": 15},
                           "prompt": {"type": "string", "minLength": 1, "maxLength": 2000}})
@@ -192,7 +193,14 @@ def _validate(value, schema: dict, path: str = "output") -> None:
 
 
 def validate_plan(plan: dict) -> dict:
-    _validate(plan, PLAN_SCHEMA)
+    # Newly generated plans use the strict complete schema. Stored legacy
+    # plans need not be rewritten merely to add these non-media identity flags.
+    validation_input = plan
+    if isinstance(plan, dict) and isinstance(plan.get("assets"), list):
+        validation_input = {**plan, "assets": [
+            {"voice_only": False, "audition_speaker": "", **asset} if isinstance(asset, dict) else asset
+            for asset in plan["assets"]]}
+    _validate(validation_input, PLAN_SCHEMA)
     ids: set[str] = set()
     for asset in plan["assets"]:
         if asset["id"] in ids:
@@ -207,6 +215,10 @@ def validate_plan(plan: dict) -> dict:
             raise BrainError("声音资产必须用 character_id 绑定一个已定义的角色。")
         if asset["kind"] != "voice" and asset["character_id"]:
             raise BrainError("非声音资产的 character_id 必须为空字符串。")
+        if asset.get("voice_only") is True and asset["kind"] != "character":
+            raise BrainError("voice_only 仅适用于后台内部画外角色声源。")
+        if asset["kind"] != "voice" and asset.get("audition_speaker", "").strip():
+            raise BrainError("非声音资产的 audition_speaker 必须为空字符串。")
     seen = set(ids)
     for episode in plan["episodes"]:
         if episode["id"] in seen:
@@ -248,6 +260,15 @@ NEW_EPISODE_DURATION_RULES = (
     "这只是新规划的默认值，不能追溯修改已有或已批准的分集、片段 duration 或 subshots；"
     "例如已经批准的130秒第一集保持130秒，不为了新默认重新分集、裁短或重做。"
     "不要把整部小说塞进一集。"
+)
+
+INTERNAL_VOICE_SOURCE_RULES = (
+    "kind=character 且 voice_only=true 的记录是后台内部画外声源，用于绑定真正的 voice 资产。"
+    "内部声源不生成可见人物、肖像或独立试音，不作为单独资产卡、创作选择或人工审批对象；"
+    "不要让用户先批准画外角色定义，也不能把内部登记说成人工批准。"
+    "用户只对真正的 voice 资产选择声线、试听并批准声音；声音未获人工批准就不能用于视频。"
+    "新增或变更资产方案仍须用户确认，方案仅展示实际人物、场景、道具和声音及其用途，内部声源绑定在后台维护。"
+    "可见人物、声音、场景等实际资产仍须人工审批，不能借内部声源规则自动批准。"
 )
 
 
@@ -362,12 +383,16 @@ class Brain:
 每个角色/场景/关键道具建立唯一 ASCII ID，复用资产 ID；asset_ids 必须引用列表中的资产。
 为有对白的主要角色创建独立 voice 资产，character_id 必须填写该声音对应的 character 资产 ID；其他资产的 character_id 填空字符串。
 声音资产名称明确对应角色。{VOICE_PLAN_RULES}
+{INTERNAL_VOICE_SOURCE_RULES}
+系统或旁白等仅画外声音可建立 voice_only=true 的 character 内部声源并绑定 voice；内部记录不要求人物形象。
+所有新资产均填写 voice_only 和 audition_speaker：只有内部画外 character 的 voice_only=true，其他为 false；
+voice.audition_speaker 填原文实际归属，如“系统”，非 voice 为空。实际 voice 仍须人工选择、试听和审批。
 分镜引用 voice 时必须同时引用其绑定的 character ID。
 画风以漫画/动画为主，禁止在角色形象提示词里强行使用真人摄影风格。
 镜头 prompt 写构图、人物站位、左右方向、光线、动作起止、运镜、精确对白、环境声；不内嵌字幕、不生成配乐。
 对白能在时长内自然说完。continuity_notes 写轴线/视线/道具/情绪/动作承接。
 每集 music_prompt 单独写无歌词配乐的情绪、乐器、节拍、起承转折与淡入淡出，音乐最终统一混合。
-人物与场景只提出待审批候选，不得宣称已批准。输出完整计划。""", {"novel": novel}, PLAN_SCHEMA)
+可见人物、场景、声音等实际资产只提出待审批候选，不得宣称已批准；内部画外声源由后台登记，不单独请求审批。输出完整计划。""", {"novel": novel}, PLAN_SCHEMA)
         return validate_plan(result)
 
     def select_voice_audition(self, novel: str, asset: dict, character: dict) -> dict:
@@ -410,6 +435,7 @@ voice.audition_speaker（非空时）是原文的说话归属，例如“系统�
 只有意见明确引入缺失的人物、声源、场景或道具才新增。不能把“加女声播报”当成修改或重做现有男主声线。
 仅画外的系统/任务框女播报员建立 kind=character、voice_only=true 的逻辑声源，无人物形象、无需图片；
 再建 kind=voice、character_id 绑定该声源，voice_only=false。其他资产 voice_only=false。
+{INTERNAL_VOICE_SOURCE_RULES}
 不要把画外播报员写进画面或要求她出镜。不要凭空生成伴随新声源的无关人物、服装、场景或道具。
 additions 每项含 id、kind、name、prompt、character_id、voice_only、audition_speaker、audition_text、audition_reason、audition_source。
 非 voice 的 character_id、audition_speaker 和三个 audition 字段为空；voice.audition_speaker 写原文说话归属，例如“系统”，不是新取的展示名。
@@ -431,8 +457,9 @@ continuity_notes 注明新播报规则覆盖旧内部镜头里相冲突的无配
 instruction 说明复用同一已审批声线、逐字播本次原文系统内容、画外播报、保持其他对白、无配乐和不额外生成字幕。
 为尚未生成且出现该系统框的后续片段添加同一逻辑声源和 voice 引用、具体内容；不能把所有无系统框的片段都塞入播报。
 已有 audio_policy 未被用户要求修改时原样保留；尚未设置且本次无相关要求时 enabled=false，其余三字段空字符串。
-summary 简洁说明新增或复用什么、先回到资产人工确认再返修；blockers=[] 表示没有已知规划阻塞，不表示批准。
-needs_assets 必须与 additions 是否非空一致。所有候选均待人工审批，不能宣称已生成、已听过、已通过或保证一致性。""",
+summary 简洁说明新增或复用什么、先回到资产人工确认再返修；只需用户选择、试听和审批真正的声音，不要求另批内部画外角色定义。
+blockers=[] 表示没有已知规划阻塞，不表示批准。needs_assets 必须与 additions 是否非空一致。
+实际资产候选均待人工审批；后台内部声源不参与独立审批，不能宣称已生成、已听过、已人工通过或保证一致性。""",
                             {"shot": shot, "context": context, "feedback": feedback}, REVISION_SCHEMA)
         _validate(result, REVISION_SCHEMA)
         return self._validate_revision(result, shot, context)
@@ -617,7 +644,8 @@ accepted_deviations 保留该版本原报告的疑点，用户接受版本不等
 context.audio_policy.system_broadcast.enabled=true 时，系统/任务框按项目规则使用同一已批准声源播报。
 以该规则和本次明确人工意见为准，删除旧 prompt 中“系统无配音”“不念任务框”“系统仅显示不播音”等冲突要求；
 旧 subshots 中相冲突的声音禁令已被新规则覆盖，不能借保持原时间表再次取消播报。切点、动作和时长仍保持不变。
-voice_only=true 的 character 是仅画外声源，不出镜、没有形象参考，也不要求生成或上传人物图。
+voice_only=true 的 character 是后台内部画外声源，不出镜、没有形象参考，也不要求生成或上传人物图；
+内部登记不是独立资产候选或人工批准，用户只需选择、试听和审批对应真正的 voice 声音。
 把原文系统文字播报与另行生成字幕区分：不生成额外画面字幕不等于禁止读出剧情中系统/任务框内容。
 本段确有系统框且已在资产引用中包含 policy.voice_id 时，按 audio_references 的真实编号使用该声线，
 逐字保留 shot.dialogue 里批准的播报内容及归属；不把其他角色台词交给播报员，不加未规划播报，不省略原角色对白。

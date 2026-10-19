@@ -236,20 +236,66 @@ def _public_prompt_candidate(value):
         references["previous_actual"] = _pick(previous, ("shot_id", "reference_mode", "same_scene"))
     assets = context.get("assets")
     if isinstance(assets, list):
-        references["assets"] = [_pick(asset, ("id", "kind", "name", "version", "voice_only"))
-                                for asset in assets[:100] if isinstance(asset, dict)]
+        from .core import is_internal_voice_source
+        internal_ids = {asset.get("id") for asset in assets if isinstance(asset, dict) and is_internal_voice_source(asset)}
+        references["assets"] = []
+        for asset in assets[:100]:
+            if not isinstance(asset, dict) or is_internal_voice_source(asset):
+                continue
+            item = _pick(asset, ("id", "kind", "name", "version"))
+            source = _public_voice_source(asset, assets)
+            if source:
+                item["voice_source"] = source
+            references["assets"].append(item)
+        references["image_references"] = [row for row in references.get("image_references", [])
+                                           if row.get("asset_id") not in internal_ids]
     result["reference_manifest"] = references
     return result
 
 
-def _public_asset_amendment(value):
+def _public_voice_source(asset, assets, audio_policy=None):
+    """An offscreen source is descriptive voice metadata, never an approval card."""
+    from .core import is_internal_voice_source
+    if asset.get("kind") != "voice":
+        return None
+    source = next((item for item in assets if isinstance(item, dict)
+                   and item.get("id") == asset.get("character_id") and is_internal_voice_source(item)), None)
+    if source is None:
+        return None
+    from .failures import sanitize_failure
+    safe = sanitize_failure({"message": source.get("name") or "画外播报声源",
+                             "provider_message": source.get("prompt", "")})
+    result = {"name": safe["message"], "description": safe.get("provider_message", ""), "offscreen": True}
+    broadcast = audio_policy.get("system_broadcast") if isinstance(audio_policy, dict) else None
+    result["purpose"] = "系统通知与任务播报" if isinstance(broadcast, dict) and broadcast.get("voice_id") == asset.get("id") else "画外播报"
+    return result
+
+
+def _public_asset_amendment(value, state=None):
     if not isinstance(value, dict) or value.get("status") != "candidate":
         return None
     result = _pick(value, ("id", "status", "target_shot_id", "target_version", "feedback", "created_at"))
-    result["additions"] = [_pick(asset, ("id", "kind", "name", "prompt", "voice_only", "character_id", "audition_text", "audition_reason"))
-                           for asset in value.get("additions", []) if isinstance(asset, dict)]
-    result["shot_updates"] = [_pick(shot, ("id", "add_asset_ids", "prompt", "dialogue", "continuity_notes"))
-                              for shot in value.get("shot_updates", []) if isinstance(shot, dict)]
+    from .core import is_internal_voice_source
+    state = state if isinstance(state, dict) else {}
+    additions = [asset for asset in value.get("additions", []) if isinstance(asset, dict)]
+    assets = list(state.get("assets", [])) + additions
+    internal_ids = {asset.get("id") for asset in assets if is_internal_voice_source(asset)}
+    result["additions"] = []
+    for asset in additions:
+        if is_internal_voice_source(asset):
+            continue
+        item = _pick(asset, ("id", "kind", "name", "prompt", "character_id", "audition_text", "audition_reason"))
+        source = _public_voice_source(asset, assets, value.get("audio_policy", state.get("audio_policy")))
+        if source:
+            item["voice_source"] = source
+        result["additions"].append(item)
+    result["shot_updates"] = []
+    for shot in value.get("shot_updates", []):
+        if isinstance(shot, dict):
+            item = _pick(shot, ("id", "add_asset_ids", "prompt", "dialogue", "continuity_notes"))
+            if isinstance(item.get("add_asset_ids"), list):
+                item["add_asset_ids"] = [identifier for identifier in item["add_asset_ids"] if identifier not in internal_ids]
+            result["shot_updates"].append(item)
     audio_policy = value.get("audio_policy")
     broadcast = audio_policy.get("system_broadcast") if isinstance(audio_policy, dict) else None
     if isinstance(broadcast, dict):
@@ -469,8 +515,14 @@ def public_state(state: dict) -> dict:
     from .progress import episode_progress
     from .core import now
     result["assets"] = []
+    from .core import is_internal_voice_source
     for asset in state.get("assets", []):
+        if is_internal_voice_source(asset):
+            continue
         item = _pick(asset, ("id", "kind", "name", "prompt", "status", "version", "file", "audio_file", "feedback", "audition_profile", "voice_only", "character_id"))
+        source = _public_voice_source(asset, state.get("assets", []), state.get("audio_policy"))
+        if source:
+            item["voice_source"] = source
         data = input_state(asset)
         item["creation_input"] = _pick(data, ("mode", "description", "revision", "confirmed"))
         item["creation_input"]["references"] = [_pick(ref, ("id", "file", "mime", "bytes")) for ref in data.get("references", [])]
@@ -482,7 +534,7 @@ def public_state(state: dict) -> dict:
             item.update(_public_asset_failure(state, asset))
         result["assets"].append(item)
     result["asset_amendments"] = [candidate for value in state.get("asset_amendments", [])
-                                  if (candidate := _public_asset_amendment(value)) is not None]
+                                  if (candidate := _public_asset_amendment(value, state)) is not None]
     episodes = []
     stamp = now()
     for episode in state.get("episodes", []):
@@ -656,11 +708,13 @@ class _Context:
         return True
 
     def launch(self) -> bool:
+        from .core import is_internal_voice_source
         with self.lock:
             if self.running:
                 return False
             state = _core().load_project(self.project_dir)
-            if any(asset.get("status") == "generation_failed" for asset in state.get("assets", [])):
+            if any(asset.get("status") == "generation_failed" and not is_internal_voice_source(asset)
+                   for asset in state.get("assets", [])):
                 raise ValueError("请先查看资产失败原因，并明确提出重试意见。")
             if any(isinstance(episode.get("segment_proposal"), dict)
                    and episode["segment_proposal"].get("status") == "candidate"

@@ -136,10 +136,10 @@ class DashboardPromptGateTests(unittest.TestCase):
         status, result = self.request("GET", "/api/state")
         self.assertEqual(status, 200)
         self.assertEqual(result["episodes"][0]["progress"]["stage"], "awaiting_asset_amendment")
-        self.assertTrue(result["asset_amendments"][0]["additions"][0]["voice_only"])
         public = result["asset_amendments"][0]
-        self.assertEqual(public["additions"][1]["audition_text"], "系统绑定成功。")
-        self.assertEqual(public["additions"][1]["audition_reason"], "原文中平稳完整的系统播报。")
+        self.assertEqual([a["id"] for a in public["additions"]], ["voice"])
+        self.assertEqual(public["additions"][0]["audition_text"], "系统绑定成功。")
+        self.assertEqual(public["additions"][0]["audition_reason"], "原文中平稳完整的系统播报。")
         self.assertEqual(public["audio_policy"], {"system_broadcast": {"enabled": True,
             "character_id": "host", "voice_id": "voice", "instruction": "每次系统任务框出现时，用同一女声播报。"}})
         self.assertNotIn("SECRET-", json.dumps(result))
@@ -151,16 +151,11 @@ class DashboardPromptGateTests(unittest.TestCase):
         self.assertEqual(self.request("POST", payload={"action": "asset_amendment", "id": "add-voice",
                                                       "decision": True})[0], 409)
 
-    def test_voice_only_character_needs_definition_approval_without_image_intake(self):
+    def test_internal_voice_source_is_not_exposed_as_reviewable_asset(self):
         self.state["assets"] = [{"id": "host", "kind": "character", "voice_only": True, "name": "系统播报员",
                                  "prompt": "不入画的系统女声。", "version": 1, "status": "candidate"}]
         _, result = self.request("GET", "/api/state")
-        asset = result["assets"][0]
-        self.assertTrue(asset["voice_only"])
-        self.assertFalse(asset["input_editable"])
-        self.assertFalse(asset["input_required"])
-        self.assertEqual(asset["status"], "candidate")
-        self.assertNotIn("file", asset)
+        self.assertEqual(result["assets"], [])
 
 
 @unittest.skipUnless(shutil.which("node"), "Node.js required for pure DOM rendering test")

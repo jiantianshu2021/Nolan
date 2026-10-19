@@ -55,6 +55,8 @@ def summary(s):
     p = s["plan"]
     rows.append(f"规划 v{p['version']}：{STATUS.get(p['status'],p['status'])}")
     for a in s["assets"]:
+        if core.is_internal_voice_source(a):
+            continue
         rows.append(f"  资产 {a['id']} · {a['name']} · v{a['version']} · {STATUS.get(a['status'],a['status'])}")
     for ep in s["episodes"]:
         rows.append(f"  {ep['id']} · {ep['title']} · v{ep['version']} · {STATUS.get(ep['status'],ep['status'])}")
@@ -79,7 +81,7 @@ def summary(s):
 def preview(root, kind="", item_id=""):
     s = core.load_project(root)
     if kind == "plan":
-        print(json.dumps({"plan": s["plan"], "assets": s["assets"], "episodes": s["episodes"]}, ensure_ascii=False, indent=2))
+        print(json.dumps({"plan": s["plan"], "assets": [a for a in s["assets"] if not core.is_internal_voice_source(a)], "episodes": s["episodes"]}, ensure_ascii=False, indent=2))
         return
     if item_id:
         items = [core._find(s, kind, item_id)]
@@ -92,6 +94,8 @@ def preview(root, kind="", item_id=""):
     if not items:
         raise ValueError("当前没有可预览的候选素材或成片")
     for item in items:
+        if core.is_internal_voice_source(item):
+            raise ValueError("此记录是声音的内部用途绑定；请预览对应声音资产，试听后再审批音色。")
         if not item.get("file"):
             raise ValueError(f"{item['id']} 当前尚未生成可预览文件，请先查看制作进度")
         path = core.safe_path(root, item["file"])

@@ -30,6 +30,8 @@ def context(s):
     items = [{"kind": "plan", "id": "plan", **s["plan"]}]
     for kind, collection in (("asset", s["assets"]), ("episode", s["episodes"])):
         for item in collection:
+            if kind == "asset" and core.is_internal_voice_source(item):
+                continue
             items.append({"kind": kind, **{k: item.get(k) for k in ("id", "name", "title", "status", "version")}})
             if kind == "episode":
                 items.extend({"kind": "shot", "episode": item["id"], **{k: sh.get(k) for k in

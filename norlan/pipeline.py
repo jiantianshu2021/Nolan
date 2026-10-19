@@ -413,21 +413,19 @@ def _asset_generation_failed(root, asset_id):
 
 def _assets(root):
     s = _gate(root)
+    core.normalize_voice_sources(root, already_locked=True)
+    s = _gate(root)
     from .asset_inputs import pending_assets, reference_paths, compose_prompt
     waiting_for_input = bool(pending_assets(s))
     for original in s["assets"]:
         s = _gate(root)
         asset = core._find(s, "asset", original["id"])
-        if asset["status"] in {"approved", "candidate"}:
+        if core.is_internal_voice_source(asset):
+            if not core.asset_ready(asset):
+                raise core.GateError("内部画外声源定义尚未登记，不能生成声音")
+            core._check_artifact(root, asset)
             continue
-        if asset.get("kind") == "character" and asset.get("voice_only") is True:
-            # Voice-source definitions are not portraits. They receive a human
-            # definition decision; no image/video call can create that decision.
-            definition = dict(asset)
-            if asset.get("feedback", "").strip():
-                definition["prompt"] = asset["prompt"] + "\n本次声源定义修改：" + asset["feedback"].strip()
-            _save_asset(root, asset["id"], prompt=definition["prompt"], status="candidate",
-                        version=asset.get("version", 0) + 1, sha256=core.voice_only_digest(definition))
+        if asset["status"] in {"approved", "candidate"}:
             continue
         active_job = s["jobs"].get(asset.get("job_id", ""))
         if active_job and active_job.get("state") == "failed" and asset["status"] != "rejected":
@@ -440,7 +438,7 @@ def _assets(root):
             continue
         if asset["kind"] == "voice" and not recovering:
             # A voice audition must use approved visual identity references.
-            if any(a["status"] != "approved" for a in s["assets"] if a["kind"] != "voice"):
+            if any(not core.asset_ready(a) for a in s["assets"] if a["kind"] != "voice"):
                 continue
         if not recovering:
             _new_work_gate(s)
@@ -470,8 +468,8 @@ def _assets(root):
         prompt = compose_prompt(asset, s['plan'].get('style', ''))
         if asset["kind"] == "voice":
             character = next((a for a in s["assets"] if a["id"] == asset.get("character_id") and a["kind"] == "character"), None)
-            if character is None or character["status"] != "approved":
-                raise core.GateError("声音试音必须绑定一个已批准的角色，不能猜测说话人")
+            if character is None or not core.asset_ready(character):
+                raise core.GateError("声音试音必须绑定已批准的可见角色或已登记的内部声源，不能猜测说话人")
             core._check_artifact(root, character)
             images = [] if character.get("voice_only") is True else [core.safe_path(root, character["file"])]
             voice_asset = {**asset, "prompt": compose_prompt(asset), "voice_only": character.get("voice_only") is True}
@@ -530,7 +528,7 @@ def _assets(root):
     if pending_assets(s):
         _set(root, status="awaiting_asset_input")
         return False
-    if any(a["status"] != "approved" for a in s["assets"]):
+    if any(not core.asset_ready(a) for a in s["assets"]):
         _set(root, status="awaiting_assets")
         return False
     for asset in s["assets"]:
@@ -543,7 +541,7 @@ def _shot_context(root, ep, shot, previous):
     assets = [a for a in s["assets"] if a["id"] in shot["asset_ids"]]
     images, voices, image_manifest, voice_manifest = [], [], [], []
     for asset in assets:
-        if asset["status"] != "approved":
+        if not core.asset_ready(asset):
             raise core.GateError("镜头引用的资产尚未批准")
         core._check_artifact(root, asset)
         if asset["kind"] == "voice":
@@ -718,8 +716,8 @@ def _system_voice_reference(root, shot):
     required = [policy.get("character_id"), policy.get("voice_id")]
     for identifier in required:
         asset = core._find(state, "asset", identifier)
-        if asset["status"] != "approved":
-            raise core.GateError("固定系统播报声源尚未人工批准，不能继续准备片段。")
+        if not core.asset_ready(asset):
+            raise core.GateError("固定系统播报的内部声源未登记或声音尚未人工批准，不能继续准备片段。")
         core._check_artifact(root, asset)
     if not set(required) <= set(shot["asset_ids"]):
         _save_shot(root, shot["id"], asset_ids=list(dict.fromkeys(shot["asset_ids"] + required)))

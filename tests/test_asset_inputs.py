@@ -43,6 +43,20 @@ class AssetInputTests(unittest.TestCase):
         self.assertEqual([a["id"] for a in asset_inputs.pending_assets(state)], ["hero", "station"])
         self.assertEqual(state["assets"][0]["creation_input"], asset_inputs.empty_input())
 
+    def test_internal_voice_binding_never_requires_creation_input_or_bulk_confirmation(self):
+        with core.transaction(self.root) as state:
+            state["assets"].append({"id": "system-source", "kind": "character", "name": "系统声源",
+                "prompt": "不入画的通知播报用途", "voice_only": True, "status": "planned", "version": 0,
+                "creation_input": asset_inputs.empty_input()})
+        before = self.asset("system-source")
+        self.assertEqual([a["id"] for a in asset_inputs.pending_assets(core.load_project(self.root))],
+                         ["hero", "station"])
+        state = core.set_remaining_asset_inputs_gpt(self.root, 1)
+        self.assertEqual(core._find(state, "asset", "system-source"), before)
+        with self.assertRaises(core.GateError):
+            core.set_asset_input(self.root, "system-source", 0, 0, "gpt", "")
+        self.assertEqual(core.load_project(self.root)["jobs"], {})
+
     def test_all_inputs_require_current_approved_plan(self):
         state = core.install_plan(self.root, pipeline.demo_plan())
         mutations = [lambda: core.set_asset_input(self.root, "hero", 0, 0, "gpt", ""),
