@@ -930,6 +930,139 @@ def reject(root, kind, item_id, version, feedback, shot_ids=None):
     return load_project(root)
 
 
+def resolve_completed_asset_feedback(root, shot_id):
+    """Consume only a proven, completed machine asset-rejection cascade.
+
+    The production runner already owns run_lock. This bookkeeping operation
+    never approves media, changes an attempted video, or interprets human prose.
+    Unknown, mixed or newly submitted shot instructions remain untouched.
+    """
+    with transaction(root) as state:
+        shot = _find(state, "shot", shot_id)
+        if (shot.get("status") != "planned" or type(shot.get("version", 0)) is not int
+                or shot.get("version", 0) != 0 or shot.get("file") or shot.get("job_id")
+                or shot.get("attempts") or shot.get("prompt_approval")
+                or any(job.get("kind") == "video" and job.get("item_id") == shot_id
+                       for job in state.get("jobs", {}).values())):
+            return False
+        feedback = shot.get("feedback")
+        if not isinstance(feedback, str) or not feedback:
+            return False
+        events = state.get("events", [])
+        assets = {asset["id"]: asset for asset in state["assets"]}
+        latest = {}
+        for index, record in enumerate(events):
+            if (record.get("action") == "human_rejected" and record.get("kind") == "asset"
+                    and isinstance(record.get("feedback"), str) and record["feedback"]):
+                latest[(record.get("id"), record["feedback"])] = (index, record)
+        proofs = {}
+        for (asset_id, original), (index, rejected) in latest.items():
+            machine_text = "资产变更：" + original
+            asset = assets.get(asset_id, {})
+            version, rejected_version = asset.get("version"), rejected.get("version")
+            sha = asset.get("sha256")
+            approved = None
+            if (asset.get("status") == "approved" and type(version) is int
+                    and type(rejected_version) is int and version > rejected_version
+                    and isinstance(sha, str) and sha and sha == asset.get("approved_sha256")):
+                approved = next(((position, record) for position, record in reversed(list(enumerate(events)))
+                    if position > index and record.get("action") == "human_approved"
+                    and record.get("kind") == "asset" and record.get("id") == asset_id
+                    and record.get("version") == version and record.get("sha256") == sha), None)
+                if approved:
+                    try:
+                        _check_artifact(root, asset)
+                    except (GateError, ValueError, OSError):
+                        approved = None
+            # Identical prose can belong to several assets. Every matching
+            # latest rejection must be resolved; never guess which one it was.
+            proofs.setdefault(machine_text, []).append(None if not approved else {
+                "asset_id": asset_id, "version": version, "sha256": sha,
+                "rejected_event_index": index, "rejected_event": copy.deepcopy(rejected),
+                "approved_event_index": approved[0], "approved_event": copy.deepcopy(approved[1])})
+        resolved = {text: proof for text, proof in proofs.items() if proof and all(proof)}
+        instructions = shot.get("source_shot_instructions", [])
+        if not isinstance(instructions, list) or any(not isinstance(value, dict) for value in instructions):
+            return False
+        source_ids = set(value for value in shot.get("source_shot_ids", []) if isinstance(value, str))
+        source_ids.update(value["id"] for value in instructions if isinstance(value.get("id"), str))
+        variants = {text: (None, text) for text in resolved}
+        variants.update({f"{source_id}：{text}": (source_id, text)
+                         for source_id in source_ids for text in resolved})
+        # Match complete original records, including any embedded newlines.
+        paths, pending = {0: []}, [0]
+        while pending and len(feedback) not in paths:
+            start = pending.pop()
+            for text, token in variants.items():
+                end = start + len(text)
+                if feedback.startswith(text, start) and (end == len(feedback) or feedback[end:end + 1] == "\n"):
+                    next_start = end if end == len(feedback) else end + 1
+                    if next_start not in paths:
+                        paths[next_start] = paths[start] + [token]
+                        pending.append(next_start)
+        matched = paths.get(len(feedback))
+        if not matched:
+            return False
+        proof = [record for _, text in matched for record in resolved[text]]
+        first_rejection = min(record["rejected_event_index"] for record in proof)
+        protected_ids = source_ids | {shot_id}
+        owner = next(ep for ep in state["episodes"] if shot in ep["shots"])
+        for record in events[first_rejection + 1:]:
+            direct = record.get("id") in protected_ids
+            if ((direct and record.get("action") in {"human_planning_feedback", "human_rejected_prompt"})
+                    or (record.get("action") == "human_rejected" and (
+                        (record.get("kind") == "shot" and direct)
+                        or (record.get("kind") == "episode" and record.get("id") == owner["id"]
+                            and (not record.get("shot_ids") or protected_ids.intersection(record["shot_ids"])))))):
+                return False
+        subshots = copy.deepcopy(shot.get("subshots", []))
+        for instruction in instructions:
+            original = instruction.get("feedback", "")
+            if not original:
+                continue
+            source_id = instruction.get("id")
+            if original not in resolved or (source_id, original) not in matched:
+                return False
+            pattern = re.compile(r"\n原生成片段 " + re.escape(source_id)
+                + r" 的返工意见（仅适用于本生成片段 (\d+(?:\.\d+)?)–(\d+(?:\.\d+)?) 秒的来源段；"
+                  r"覆盖该来源段的内部镜头，保留各句对白的归属，不作为每镜新增对白）：\n"
+                + re.escape(original) + r"\Z")
+            found = []
+            for index, subshot in enumerate(subshots):
+                match = pattern.search(subshot.get("prompt", ""))
+                if match and 0 <= float(match[1]) < float(match[2]) <= shot["duration"]:
+                    found.append((index, match.start()))
+            if len(found) != 1:
+                return False
+            index, boundary = found[0]
+            if not subshots[index]["prompt"][:boundary].strip():
+                return False
+            subshots[index]["prompt"] = subshots[index]["prompt"][:boundary]
+        stamp = now()
+        archive = {"resolved_at": stamp, "feedback": feedback, "proof": proof,
+            "subshots": copy.deepcopy(shot.get("subshots")),
+            "source_shot_instructions": copy.deepcopy(shot.get("source_shot_instructions")),
+            "revision_analysis": copy.deepcopy(shot.get("revision_analysis"))}
+        shot.setdefault("resolved_asset_feedback_history", []).append(archive)
+        if "subshots" in shot:
+            shot["subshots"] = subshots
+        for instruction in instructions:
+            instruction["feedback"] = ""
+        analysis = shot.pop("revision_analysis", None)
+        if analysis:
+            shot.setdefault("revision_analysis_history", []).append({**copy.deepcopy(analysis),
+                "superseded_at": stamp, "resolution": "completed_asset_feedback"})
+        candidate = shot.pop("prompt_candidate", None)
+        if candidate:
+            shot.setdefault("prompt_history", []).append({**copy.deepcopy(candidate), "status": "invalidated",
+                "invalidation_reason": "已批准的新资产完成原资产返工；重新准备完整提示词"})
+        shot.pop("refined_prompt", None)
+        shot["feedback"] = ""
+        event(state, "completed_asset_feedback_resolved", id=shot_id,
+              asset_ids=list(dict.fromkeys(record["asset_id"] for record in proof)))
+    return True
+
+
 def request_caption_fix(root, item_id, version, feedback):
     """A subtitle-only edit preserves the generated picture and sound."""
     if not isinstance(feedback, str) or not feedback.strip():

@@ -962,6 +962,8 @@ def _shot(root, ep_id, shot_id, previous):
     if not recovering:
         _new_work_gate(s)
         shot = _system_voice_reference(root, shot)
+        if core.resolve_completed_asset_feedback(root, shot_id):
+            shot = core._find(core.load_project(root), "shot", shot_id)
         _progress(root, ep_id, "shot_preparation", shot_id)
         if not _revision_analysis(root, shot):
             return False
