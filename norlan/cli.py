@@ -144,6 +144,11 @@ def main(argv=None):
     music_login = sub.add_parser("music-login", help="隐藏输入火山音乐AK/SK并启动Nolan，仅保留在本次进程")
     music_login.add_argument("project", type=Path, nargs="?")
     music_login.add_argument("--resume", action="store_true", dest="music_resume")
+    music_folder = sub.add_parser("music-folder", help="注册本地音乐文件夹；可扫描新曲目供本人试听审批，无需音乐 API")
+    music_folder.add_argument("project", type=Path)
+    music_folder.add_argument("folder", type=Path, nargs="?", help="本地音乐目录；省略则沿用项目已保存的目录")
+    music_folder.add_argument("--scan", action="store_true", help="把新音频复制到项目曲库，不自动审批或开始制作")
+    music_folder.add_argument("--json", action="store_true", help="输出扫描结果或目录配置 JSON")
     setup_parser = sub.add_parser("setup", help="选择 ChatGPT 订阅或 OpenAI API 连接")
     setup_parser.add_argument("--provider", choices=["chatgpt", "openai"])
     setup_parser.add_argument("--model", help="明确指定模型 ID；API 模式必填")
@@ -224,6 +229,30 @@ def main(argv=None):
         if args.command == "doctor":
             return doctor()
         root = args.project.expanduser().resolve()
+        if args.command == "music-folder":
+            from .music_folder import MusicFolderError
+            if not args.folder and not args.scan:
+                raise MusicFolderError("请提供本地音乐文件夹，或使用 --scan 扫描已保存的目录。")
+            if args.scan:
+                result = core.scan_music_folder(root, args.folder)
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                else:
+                    print(f"音乐目录：{result['folder']}")
+                    print(f"新增候选 {len(result['imported'])} 首，重复跳过 {result['duplicates']} 首，无法导入 {len(result['skipped'])} 项。")
+                    print("新候选需在审片室试听确认；本次未生成视频、未调用付费音乐服务。")
+                    for failure in result["skipped"]:
+                        print(failure["name"] + "：" + failure["reason"], file=sys.stderr)
+            else:
+                state = core.configure_music_folder(root, args.folder)
+                result = {"mode": "library", "folder": state["settings"]["music"]["folder"]}
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                else:
+                    print("已登记本地音乐目录：" + result["folder"])
+                    print("运行同一命令并加 --scan，或在审片室扫描曲库。音乐首次需本人试听确认。")
+            remember(root)
+            return 0
         if args.command == "costs":
             from .costs import cost_report, format_report, sync_usage
             if args.confirm_no_video_input and not args.sync:

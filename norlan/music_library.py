@@ -228,8 +228,71 @@ def approved_tracks(library: dict, *, project: Path | None = None) -> list[dict]
         # arrangement method's 20k context limit, leaving room for the episode.
         item.update(title=str(track.get("title", ""))[:120],
                     prompt=str(track.get("prompt", ""))[:480])
+        editorial = track.get("provenance", {}).get("editorial", {})
+        if isinstance(editorial, dict):
+            tags = editorial.get("moods", [])
+            if isinstance(tags, list):
+                item["tags"] = [tag[:24] for tag in tags if isinstance(tag, str)][:8]
         result.append(item)
     return result
+
+
+def select_catalog(catalog: list[dict], context: str, *, preferred_ids=(), previous_ids=(), limit=12) -> list[dict]:
+    """Shortlist approved metadata locally; GPT never receives a whole folder.
+
+    Matching descriptions is editorial assistance, not analysis of the waveform.
+    Exact IDs used by the previous episode remain eligible for theme continuity.
+    """
+    if type(limit) is not int or not 1 <= limit <= 12 or not isinstance(context, str):
+        raise MusicLibraryError("音乐目录选择参数无效。")
+    terms = ("悬疑", "紧张", "危机", "工业", "科技", "系统", "动作", "战斗", "追逐", "节奏", "冷静", "低沉",
+             "温暖", "情感", "悲伤", "希望", "励志", "胜利", "轻松", "幽默", "神秘", "压迫", "反转")
+    wanted = {word for word in terms if word in context}
+    preferred_ids, previous_ids = set(preferred_ids), set(previous_ids)
+    ranked = []
+    for index, track in enumerate(catalog):
+        text = " ".join((str(track.get("title", "")), str(track.get("prompt", "")), " ".join(track.get("tags", []))))
+        score = sum(3 for term in wanted if term in text)
+        score += 10000 if track["id"] in preferred_ids else 0
+        score += 4 if track["id"] in previous_ids else 0
+        ranked.append((-score, index, track))
+    return [dict(row[2]) for row in sorted(ranked, key=lambda row: row[:2])[:limit]]
+
+
+def write_music_credits(plan: dict, library: dict, output: Path, *, project: Path) -> dict:
+    """Publish attribution for only the cues actually used, alongside the film."""
+    project = Path(project).resolve()
+    output = Path(output).resolve()
+    if not output.is_relative_to(project / "exports") or output.suffix != ".txt":
+        raise MusicLibraryError("配乐署名说明必须保存在本集导出目录内。")
+    ids = list(dict.fromkeys(cue["track_id"] for cue in plan["cues"]))
+    lines = ["本集配乐署名与来源", "", "处理说明：本集使用下列音乐的剪辑片段，并调整音量、淡入淡出和混音。",
+             "发布本集时请保留需要署名的作者、曲名、来源与许可链接（可放在发布说明中）。", ""]
+    for number, tid in enumerate(ids, 1):
+        track = _find(library, tid)
+        _verify(track, approval=True, project=project)
+        source = track.get("provenance", {})
+        license = source.get("license", {})
+        license = license if isinstance(license, dict) else {"name": str(license)}
+        lines.extend([f"{number}. {track['title']}", "作者：" + str(source.get("author") or "用户提供，未登记作者"),
+                      "来源：" + str(source.get("source_url") or "本地音乐文件"),
+                      "许可：" + str(license.get("name") or "用户提供，许可信息尚未登记")])
+        if license.get("url"):
+            lines.append("许可链接：" + str(license["url"]))
+        if source.get("attribution"):
+            lines.append("署名文本：" + str(source["attribution"]))
+        lines.append("")
+    data = ("\n".join(lines) + "\n").encode("utf-8")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        if output.read_bytes() != data:
+            raise MusicLibraryError("已有配乐署名文件与本版内容不一致，没有覆盖。")
+    else:
+        with tempfile.TemporaryDirectory(prefix=".music-credits-", dir=output.parent) as raw:
+            temporary = Path(raw) / "credits.txt"
+            temporary.write_bytes(data)
+            os.link(temporary, output)
+    return {"file": str(output), "sha256": _digest(output), "track_ids": ids}
 
 
 def validate_cue_plan(plan: dict, library: dict, duration: float,

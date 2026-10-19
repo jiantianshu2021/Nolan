@@ -209,7 +209,8 @@ def create_project(root, novel: str, mode="demo", title="Nolan 漫剧"):
             "caps": {"image": 0, "video_second": 0, "llm": 0},
             "max_attempts": 3, "max_llm_calls": 80, "batch_size": 3,
             "poll_seconds": 10, "max_poll_seconds": 1800,
-            "music": {}, "subtitles": {"mode": "local" if mode == "live" else "none", "call_cap": 0},
+            "music": {"mode": "library"} if mode == "live" else {},
+            "subtitles": {"mode": "local" if mode == "live" else "none", "call_cap": 0},
             "postproduction": {"enabled": mode == "live"},
             "creative_brief": "", "require_voice_reference": True,
         },
@@ -1115,6 +1116,18 @@ def reject_music(root, track_id, version, sha256, feedback):
 def request_music_generation(root, episode_id, version):
     from .episode_post import request_generation
     return request_generation(root, episode_id, version)
+
+
+def configure_music_folder(root, folder):
+    """Register a local, read-only source folder without running production."""
+    from .music_folder import configure_folder
+    return configure_folder(root, folder)
+
+
+def scan_music_folder(root, folder=None):
+    """Import previously unseen audio bytes as unapproved music candidates."""
+    from .music_folder import scan_folder
+    return scan_folder(root, folder)
 
 
 def _amendment_idle(state):

@@ -69,7 +69,7 @@ MUSIC_INPUT_ERRORS = frozenset({
     "音乐上传数据无效。", "音乐上传不能为空，且不能超过 30 MB。",
     "试听的音乐版本已更新，请刷新并试听当前版本。", "试听的音乐版本已更新，请刷新后再提交意见。",
 })
-MEDIA_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".m4v", ".mov", ".webm", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".srt", ".vtt"})
+MEDIA_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".m4v", ".mov", ".webm", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".srt", ".vtt", ".txt"})
 
 
 def _core():
@@ -693,7 +693,7 @@ def _public_music_library(state: dict) -> dict:
     """Music is auditionable media; provider responses and credentials stay local."""
     library = state.get("music_library", {})
     if not isinstance(library, dict):
-        return {"tracks": []}
+        library = {}
     tracks = []
     for track in library.get("tracks", []):
         if not isinstance(track, dict):
@@ -702,8 +702,42 @@ def _public_music_library(state: dict) -> dict:
         if not _valid_sha(item.get("sha256")) or not isinstance(item.get("file"), str):
             continue
         item["version"] = _version(item.get("version"))
+        metadata = track.get("metadata", {})
+        if isinstance(metadata, dict):
+            clean = {}
+            for key in ("source", "source_url", "author", "attribution", "license", "editorial", "source_metadata"):
+                value = metadata.get(key)
+                if isinstance(value, str):
+                    clean[key] = value[:4000]
+                elif key in {"license", "editorial", "source_metadata"} and isinstance(value, dict):
+                    clean[key] = {name: data[:2000] if isinstance(data, str) else [entry[:120] for entry in data]
+                                  if isinstance(data, list) else data for name, data in value.items()
+                                  if name in {"name", "url", "text", "spdx", "commercial_use", "adaptation", "attribution_required",
+                                              "moods", "uses", "notes", "tags", "energy", "instruments", "description",
+                                              "suggested_use", "avoid", "basis", "feel", "tempo_bpm", "isrc", "catalogue_length"}
+                                  and (isinstance(data, (str, bool)) or type(data) in {int, float} or isinstance(data, list)
+                                       and all(isinstance(entry, str) for entry in data) and len(data) <= 30)}
+            if clean:
+                item["metadata"] = clean
         tracks.append(item)
-    return {"tracks": tracks}
+    config = state.get("settings", {}).get("music", {})
+    result = {"tracks": tracks, "mode": config.get("mode", "")}
+    if isinstance(config.get("folder"), str):
+        result["folder"] = config["folder"][:4096]
+    scan = config.get("folder_scan")
+    if isinstance(scan, dict):
+        report = {"folder": str(scan.get("folder", ""))[:4096], "scanned_at": str(scan.get("scanned_at", ""))[:64]}
+        for key in ("duplicates", "total_candidates"):
+            count = scan.get(key)
+            report[key] = count if type(count) is int and count >= 0 else 0
+        report["imported"] = [_pick(row, ("id", "title", "version", "sha256", "status", "duration"))
+                              for row in scan.get("imported", []) if isinstance(row, dict)][:100]
+        from .failures import sanitize_failure
+        report["skipped"] = [{"name": str(row.get("name", ""))[:240],
+                              "reason": sanitize_failure({"message": str(row.get("reason", ""))[:1000]})["message"]}
+                             for row in scan.get("skipped", []) if isinstance(row, dict)][:100]
+        result["folder_scan"] = report
+    return result
 
 
 def _public_postproduction(state: dict, episode: dict) -> dict:
@@ -715,15 +749,25 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
     result = _pick(value, ("enabled", "status", "revision", "ready", "final_ready", "rough_file", "dry_file", "feedback"))
     from .core import human_approved_shot
     result["enabled"] = state.get("settings", {}).get("postproduction", {}).get("enabled") is True
+    library_mode = state.get("settings", {}).get("music", {}).get("mode") == "library"
     shots = episode.get("shots", [])
     result["ready"] = bool(shots) and all(human_approved_shot(shot) for shot in shots)
     result["final_ready"] = bool(value.get("final_ready") is True and episode.get("status") in {"awaiting_review", "approved"})
     result["missing_configuration"] = [sanitize_failure({"message": text})["message"] for text in value.get("missing_configuration", [])
                                         if isinstance(text, str) and len(text) <= 1000][:20]
+    if library_mode:
+        # Old provider setup notices are saved on the episode. Selecting a local
+        # folder makes only these music-service notices obsolete; ASR, GPT and
+        # actual folder errors still need to be shown.
+        obsolete_prefixes = ("自动生成音乐需配置火山纯音乐服务", "自动生成音乐需额外配置火山音乐服务",
+                             "未找到火山音乐AK/SK", "未找到火山音乐 AK/SK",
+                             "需要首次导入音乐并试听确认；自动生成音乐另需火山音乐")
+        result["missing_configuration"] = [message for message in result["missing_configuration"]
+                                             if not message.startswith(obsolete_prefixes)]
     for section in ("subtitles", "music"):
         source = value.get(section, {})
         source = source if isinstance(source, dict) else {}
-        item = _pick(source, ("status", "file", "engine", "summary", "feedback", "can_generate"))
+        item = _pick(source, ("status", "file", "engine", "summary", "feedback", "can_generate", "credits_file"))
         if source.get("error"):
             item["error"] = sanitize_failure({"message": str(source["error"])})["message"]
         if section == "subtitles":
@@ -739,11 +783,21 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
     if result["enabled"]:
         from .episode_post import music_configuration
         can_generate, _reason = music_configuration(state)
-        result["music"]["can_generate"] = bool(can_generate)
+        result["music"]["can_generate"] = bool(can_generate) and not library_mode
+    elif library_mode:
+        result["music"]["can_generate"] = False
     library = state.get("music_library", {})
     tracks = library.get("tracks", []) if isinstance(library, dict) else []
+    if library_mode and result["music"].get("status") in {None, "unconfigured", "pending", "waiting"}:
+        if any(isinstance(track, dict) and track.get("status") == "awaiting_approval" for track in tracks):
+            result["music"]["status"] = "awaiting_approval"
+        elif any(isinstance(track, dict) and track.get("status") == "approved" for track in tracks):
+            result["music"]["status"] = "library_ready"
     if result["enabled"] and not any(isinstance(track, dict) and track.get("status") in {"approved", "awaiting_approval"} for track in tracks):
-        result["missing_configuration"].append("需要首次导入音乐并试听确认；自动生成音乐另需火山音乐 AK/SK 和调用预算。")
+        if library_mode:
+            result["missing_configuration"].append("需要首次导入音乐并试听确认；本地曲库无需音乐 API 凭据，可先扫描音乐文件夹。")
+        else:
+            result["missing_configuration"].append("需要首次导入音乐并试听确认；自动生成音乐另需火山音乐 AK/SK 和调用预算。")
     return result
 
 
@@ -880,6 +934,17 @@ def public_state(state: dict) -> dict:
     return result
 
 
+def _music_credits_paths(state: dict) -> set[str]:
+    paths = set()
+    for episode in state.get("episodes", []):
+        post = episode.get("postproduction", {})
+        music = post.get("music", {}) if isinstance(post, dict) else {}
+        path = music.get("credits_file") if isinstance(music, dict) else None
+        if isinstance(path, str) and path.endswith(".credits.txt"):
+            paths.add(path)
+    return paths
+
+
 def _media_paths(state: dict) -> set[str]:
     paths = set()
     items = list(state.get("assets", [])) + list(state.get("episodes", []))
@@ -912,6 +977,7 @@ def _media_paths(state: dict) -> set[str]:
             value = post.get(section, {})
             if isinstance(value, dict) and isinstance(value.get("file"), str):
                 paths.add(value["file"])
+    paths.update(_music_credits_paths(state))
     return paths
 
 
@@ -923,6 +989,8 @@ def resolve_media(project_dir: Path, requested: str, state: dict) -> Path | None
     if any(part in {"", ".", ".."} for part in parts):
         return None
     if requested not in _media_paths(state) or Path(requested).suffix.lower() not in MEDIA_SUFFIXES:
+        return None
+    if Path(requested).suffix.lower() == ".txt" and requested not in _music_credits_paths(state):
         return None
     root = project_dir.resolve()
     path = root
@@ -1130,8 +1198,9 @@ class _Handler(BaseHTTPRequestHandler):
         size = path.stat().st_size
         start, end, status = 0, size - 1, 200
         headers = {"Accept-Ranges": "bytes"}
-        if path.suffix.lower() in {".srt", ".vtt"}:
-            headers["Content-Disposition"] = 'attachment; filename="subtitles' + path.suffix.lower() + '"'
+        if path.suffix.lower() in {".srt", ".vtt", ".txt"}:
+            filename = "music-credits.txt" if path.suffix.lower() == ".txt" else "subtitles" + path.suffix.lower()
+            headers["Content-Disposition"] = 'attachment; filename="' + filename + '"'
         requested = self.headers.get("Range")
         if requested:
             match = re.fullmatch(r"bytes=(\d*)-(\d*)", requested)
@@ -1192,6 +1261,16 @@ class _Handler(BaseHTTPRequestHandler):
                 raise ValueError
             action = data.get("action")
             with context.mutation_lock:
+                if path == "/api/action" and action == "music_folder_scan":
+                    if context.running or context.external_run_active():
+                        return self._error(409, "制作正在进行，请等待当前任务结束后再扫描音乐文件夹。")
+                    folder = data.get("folder")
+                    if (folder is not None and (not isinstance(folder, str) or not folder.strip()
+                                                or len(folder) > 4096 or "\x00" in folder)
+                            or set(data) - {"action", "folder"}):
+                        raise ValueError
+                    _core().scan_music_folder(context.project_dir, folder.strip() if folder is not None else None)
+                    return self._json(200, context.state())
                 if path == "/api/music-upload" or action in {"music_approve", "music_reject", "music_generate", "postproduction"}:
                     if context.running or context.external_run_active():
                         return self._error(409, "制作正在进行，请等待当前任务结束后再调整后期。")
@@ -1319,8 +1398,10 @@ class _Handler(BaseHTTPRequestHandler):
                     raise ValueError
             self._json(200, context.state())
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            from .music_folder import MusicFolderError
             message = str(exc)
-            self._error(409, message if message in INPUT_ERRORS or message in SEGMENT_ERRORS else "状态已变化或参数无效，请刷新后重试。")
+            self._error(409, message if isinstance(exc, MusicFolderError) or message in INPUT_ERRORS or message in SEGMENT_ERRORS
+                        else "状态已变化或参数无效，请刷新后重试。")
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:

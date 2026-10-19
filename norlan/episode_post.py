@@ -41,6 +41,8 @@ def _wait(root, eid, status, **values):
 def music_configuration(state):
     from .music import MusicProvider
     config = state["settings"].get("music", {})
+    if config.get("mode") == "library":
+        return False, "使用本地曲库，无需音乐API凭据。请添加音乐到配置文件夹、扫描并试听确认。"
     cap = config.get("call_cap", 0)
     if config.get("mode") != "volc" or type(cap) not in {int, float} or not math.isfinite(cap) or cap <= 0:
         return False, "自动生成音乐需配置火山纯音乐服务（独立AK/SK）及单次费用上限；也可直接导入本地音乐。"
@@ -218,8 +220,21 @@ def _captions(root, ep, dry, brain_call, gate):
 def _music(root, ep, duration, captions, brain_call, gate, soundtrack):
     from . import music_library as library_api
     state = gate(root)
+    if state["settings"].get("music", {}).get("mode") == "library":
+        from .music_folder import scan_folder_locked
+        scan_folder_locked(root)
+        state = gate(root)
     pp = _episode(root, ep["id"]).get("postproduction", {})
     can_generate, reason = music_configuration(state)
+    if state["settings"].get("music", {}).get("mode") == "library" and pp.get("music_generation_requested"):
+        old_job = state["jobs"].get(ep.get("music_job_id", ""))
+        if old_job and core.execution_unsettled(old_job):
+            _wait(root, ep["id"], "configuration_required", missing_configuration=[
+                "原音乐调用仍在途或结果待核实，请先核实原任务；切换本地曲库不会重发或改写原费用。"])
+            return None
+        _save(root, ep["id"], music_generation_requested=False,
+              music_generation_cancelled_for_library=core.now())
+        pp = _episode(root, ep["id"]).get("postproduction", {})
     if pp.get("music_generation_requested"):
         rejected = [t for t in state.get("music_library", {}).get("tracks", [])
                     if t.get("status") == "rejected" and t.get("provenance", {}).get("episode_id") == ep["id"]]
@@ -268,8 +283,10 @@ def _music(root, ep, duration, captions, brain_call, gate, soundtrack):
                  if any(t["id"] == tid for t in catalog)]
     if preferred:
         context["preferred_track_ids"] = preferred[-6:]
-        # A deliberately imported replacement must remain within the small catalog.
-        context["catalog"] = sorted(catalog, key=lambda t: t["id"] not in preferred)[:12]
+    previous_ids = [cue["track_id"] for cue in (previous or {}).get("ending_cues", [])]
+    context["catalog"] = library_api.select_catalog(catalog,
+        ep.get("summary", "")[:1000] + "\n" + ep.get("music_prompt", "")[:2200] + "\n" + pp.get("music_feedback", "")[:2000],
+        preferred_ids=preferred[-6:], previous_ids=previous_ids)
     key = _hash({"context": context, "policy": 1})
     music = pp.get("music", {})
     if pp.get("music_key") == key and music.get("status") == "ready":
@@ -343,6 +360,11 @@ def _finish(root, ep, *, brain_call, gate, soundtrack):
                            subtitles=captions, music=music, music_gain=1.0)
     if captions and not result.get("burned_subtitles"):
         raise core.GateError("字幕未能烧录：请安装带libass字幕滤镜的FFmpeg和中文字体；SRT和视频已保留")
+    post = _episode(root, ep["id"])["postproduction"]
+    from .music_library import write_music_credits
+    credits = write_music_credits(
+        {"cues": post["music"]["cues"]}, core.load_project(root)["music_library"],
+        out.with_suffix(".credits.txt"), project=root)
     with core.transaction(root) as state:
         current = core._find(state, "episode", ep["id"])
         # A late edit cannot be stamped into a manifest for another source.
@@ -351,6 +373,7 @@ def _finish(root, ep, *, brain_call, gate, soundtrack):
         pp = current["postproduction"]
         pp.update(status="awaiting_final_approval", final_ready=True, final_file=_rel(root, out),
                   final_sha256=core.digest(out), final_version=version, missing_configuration=[])
+        pp["music"].update(credits_file=_rel(root, credits["file"]), credits_sha256=credits["sha256"])
         pp["subtitles"]["file"] = _rel(root, result["subtitles"]) if result.get("subtitles") else None
         current.update(version=version, file=_rel(root, out), sha256=core.digest(out),
             status="awaiting_review", duration=result["duration"], subtitle_status="local_asr_subscription_proofread",
@@ -363,6 +386,7 @@ def _finish(root, ep, *, brain_call, gate, soundtrack):
                     "music_key": pp["music_key"], "music_sha256": pp["music"]["sha256"],
                     "music_fingerprint": pp["music"]["fingerprint"],
                     "subtitle_content_hash": _hash(captions),
+                    "credits_sha256": credits["sha256"],
                     "srt_sha256": core.digest(result["subtitles"]) if result.get("subtitles") else None,
                     "revision": pp.get("revision", 0)}})
         state.update(status="awaiting_episode_review", last_error=None)
@@ -399,3 +423,7 @@ def check_final(root, state, ep):
                             state["music_library"], pp["duration"], project=root)
     if plan["fingerprint"] != pp["music"].get("fingerprint") or plan["fingerprint"] != manifest.get("music_fingerprint"):
         raise core.GateError("本集配乐安排与导出工作轨不一致，请重新合成")
+    if manifest.get("credits_sha256") and (not pp["music"].get("credits_file")
+            or core.digest(core.safe_path(root, pp["music"]["credits_file"])) != manifest.get("credits_sha256")
+            or pp["music"].get("credits_sha256") != manifest.get("credits_sha256")):
+        raise core.GateError("本集配乐署名文件已变化，请重新合成")

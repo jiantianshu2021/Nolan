@@ -1,0 +1,62 @@
+# 本地音乐文件夹
+
+Nolan 可以使用已经下载的本地配乐，不需要开通音乐生成服务，也不需要 AK/SK。GPT 根据素材页标签、你填写的用途和本集时间轴选曲、截取、淡入淡出；FFmpeg 实际剪辑与混音。标签不是 GPT 试听音频的证明，最终仍由你审批。
+
+1. 把 MP3、WAV、M4A、OGG 或 FLAC 放在一个文件夹内，最多 100 首、总计 500 MB、单首不超过 100 MB。只扫描这一层；子目录和符号链接不会导入。
+2. 在审片室的音乐库填写文件夹路径并扫描，或者运行：
+
+   ```bash
+   nolan music-folder "/项目目录" "/音乐目录" --scan
+   ```
+
+3. 扫描会把新音频复制到项目的受控音乐库，保留原文件。新音乐首次必须由你试听、确认；确认后允许后续剧集自动复用与编排。
+4. 后续把新曲目放入同一文件夹，再在网页扫描，或运行：
+
+   ```bash
+   nolan music-folder "/项目目录" --scan
+   ```
+
+重复扫描按音频内容去重，不会重复导入；已经拒绝的音乐也不会因重新扫描再次变成待批。扫描本身不会生成视频、自动批准音乐、修改既有视频进度或调用付费音乐服务。
+
+## 曲库说明文件
+
+没有 `index.json` 也能导入，标题使用文件名；许可信息会标记为未知，不代表可以商用。需要保存曲目用途和署名时，在音乐文件夹内放一个 UTF-8 的 `index.json`：
+
+```json
+{
+  "schema_version": 1,
+  "library_name": "我的短剧配乐库",
+  "approval_required": true,
+  "tracks": [
+    {
+      "file": "suspense.mp3",
+      "title": "悬疑气氛",
+      "author": "素材作者",
+      "source_url": "https://example.com/music-page",
+      "license": {
+        "name": "素材页标注的许可名称",
+        "url": "https://example.com/license",
+        "commercial_use": true,
+        "adaptation": true,
+        "attribution_required": true
+      },
+      "attribution": "按素材许可要求填写署名",
+      "source_metadata": {
+        "instruments": ["钢琴", "弦乐"],
+        "feel": ["紧张", "悬疑"],
+        "tempo_bpm": 85
+      },
+      "editorial": {
+        "moods": ["悬疑"],
+        "suggested_use": "人物发现线索时，低音量铺底",
+        "avoid": "不用于轻松喜剧段落",
+        "basis": "素材页标签与人工说明"
+      }
+    }
+  ]
+}
+```
+
+示例的 URL 和许可只表示字段写法，不代表具体音乐已获得授权。请保留实际下载页面、许可与署名要求；`license` 是所提供信息的记录，Nolan 不会自行证明版权。不要把 API 密钥、密码或其他凭据写入说明文件。
+
+`file` 必须是同一文件夹中的文件名，不能包含子目录或外部路径。可选 `sha256` 用于核对下载原件。说明文件最多 256 KB、100 首；不认识的字段不会送入项目状态或 GPT 上下文。

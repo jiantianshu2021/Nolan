@@ -28,6 +28,17 @@ MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 REVIEW_ERROR_MESSAGE = "审片页暂时无法打开，制作进度已保留；请重试 open_review，或在终端运行 nolan studio 项目目录。"
 
 
+def _compact_music_status(library):
+    """The conversation needs decisions and counts; only the browser needs media metadata."""
+    tracks = library.get("tracks", []) if isinstance(library, dict) else []
+    tracks = [track for track in tracks if isinstance(track, dict)]
+    return {"mode": library.get("mode", ""), "folder": library.get("folder", ""),
+            "track_count": len(tracks),
+            "approved_count": sum(track.get("status") == "approved" for track in tracks),
+            "awaiting_approval_count": sum(track.get("status") == "awaiting_approval" for track in tracks),
+            "tracks": [{key: track.get(key) for key in ("id", "title", "version", "status")} for track in tracks[:12]]}
+
+
 class ToolError(ValueError):
     """An intentionally public, credential-free diagnostic."""
 
@@ -290,6 +301,7 @@ class MCPServer:
         from .connection import production_connection_info
         state = core.load_project(root)
         result = dashboard.public_state(state)
+        result["music_library"] = _compact_music_status(result.get("music_library", {}))
         result["gpt_connection"] = production_connection_info(state["settings"].get("brain", {}))
         # State/provider errors are not trusted to contain no credentials.
         if "last_error" in result:
