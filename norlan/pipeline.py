@@ -1,9 +1,10 @@
-"""Resumable production, with a human gate before every next episode."""
+"""Resumable production, with human decisions for every generated segment."""
 from __future__ import annotations
 
 import copy
 import hashlib
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -103,6 +104,21 @@ def _relative_evidence(root, evidence):
     return result
 
 
+def _archive_stale_shot_file(shot):
+    """Remove a prior version from the current slot, preserving its provenance."""
+    file = shot.get("file")
+    match = re.fullmatch(re.escape(shot["id"]) + r"-v(\d+)\.(?:mp4|m4v|mov|webm)", Path(file).name) if file else None
+    if not match or int(match.group(1)) == shot.get("version"):
+        return False
+    if not any(record.get("file") == file for record in shot.get("history", [])):
+        old = {key: copy.deepcopy(shot[key]) for key in ("file", "sha256", "evidence", "review") if key in shot}
+        old["version"] = int(match.group(1))
+        shot.setdefault("history", []).append(old)
+    for key in ("file", "sha256", "evidence", "review", "approved_at", "approved_sha256", "approved_version"):
+        shot.pop(key, None)
+    return True
+
+
 def _recover(root):
     # Before a POST starts its intent was committed. A killed process must not
     # interpret the absence of a response as absence of a provider-side job.
@@ -111,6 +127,39 @@ def _recover(root):
             if job["accounting"] == "reserved" and job["state"] == "submitting":
                 job.update(accounting="unknown", state="uncertain")
                 core.event(s, "interrupted_submission", id=job["id"])
+        # Older releases cleared a failed candidate and queued an automatic
+        # retry. Restore that exact candidate for a human decision instead. An
+        # explicit rejection advances revision, so it is not undone here.
+        for ep in s["episodes"]:
+            for shot in ep["shots"]:
+                if shot["status"] != "accepted" and _archive_stale_shot_file(shot):
+                    active = s["jobs"].get(shot.get("job_id"), {})
+                    if active.get("state") in {"submitted", "download_pending", "completed"}:
+                        shot["status"] = "generating"
+                    else:
+                        shot.update(status="review_required", generation_error=
+                            "本次视频生成未得到可用结果。不会自动再次提交；请填写意见后由你决定是否重试。")
+                    core.event(s, "stale_candidate_archived", id=shot["id"], version=shot.get("version"))
+                if shot["status"] != "planned" or shot.get("file") or shot.get("job_id"):
+                    continue
+                history = shot.get("history", [])
+                attempts = shot.get("attempts", [])
+                if not history or not attempts:
+                    continue
+                candidate = copy.deepcopy(history[-1])
+                if "version" not in candidate:
+                    match = re.fullmatch(re.escape(shot["id"]) + r"-v(\d+)\.mp4", Path(candidate.get("file", "")).name)
+                    if match:
+                        candidate["version"] = int(match.group(1))
+                if (candidate.get("version") != shot.get("version")
+                        or candidate.get("review", {}).get("verdict") != "fail"
+                        or attempts[-1].get("revision", 0) != shot.get("revision", 0)):
+                    continue
+                core._check_artifact(root, candidate)
+                shot.update({key: copy.deepcopy(candidate[key]) for key in
+                             ("file", "sha256", "version", "evidence", "review") if key in candidate})
+                shot.update(status="review_required", feedback="")
+                core.event(s, "automatic_retry_cancelled", id=shot["id"], version=shot["version"])
 
 
 def _save_asset(root, asset_id, **values):
@@ -174,7 +223,7 @@ def _poll_video(root, job_id, output):
         if result["status"] == "failed":
             core.record_usage(root, job_id, result)
             core.update_job(root, job_id, state="failed", accounting="spent")
-            raise core.GateError("供应商报告任务失败，已按上限保守计账；再次运行可在重试限制内返工")
+            raise core.GateError("供应商报告任务失败；预算占用不代表实际扣费，重新生成须由你明确决定。")
         # A pause stops waiting/new submissions; the saved task is polled again
         # after resume. It may continue charging at the provider.
         _gate(root)
@@ -396,9 +445,18 @@ def _shot_context(root, ep, shot, previous):
         if previous["status"] != "accepted":
             raise core.GateError("前镜头未被接受，不能成为连续性参考")
         core._check_artifact(root, previous)
+        report = previous.get("review", {})
+        report = report if (report.get("sha256") == previous["sha256"] and
+                           report.get("version", previous.get("version")) == previous.get("version")) else {}
         continuity = {"shot_id": previous["id"], "sha256": previous["sha256"],
-            "observed_end_state": previous.get("review", {}).get("observed_end_state", "未核实"),
+            "observed_end_state": report.get("observed_end_state", "未核实"),
             "same_scene": previous["scene_id"] == shot["scene_id"]}
+        if core.human_approved_shot(previous):
+            continuity["human_decision"] = copy.deepcopy(previous.get("human_decision") or {
+                "decision": "approved", "version": previous.get("version"), "sha256": previous["sha256"],
+                "at": previous.get("approved_at"), "source": "legacy_human_approval"})
+            continuity["accepted_deviations"] = copy.deepcopy(report.get("issues", []))
+            continuity["acceptance_note"] = "用户已接受这个视频版本；报告中的疑点未必被用户逐项证实。以实际已接受画面承接，不擅自纠正其既有细节。"
         if continuity["same_scene"]:
             tail = previous["evidence"]["tail_frame"]
             path = core.safe_path(root, tail)
@@ -425,97 +483,112 @@ def _shot_context(root, ep, shot, previous):
 
 
 def _shot(root, ep_id, shot_id, previous):
-    while True:
-        s = _gate(root)
-        ep = core._find(s, "episode", ep_id)
-        shot = core._find(s, "shot", shot_id)
-        if "subshots" in shot:
-            from .segments import validate_subshots
-            validate_subshots(shot)
-        if shot["status"] == "accepted":
-            core._check_artifact(root, shot)
+    s = _gate(root)
+    ep = core._find(s, "episode", ep_id)
+    shot = core._find(s, "shot", shot_id)
+    if "subshots" in shot:
+        from .segments import validate_subshots
+        validate_subshots(shot)
+    if shot["status"] == "accepted":
+        core._check_artifact(root, shot)
+        if core.human_approved_shot(shot):
             return True
-        if shot["status"] == "review_required":
-            _set(root, status="review_required")
-            return False
-        total_attempts = sum(j["item_id"] == shot_id and j["kind"] == "video" for j in s["jobs"].values())
-        active = s["jobs"].get(shot.get("job_id", ""))
-        recovering = bool(active and active["state"] in {"submitted", "download_pending", "completed"})
-        if not recovering and total_attempts >= s["settings"]["max_attempts"]:
-            if shot.get("file"):
-                _save_shot(root, shot_id, status="review_required")
-            raise core.GateError("自动返工达到上限，请人工审查：" + shot_id)
-        if not recovering:
-            _new_work_gate(s)
-            _progress(root, ep_id, "shot_preparation", shot_id)
-        context, images, voices = _shot_context(root, ep, shot, previous)
-        if not recovering:
-            if s["mode"] == "demo":
-                refined = {"prompt": shot["prompt"] + " " + shot.get("feedback", ""), "dialogue": "", "continuity_notes": "Synthetic demo"}
-            else:
-                refined = _brain(root, "refine_shot", shot, context, images)
-            version = shot.get("version", 0) + 1
-            _save_shot(root, shot_id, refined_prompt=refined, version=version, status="generating",
-                reference_manifest={"images": [_rel(root, f) for f in images],
-                    "audio": [_rel(root, f) for f in voices], "context": context})
-            shot = core._find(core.load_project(root), "shot", shot_id)
-        version = shot["version"]
-        out = Path(root) / "media" / ep_id / f"{shot_id}-v{version}.mp4"
-        prompt = shot["refined_prompt"]["prompt"]
-        if "subshots" in shot:
-            from .segments import timeline_prompt
-            prompt += "\n" + timeline_prompt(shot)
-        # Refined text must not be treated as approved story changes.
-        if shot.get("dialogue"):
-            prompt += "\n必须使用的原定对白：" + shot["dialogue"]
-        prompt += "\n不添加画面字幕，不添加背景配乐。"
+        # A legacy GPT pass is advice, not a human decision.
+        _save_shot(root, shot_id, status="review_required")
+        _set(root, status="review_required")
+        return False
+    if shot["status"] == "review_required":
+        _set(root, status="review_required")
+        return False
+    active = s["jobs"].get(shot.get("job_id", ""))
+    recovering = bool(active and active["state"] in {"submitted", "download_pending", "completed"})
+    attempted = bool(active and active.get("state") == "failed") or any(
+        attempt.get("revision", 0) == shot.get("revision", 0) for attempt in shot.get("attempts", []))
+    if not recovering and attempted:
+        _save_shot(root, shot_id, status="review_required", generation_error=
+                   "本次视频生成未得到可用结果。不会自动再次提交；请填写意见后由你决定是否重试。")
+        _set(root, status="review_required")
+        return False
+    if not recovering:
+        _new_work_gate(s)
+        _progress(root, ep_id, "shot_preparation", shot_id)
+    context, images, voices = _shot_context(root, ep, shot, previous)
+    if not recovering:
+        if s["mode"] == "demo":
+            refined = {"prompt": shot["prompt"] + " " + shot.get("feedback", ""), "dialogue": "", "continuity_notes": "Synthetic demo"}
+        else:
+            refined = _brain(root, "refine_shot", shot, context, images)
+        version = shot.get("version", 0) + 1
+        _save_shot(root, shot_id, refined_prompt=refined, version=version, status="generating",
+            reference_manifest={"images": [_rel(root, f) for f in images],
+                "audio": [_rel(root, f) for f in voices], "context": context})
+        shot = core._find(core.load_project(root), "shot", shot_id)
+    version = shot["version"]
+    out = Path(root) / "media" / ep_id / f"{shot_id}-v{version}.mp4"
+    if shot.get("file") and shot["file"] != _rel(root, out):
+        # A legacy interrupted retry may still carry v2's file under version 3.
+        # Keep the old bytes/history, but never allow approving them as v3.
+        with core.transaction(root) as current:
+            stored = core._find(current, "shot", shot_id)
+            if not _archive_stale_shot_file(stored):
+                raise core.GateError("当前视频文件与生成任务路径不一致，请先核实原任务；不会重新提交。")
+    prompt = shot["refined_prompt"]["prompt"]
+    if "subshots" in shot:
+        from .segments import timeline_prompt
+        prompt += "\n" + timeline_prompt(shot)
+    # Refined text must not be treated as approved story changes.
+    if shot.get("dialogue"):
+        prompt += "\n必须使用的原定对白：" + shot["dialogue"]
+    prompt += "\n不添加画面字幕，不添加背景配乐。"
+    try:
         _video(root, "video", shot_id, out, shot["duration"], prompt, images, voices,
                old_job=shot.get("job_id") if recovering else None)
-        _progress(root, ep_id, "shot_checks", shot_id)
-        evidence_dir = Path(root) / "evidence" / f"{shot_id}-v{version}"
-        evidence = (media.extract_evidence(out, evidence_dir, subshots=shot["subshots"])
-                    if "subshots" in shot else media.extract_evidence(out, evidence_dir))
-        relative = _relative_evidence(root, evidence)
-        _save_shot(root, shot_id, file=_rel(root, out), sha256=core.digest(out), evidence=relative, status="reviewing")
-        # Review the seam too: prior tail + current sampled frames, tied to hashes.
-        review_images = images + [Path(f) for f in evidence["frames"]]
-        review_context = {**context, "shot": shot, "actual": relative,
-            "current_frame_image_indices": list(range(len(images) + 1, len(review_images) + 1)),
-            "current_frame_samples": [{"image_index": len(images) + index + 1, "time_seconds": instant}
-                                      for index, instant in enumerate(evidence.get("sample_times", []))],
-            "review_scope": "当前镜头首/中/尾抽样画面与前镜实际尾帧。没有审听音频；不可宣称整段动作或音色已核实。"}
-        if "subshots" in shot:
-            review_context.update(
-                review_scope="按计划子镜中点及切点前后采样，包含实测首帧、最后一帧与前段实际尾帧参考。"
-                             "只是计划点抽样，未检测或确认实际切镜；未审听音频，不可宣称完整动作、口型或音色已核实。",
-                repair_unit="一个生成段对应一次视频任务；任何子镜有问题均返工整个生成段，不能仅替换段内某一子镜。")
-        _progress(root, ep_id, "shot_review", shot_id)
+    except Exception:
+        current = core.load_project(root)
+        current_shot = core._find(current, "shot", shot_id)
+        failed = current["jobs"].get(current_shot.get("job_id", ""), {})
+        if failed.get("state") != "failed" or failed.get("accounting") == "unknown":
+            raise
+        _save_shot(root, shot_id, status="review_required", generation_error=
+                   "本次视频生成未得到可用结果。不会自动再次提交；请填写意见后由你决定是否重试。")
+        _set(root, status="review_required")
+        return False
+    _progress(root, ep_id, "shot_checks", shot_id)
+    evidence_dir = Path(root) / "evidence" / f"{shot_id}-v{version}"
+    evidence = (media.extract_evidence(out, evidence_dir, subshots=shot["subshots"])
+                if "subshots" in shot else media.extract_evidence(out, evidence_dir))
+    relative = _relative_evidence(root, evidence)
+    _save_shot(root, shot_id, file=_rel(root, out), sha256=core.digest(out), evidence=relative, status="reviewing")
+    # Review the seam too: prior tail + current sampled frames, tied to hashes.
+    review_images = images + [Path(f) for f in evidence["frames"]]
+    review_context = {**context, "shot": shot, "actual": relative,
+        "current_frame_image_indices": list(range(len(images) + 1, len(review_images) + 1)),
+        "current_frame_samples": [{"image_index": len(images) + index + 1, "time_seconds": instant}
+                                  for index, instant in enumerate(evidence.get("sample_times", []))],
+        "review_scope": "当前镜头首/中/尾抽样画面与前镜实际尾帧。没有审听音频；不可宣称整段动作或音色已核实。"}
+    if "subshots" in shot:
+        review_context.update(
+            review_scope="按计划子镜中点及切点前后采样，包含实测首帧、最后一帧与前段实际尾帧参考。"
+                         "只是计划点抽样，未检测或确认实际切镜；未审听音频，不可宣称完整动作、口型或音色已核实。",
+            repair_unit="一个生成段对应一次视频任务；仅当用户选择返工时才重新生成整段，不能仅替换段内某一子镜。")
+    _progress(root, ep_id, "shot_review", shot_id)
+    try:
         review = ({"verdict": "pass", "issues": [], "observed_end_state": "Synthetic demo only",
                    "repair_prompt": "", "scope": "synthetic smoke test"} if s["mode"] == "demo"
                   else _brain(root, "review", review_context, review_images))
-        review.update(sha256=core.digest(out), audio_checked=False, whole_video_checked=False)
-        verdict = review.get("verdict", "uncertain")
-        if verdict == "pass":
-            _save_shot(root, shot_id, review=review, status="accepted")
-            return True
-        _save_shot(root, shot_id, review=review, status="review_required")
-        if verdict != "fail":
-            _set(root, status="review_required")
-            return False
-        # A failed sample never becomes canon. Retry only this shot, bounded by
-        # all attempts, including provider failures and human revisions.
-        shot = core._find(core.load_project(root), "shot", shot_id)
-        count = sum(j["item_id"] == shot_id and j["kind"] == "video" for j in core.load_project(root)["jobs"].values())
-        if count >= s["settings"]["max_attempts"]:
-            return False
-        with core.transaction(root) as current:
-            sh = core._find(current, "shot", shot_id)
-            sh.setdefault("history", []).append({key: sh[key] for key in
-                ("file", "sha256", "version", "evidence", "review") if key in sh})
-            sh.update(status="planned", feedback=review.get("repair_prompt") or "；".join(review.get("issues", [])))
-            for key in ("file", "sha256", "evidence", "review", "refined_prompt", "job_id"):
-                sh.pop(key, None)
-
+    except Exception:
+        # A failed report must not hide a paid-for candidate or cause another
+        # video/report request on every resume. The user can review the video.
+        if core.load_project(root)["paused"]:
+            raise
+        review = {"verdict": "uncertain", "issues": ["审查报告未完成，请自行观看当前视频后决定通过或返工。"],
+                  "observed_end_state": "未核实", "repair_prompt": "", "scope": "sampled_frames_only",
+                  "report_unavailable": True}
+    review.update(sha256=core.digest(out), version=version, advisory=True,
+                  audio_checked=False, whole_video_checked=False)
+    _save_shot(root, shot_id, review=review, status="review_required")
+    _set(root, status="review_required")
+    return False
 
 def _soundtrack(root, ep):
     """Music is one episode cue; frame-only reviewers never certify its sound."""
@@ -701,7 +774,7 @@ def _rough_cut(root, episode, count):
 def _episode(root, ep_id):
     s = _gate(root)
     ep = core._find(s, "episode", ep_id)
-    if ep["status"] == "awaiting_review":
+    if ep["status"] == "awaiting_review" and all(core.human_approved_shot(shot) for shot in ep["shots"]):
         _set(root, status="awaiting_episode_review")
         return
     _save_episode(root, ep_id, status="generating")
@@ -728,21 +801,23 @@ def _episode(root, ep_id):
             path = core.safe_path(root, rough_cut["file"])
             ev = media.extract_evidence(path, Path(root) / "evidence" / f"rough-{ep_id}-{batch_key[:16]}")
             _progress(root, ep_id, "batch_review", original["id"])
-            review = ({"verdict": "pass", "issues": [], "observed_end_state": "Synthetic demo",
-                       "repair_prompt": ""} if s["mode"] == "demo" else
-                      _brain(root, "review", {"episode": ep_id, "shots": fresh["shots"][:count],
-                          "scope": "分段粗剪抽帧检查；听觉未评估，运动过程未完整评估。",
-                          "evidence": _relative_evidence(root, ev)}, [Path(f) for f in ev["frames"]]))
+            try:
+                review = ({"verdict": "pass", "issues": [], "observed_end_state": "Synthetic demo",
+                           "repair_prompt": ""} if s["mode"] == "demo" else
+                          _brain(root, "review", {"episode": ep_id, "shots": fresh["shots"][:count],
+                              "scope": "分段粗剪抽帧检查；听觉未评估，运动过程未完整评估。",
+                              "evidence": _relative_evidence(root, ev)}, [Path(f) for f in ev["frames"]]))
+            except Exception:
+                if core.load_project(root)["paused"]:
+                    raise
+                review = {"verdict": "uncertain", "issues": ["拼接审查报告未完成，请自行观看累计粗剪检查衔接。"],
+                          "observed_end_state": "未核实", "repair_prompt": "", "report_unavailable": True}
             review.update(key=batch_key, file=_rel(root, path), sha256=core.digest(path),
-                          audio_checked=False, whole_video_checked=False)
+                          advisory=True, audio_checked=False, whole_video_checked=False)
             with core.transaction(root) as current:
                 core._find(current, "episode", ep_id)["reviews"].append(review)
-            if review["verdict"] != "pass":
-                # Batch diagnosis may not locate the faulty shot reliably. Stop
-                # for review instead of regenerating unrelated accepted clips.
-                _save_shot(root, original["id"], status="review_required", review=review)
-                _set(root, status="review_required")
-                return
+            # The rough-cut report is advisory too. It never overwrites a
+            # segment's report or revokes that segment's human approval.
     fresh = core._find(core.load_project(root), "episode", ep_id)
     _gate(root)
     _progress(root, ep_id, "music")

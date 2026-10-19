@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from norlan import core, pipeline
-from test_pipeline import choose_gpt_assets, fake_media, write
+from test_pipeline import choose_gpt_assets, fake_media, write, run_with_shot_approvals
 
 
 class RoughCutTests(unittest.TestCase):
@@ -58,7 +58,7 @@ class RoughCutTests(unittest.TestCase):
 
         with patch.object(pipeline.media, "extract_evidence", side_effect=observe), \
              patch.object(pipeline, "_brain") as brain:
-            state = pipeline.run(self.root)
+            state = run_with_shot_approvals(self.root)
         self.assertEqual(state["status"], "awaiting_episode_review", state.get("last_error"))
         episode = state["episodes"][0]
         self.assertEqual([cut["shot_count"] for cut in episode["rough_cuts"]], [2, 3, 4])
@@ -74,11 +74,11 @@ class RoughCutTests(unittest.TestCase):
             ])
 
     def test_recomposition_reuses_existing_cuts_and_reviews(self):
-        pipeline.run(self.root)
+        run_with_shot_approvals(self.root)
         before = copy.deepcopy(self.episode())
         self.request_recompose()
         pipeline.media.compose.reset_mock()
-        pipeline.run(self.root)
+        run_with_shot_approvals(self.root)
         after = self.episode()
         self.assertEqual(after["rough_cuts"], before["rough_cuts"])
         self.assertEqual(after["reviews"], before["reviews"])
@@ -86,12 +86,12 @@ class RoughCutTests(unittest.TestCase):
         self.assertNotIn("-rough-", str(pipeline.media.compose.call_args.args[1]))
 
     def test_revision_preserves_old_cuts_and_adds_only_changed_prefixes(self):
-        state = pipeline.run(self.root)
+        state = run_with_shot_approvals(self.root)
         old_cuts = copy.deepcopy(state["episodes"][0]["rough_cuts"])
         old_bytes = {cut["file"]: (self.root / cut["file"]).read_bytes() for cut in old_cuts}
         core.reject(self.root, "episode", "E001", state["episodes"][0]["version"],
                     "合成测试：修改第三镜动作。", ["E001-S003"])
-        state = pipeline.run(self.root)
+        state = run_with_shot_approvals(self.root)
         self.assertEqual(state["status"], "awaiting_episode_review", state.get("last_error"))
         cuts = state["episodes"][0]["rough_cuts"]
         self.assertEqual(cuts[:3], old_cuts)
@@ -105,13 +105,13 @@ class RoughCutTests(unittest.TestCase):
     def test_legacy_batch_review_file_is_indexed_without_reencoding(self):
         with core.transaction(self.root) as state:
             state["episodes"][0]["shots"] = state["episodes"][0]["shots"][:2]
-        pipeline.run(self.root)
+        run_with_shot_approvals(self.root)
         legacy = copy.deepcopy(self.episode()["reviews"][0])
         with core.transaction(self.root) as state:
             state["episodes"][0].pop("rough_cuts")
         self.request_recompose()
         pipeline.media.compose.reset_mock()
-        pipeline.run(self.root)
+        run_with_shot_approvals(self.root)
         indexed = self.episode()["rough_cuts"]
         self.assertEqual(len(indexed), 1)
         for field in ("key", "file", "sha256"):
@@ -119,45 +119,49 @@ class RoughCutTests(unittest.TestCase):
         self.assertEqual(pipeline.media.compose.call_count, 1)  # final only
 
     def test_tampered_registered_cut_is_not_overwritten_or_reused(self):
-        state = pipeline.run(self.root)
+        state = run_with_shot_approvals(self.root)
         cut = state["episodes"][0]["rough_cuts"][0]
         path = self.root / cut["file"]
         path.write_bytes(b"SYNTHETIC MODIFIED FILE")
         self.request_recompose()
         pipeline.media.compose.reset_mock()
         before_jobs = len(state["jobs"])
-        state = pipeline.run(self.root)
+        state = run_with_shot_approvals(self.root)
         self.assertEqual(state["status"], "blocked")
         self.assertIn("内容已改变", state["last_error"])
         self.assertEqual(path.read_bytes(), b"SYNTHETIC MODIFIED FILE")
         self.assertEqual(len(state["jobs"]), before_jobs)
         pipeline.media.compose.assert_not_called()
 
-    def test_preview_survives_failed_review_and_resume_keeps_batch_frequency(self):
+    def test_preview_survives_report_failure_without_repeating_gpt_requests(self):
         with core.transaction(self.root) as state:
             state["mode"] = "live"
             for shot in state["episodes"][0]["shots"]:
                 path = write(self.root / "media" / (shot["id"] + ".mp4"), b"SYNTHETIC " + shot["id"].encode())
-                shot.update(status="accepted", version=1, file=str(path.relative_to(self.root)), sha256=core.digest(path))
+                shot.update(status="review_required", version=1, file=str(path.relative_to(self.root)), sha256=core.digest(path))
+        for shot in self.episode()["shots"]:
+            core.approve(self.root, "shot", shot["id"], 1)
 
         def interrupted(root, method, context, images):
             self.assertEqual(method, "review")
-            self.assertEqual([cut["shot_count"] for cut in self.episode()["rough_cuts"]], [2, 3])
             raise RuntimeError("Synthetic review interruption")
 
         with patch.object(pipeline, "_brain", side_effect=interrupted) as brain:
             state = pipeline.run(self.root)
-        self.assertEqual(state["status"], "blocked")
-        self.assertEqual(brain.call_count, 1)
-        before = copy.deepcopy(self.episode()["rough_cuts"])
+        self.assertEqual(state["status"], "awaiting_episode_review")
+        self.assertEqual(brain.call_count, 2)
+        before = copy.deepcopy(self.episode())
+        self.assertEqual([cut["shot_count"] for cut in before["rough_cuts"]], [2, 3, 4])
+        self.assertTrue(all(review["report_unavailable"] for review in before["reviews"]))
+        self.request_recompose()
         pipeline.media.compose.reset_mock()
-        review = {"verdict": "pass", "issues": [], "observed_end_state": "synthetic", "repair_prompt": ""}
-        with patch.object(pipeline, "_brain", side_effect=lambda *args: copy.deepcopy(review)) as brain:
+        with patch.object(pipeline, "_brain") as brain:
             state = pipeline.run(self.root)
         self.assertEqual(state["status"], "awaiting_episode_review", state.get("last_error"))
-        self.assertEqual(self.episode()["rough_cuts"][:2], before)
-        self.assertEqual(brain.call_count, 2)  # only the 3-shot and 4-shot boundaries
-        self.assertEqual(pipeline.media.compose.call_count, 2)  # cut 4 + final
+        self.assertEqual(self.episode()["rough_cuts"], before["rough_cuts"])
+        self.assertEqual(self.episode()["reviews"], before["reviews"])
+        brain.assert_not_called()
+        self.assertEqual(pipeline.media.compose.call_count, 1)
 
 
 if __name__ == "__main__":

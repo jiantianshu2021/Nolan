@@ -74,7 +74,7 @@ class SegmentPlanningTests(unittest.TestCase):
             self.assertIs(schema, REFINE_SCHEMA)
             self.assertEqual(images, [])
             for required in ("数量、顺序、start/end 和 duration 完全不变", "不重说台词", "环境底声连续",
-                             "整集后期", "旧项目没有 subshots", "整段失败整段返工"):
+                             "整集后期", "旧项目没有 subshots", "一次人工返工仅生成一个新版本"):
                 self.assertIn(required, instruction)
 
 

@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from norlan import core, pipeline
 from norlan.providers import ProviderError
-from test_pipeline import choose_gpt_assets, fake_media, write
+from test_pipeline import choose_gpt_assets, fake_media, write, run_with_shot_approvals
 
 
 class CaptionPipelineTests(unittest.TestCase):
@@ -26,7 +26,7 @@ class CaptionPipelineTests(unittest.TestCase):
         state = pipeline.run(self.root)
         for asset in state["assets"]:
             core.approve(self.root, "asset", asset["id"], asset["version"])
-        state = pipeline.run(self.root)
+        state = run_with_shot_approvals(self.root)
         self.assertEqual(state["status"], "awaiting_episode_review", state.get("last_error"))
         # Recompose already accepted real-state clips with ASR enabled. No video,
         # visual review, or voice service is needed or called by these tests.

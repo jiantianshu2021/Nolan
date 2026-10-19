@@ -80,7 +80,7 @@ class SubshotPipelineTests(unittest.TestCase):
                 "sampling_note": "只是计划点采样，不代表已检测实际切镜。"}
 
     def test_three_subshots_are_one_task_with_locked_timeline_dialogue_and_references(self):
-        self.assertTrue(pipeline._shot(self.root, "E001", "E001-S001", self.previous))
+        self.assertFalse(pipeline._shot(self.root, "E001", "E001-S001", self.previous))
         self.provider.submit_video.assert_called_once()
         prompt, duration, images = self.provider.submit_video.call_args.args
         self.assertEqual(duration, 15)
@@ -103,13 +103,17 @@ class SubshotPipelineTests(unittest.TestCase):
         self.assertEqual([item["image_index"] for item in context["current_frame_samples"]], list(range(4, 13)))
         self.assertAlmostEqual(context["current_frame_samples"][-1]["time_seconds"], 14.966667)
         self.assertIn("未检测", context["review_scope"])
-        self.assertIn("整个生成段", context["repair_unit"])
+        self.assertIn("用户选择返工", context["repair_unit"])
         self.assertEqual(context["previous_actual"]["shot_id"], "previous-segment")
         self.assertEqual(context["actual"]["tail_frame"], context["actual"]["frames"][-1])
 
-    def test_bad_internal_shot_retries_entire_segment_and_preserves_previous_version(self):
+    def test_only_human_rejection_retries_entire_segment_and_preserves_previous_version(self):
         self.review_verdicts = ["fail", "pass"]
-        self.assertTrue(pipeline._shot(self.root, "E001", "E001-S001", self.previous))
+        self.assertFalse(pipeline._shot(self.root, "E001", "E001-S001", self.previous))
+        self.assertFalse(pipeline._shot(self.root, "E001", "E001-S001", self.previous))
+        self.provider.submit_video.assert_called_once()
+        core.reject(self.root, "shot", "E001-S001", 1, "用户要求修正第二个内镜动作")
+        self.assertFalse(pipeline._shot(self.root, "E001", "E001-S001", self.previous))
         self.assertEqual(self.provider.submit_video.call_count, 2)
         self.assertEqual([call.args[1] for call in self.provider.submit_video.call_args_list], [15, 15])
         shot = core.load_project(self.root)["episodes"][0]["shots"][0]

@@ -32,10 +32,10 @@ def last_project():
 
 STATUS = {"initialized": "等待策划", "awaiting_plan": "等待批准分集规划", "awaiting_assets": "等待资产审批",
     "awaiting_asset_input": "等待资产创作选择",
-    "awaiting_episode_review": "等待本集审片", "review_required": "需要人工复核镜头",
+    "awaiting_episode_review": "等待本集审片", "review_required": "等待你审批片段",
     "blocked": "等待处理", "paused": "已暂停", "complete": "全部完成", "ready": "可继续",
     "planned": "待生成", "candidate": "待批准", "approved": "已批准", "generating": "生成中",
-    "awaiting_review": "待审片", "revision_requested": "待返工", "accepted": "抽样检查通过",
+    "awaiting_review": "待审片", "revision_requested": "待返工", "accepted": "片段已接受",
     "pending": "待策划", "rejected": "待修改", "reviewing": "自动检查中"}
 
 
@@ -56,7 +56,7 @@ def summary(s):
         rows.append(f"  {ep['id']} · {ep['title']} · v{ep['version']} · {STATUS.get(ep['status'],ep['status'])}")
         for sh in ep["shots"]:
             if sh["status"] == "review_required":
-                rows.append(f"    需复核 {sh['id']} v{sh.get('version',0)}：" + "；".join(sh.get("review", {}).get("issues", [])))
+                rows.append(f"    待你审批 {sh['id']} v{sh.get('version',0)}：" + "；".join(sh.get("review", {}).get("issues", [])))
     if s.get("last_error"):
         rows.append("提示：" + s["last_error"])
     if s["status"] == "awaiting_plan":

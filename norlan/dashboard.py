@@ -35,6 +35,11 @@ INPUT_ERRORS = frozenset({
     "资产输入已更新，请刷新网页后重新确认。",
     "尚有在途或结果不明的调用，请等待落盘或完成对账后再修改资产输入。",
     "请先批准新的分段方案，或选择保留原分段，再继续制作。",
+    "请先完成人工要求返工的上游片段并批准新版本，再确认这段视频的衔接",
+    "衔接复核来源缺失，请先检查上游片段记录",
+    "生成失败记录尚未核实，不能再次提交；请先核实原调用结果",
+    "本集仍有未经人工批准当前版本的视频片段",
+    "视频文件不属于当前版本，请先恢复原生成任务并刷新后重新审阅",
 })
 MEDIA_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".m4v", ".mov", ".webm", ".wav", ".mp3", ".m4a", ".ogg", ".srt", ".vtt"})
 
@@ -109,6 +114,26 @@ def _current_shot_artifact(shot):
     return file_version is None or file_version == _version(shot.get("version"))
 
 
+def _public_shot_report(record, version):
+    """Only publish an advisory report bound to this exact video's hash."""
+    review = record.get("review")
+    if (not isinstance(review, dict) or not _valid_sha(record.get("sha256"))
+            or review.get("sha256") != record["sha256"]
+            or ("version" in review and review["version"] != version)):
+        return None
+    verdict = review.get("verdict")
+    result = {"version": version,
+              "verdict": verdict if isinstance(verdict, str) and verdict in {"pass", "fail", "uncertain"} else "uncertain"}
+    result["issues"] = [value[:8000] for value in review.get("issues", [])[:100] if isinstance(value, str)] if isinstance(review.get("issues"), list) else []
+    for key in ("observed_end_state", "repair_prompt", "scope"):
+        if isinstance(review.get(key), str):
+            result[key] = review[key][:16000]
+    for key in ("audio_checked", "whole_video_checked", "audio_assessed"):
+        if type(review.get(key)) is bool:
+            result[key] = review[key]
+    return result
+
+
 def _public_shot_history(shot):
     history, seen = [], set()
     for record in shot.get("history", []):
@@ -120,7 +145,11 @@ def _public_shot_history(shot):
             continue
         seen.add(identity)
         item = {"file": record["file"], **_public_timestamps(record)}
-        item["version"] = _version(record.get("version")) or _file_version(shot, record["file"]) or 0
+        file_version = _file_version(shot, record["file"])
+        item["version"] = file_version or _version(record.get("version"))
+        report = _public_shot_report(record, item["version"])
+        if report and (not record.get("version") or record["version"] == item["version"]):
+            item["review"] = report
         history.append(item)
     return history
 
@@ -168,6 +197,13 @@ def _public_rough_cuts(episode):
         item = {"key": record["key"], "file": record["file"], **_public_timestamps(record)}
         item.update(shot_count=count if type(count) is int and 0 < count <= len(shots) else 0,
                     current=current, legacy=legacy, shots=public_manifest)
+        matched = next((review for review in reversed(episode.get("reviews", []))
+                        if isinstance(review, dict) and review.get("key") == record["key"]
+                        and review.get("file") == record["file"] and review.get("sha256") == record["sha256"]), None)
+        if matched:
+            report = _public_shot_report({"sha256": record["sha256"], "review": matched}, None)
+            if report:
+                item["review"] = report
         output.append(item)
     return output
 
@@ -194,9 +230,10 @@ def _shot_progress(state, episode, shot, episode_status, stamp):
               "elapsed_basis": "生成任务用时", "completed": artifact, "accepted": status == "accepted" and artifact,
               "is_working": False, "waiting_for_human": False, "has_active_task": active}
     if status == "accepted" and artifact:
-        result.update(stage="accepted", label="已生成，检查通过")
-    elif status == "review_required" and artifact:
-        result.update(stage="review_required", label="已生成，等待人工复核", waiting_for_human=True)
+        result.update(stage="accepted", label="已生成，已通过")
+    elif status == "review_required":
+        result.update(stage="review_required", label="已生成，等待你审批" if artifact else "未取得可审视频，等待你决定重试",
+                      waiting_for_human=True)
     elif job.get("state") == "uncertain" or job.get("accounting") == "unknown":
         result.update(stage="unknown", label="调用结果待核实", waiting_for_human=True)
     elif job.get("state") == "failed":
@@ -274,13 +311,21 @@ def public_state(state: dict) -> dict:
                 item["segment_proposal"]["shots"].append(entry)
         item["shots"] = []
         for shot in episode.get("shots", []):
-            entry = _pick(shot, ("id", "status", "file", "prompt", "duration", "review"))
+            entry = _pick(shot, ("id", "status", "file", "prompt", "duration"))
             if isinstance(shot.get("subshots"), list):
                 entry["subshots"] = [_pick(part, ("start", "end", "prompt"))
                                      for part in shot["subshots"] if isinstance(part, dict)]
             entry["version"] = _version(shot.get("version"))
+            if shot.get("generation_error"):
+                entry["generation_error"] = "本次视频生成未得到可用结果。不会自动再次提交；请填写意见后由你决定是否重试。"
+            if shot.get("continuity_review"):
+                entry["continuity_review"] = "前段已返工，请重新审看片段接续。当前视频保留，由你决定是否需要重做。"
             if not _current_shot_artifact(shot):
                 entry.pop("file", None)
+            else:
+                report = _public_shot_report(shot, entry["version"])
+                if report:
+                    entry["review"] = report
             entry["progress"] = _shot_progress(state, episode, shot, item["progress"], stamp)
             entry["history"] = _public_shot_history(shot)
             item["shots"].append(entry)

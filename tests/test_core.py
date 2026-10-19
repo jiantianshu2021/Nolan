@@ -92,7 +92,7 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(core.GateError):
             core.approve(self.root, "asset", "voice", 1)
 
-    def test_rejection_invalidates_same_scene_downstream_and_caption_timing(self):
+    def test_episode_rejection_preserves_unselected_video_and_rechecks_continuity(self):
         with core.transaction(self.root) as state:
             ep = state["episodes"][0]
             third = copy.deepcopy(ep["shots"][0])
@@ -105,7 +105,10 @@ class CoreTests(unittest.TestCase):
                 shot.update(self.artifact(f"media/{shot['id']}.mp4"), status="accepted", version=1)
         core.reject(self.root, "episode", "E001", 1, "第二镜服装改回蓝色", ["E001-S002"])
         ep = core.load_project(self.root)["episodes"][0]
-        self.assertEqual([s["status"] for s in ep["shots"]], ["accepted", "planned", "accepted", "planned"])
+        self.assertEqual([s["status"] for s in ep["shots"]], ["accepted", "planned", "accepted", "review_required"])
+        self.assertEqual(ep["shots"][3]["version"], 1)
+        self.assertIn("file", ep["shots"][3])
+        self.assertEqual(ep["shots"][3]["continuity_review"]["source_shots"][0]["id"], "E001-S002")
         self.assertNotIn("verified_subtitles", ep)
         self.assertEqual(ep["subtitle_status"], "needs_retiming")
 

@@ -481,6 +481,89 @@ def remove_asset_reference(root, asset_id, asset_version, input_revision, refere
     return load_project(root)
 
 
+def _shot_file_matches_version(shot):
+    filename = Path(shot.get("file") or "").name
+    match = re.fullmatch(re.escape(str(shot.get("id", ""))) + r"-v([1-9]\d*)\.(?:mp4|m4v|mov|webm)", filename)
+    return match is None or int(match[1]) == shot.get("version")
+
+
+def _check_shot_artifact(root, state, shot):
+    """Old interrupted attempts can retain an earlier file under a newer version."""
+    _check_artifact(root, shot)
+    version = shot.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1 or not _shot_file_matches_version(shot):
+        raise GateError("视频文件不属于当前版本，请先恢复原生成任务并刷新后重新审阅")
+    job = state["jobs"].get(shot.get("job_id", ""))
+    if job and (job.get("kind") != "video" or job.get("item_id") != shot["id"] or
+                job.get("state") != "completed" or
+                (job.get("output") and safe_path(root, job["output"]) != safe_path(root, shot["file"]))):
+        raise GateError("视频文件不属于当前版本，请先恢复原生成任务并刷新后重新审阅")
+
+
+def human_approved_shot(shot):
+    """Recognize only a human decision bound to this exact stored video version.
+
+    This is a state check; callers using the media must also verify its bytes.
+    The legacy override remains valid only alongside the old approval metadata.
+    A stale structured decision must never fall back to that legacy override.
+    """
+    version, sha256 = shot.get("version"), shot.get("sha256")
+    if (shot.get("status") != "accepted" or not shot.get("file") or
+            isinstance(version, bool) or not isinstance(version, int) or version < 1 or
+            not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256) or
+            shot.get("approved_sha256") != sha256 or not shot.get("approved_at") or
+            not _shot_file_matches_version(shot)):
+        return False
+    approved_version = shot.get("approved_version", version)
+    if isinstance(approved_version, bool) or approved_version != version:
+        return False
+    decision = shot.get("human_decision")
+    if decision is not None:
+        return (isinstance(decision, dict) and decision.get("decision") == "approved" and
+                not isinstance(decision.get("version"), bool) and
+                decision.get("version") == version and decision.get("sha256") == sha256 and
+                bool(decision.get("at")))
+    review = shot.get("review")
+    return isinstance(review, dict) and review.get("human_override") is True
+
+
+def _shot_decision(shot, decision, feedback="", *, continuity_checked=None):
+    review = shot.get("review")
+    report_bound = (isinstance(review, dict) and bool(shot.get("sha256")) and
+                    review.get("sha256") == shot["sha256"] and
+                    ("version" not in review or (type(review["version"]) is int and
+                                                 review["version"] == shot["version"])))
+    record = {"decision": decision, "version": shot["version"], "sha256": shot.get("sha256"),
+              "at": now(), "feedback": feedback,
+              "report": {key: copy.deepcopy(review[key]) for key in ("verdict", "issues") if key in review} if report_bound else {},
+              "report_bound": report_bound,
+              "report_note": ("报告保留 GPT 的原始检查意见，未经用户逐条核实；人工决定针对这个版本的整体成片。"
+                              if report_bound else "现有检查报告未绑定当前视频版本，未作为本次人工决定的报告依据；人工决定针对实际观看的这个版本。")}
+    if not shot.get("file"):
+        record.update(job_id=shot.get("job_id"), revision=shot.get("revision", 0),
+                      outcome="generation_failed")
+    if continuity_checked:
+        record["continuity_checked"] = copy.deepcopy(continuity_checked)
+    shot["human_decision"] = record
+    shot.setdefault("human_decisions", []).append(copy.deepcopy(record))
+
+
+def _check_shot_continuity(root, state, shot):
+    pending = shot.get("continuity_review") or {}
+    if not pending.get("required"):
+        return []
+    checked = []
+    for source in pending.get("source_shots", []):
+        current = _find(state, "shot", source["id"])
+        if not human_approved_shot(current) or current["version"] <= source["version"]:
+            raise GateError("请先完成人工要求返工的上游片段并批准新版本，再确认这段视频的衔接")
+        _check_shot_artifact(root, state, current)
+        checked.append({"id": current["id"], "version": current["version"], "sha256": current["sha256"]})
+    if not checked:
+        raise GateError("衔接复核来源缺失，请先检查上游片段记录")
+    return checked
+
+
 def approve(root, kind, item_id, version):
     with transaction(root) as s:
         item = _find(s, kind, item_id)
@@ -499,10 +582,10 @@ def approve(root, kind, item_id, version):
             if any(e["status"] != "approved" for e in s["episodes"][:idx]):
                 raise GateError("请按顺序审阅每一集")
             _check_artifact(root, item)
-            if any(sh["status"] != "accepted" for sh in item["shots"]):
-                raise GateError("本集仍有未通过检查的镜头")
+            if any(not human_approved_shot(sh) for sh in item["shots"]):
+                raise GateError("本集仍有未经人工批准当前版本的视频片段")
             for sh in item["shots"]:
-                _check_artifact(root, sh)
+                _check_shot_artifact(root, s, sh)
             used_assets = {ref for sh in item["shots"] for ref in sh["asset_ids"]}
             for asset in s["assets"]:
                 if asset["id"] in used_assets:
@@ -515,11 +598,15 @@ def approve(root, kind, item_id, version):
         elif kind == "shot":
             if item["status"] != "review_required":
                 raise GateError("此镜头不等待人工复核")
-            _check_artifact(root, item)
+            _check_shot_artifact(root, s, item)
+            continuity_checked = _check_shot_continuity(root, s, item)
         item["status"] = "accepted" if kind == "shot" else "approved"
         item["approved_at"] = now()
         item["approved_sha256"] = item.get("sha256")
         if kind == "shot":
+            item["approved_version"] = version
+            _shot_decision(item, "approved", continuity_checked=continuity_checked)
+            item.pop("continuity_review", None)
             item.setdefault("review", {})["human_override"] = True
         event(s, "human_approved", kind=kind, id=item_id, version=version,
               sha256=item.get("sha256"))
@@ -531,10 +618,61 @@ def approve(root, kind, item_id, version):
 def _invalidate_shot(shot, reason):
     if shot.get("file"):
         shot.setdefault("history", []).append({k: copy.deepcopy(shot[k]) for k in
-            ("file", "sha256", "evidence", "review", "version") if k in shot})
+            ("file", "sha256", "evidence", "review", "version", "human_decision", "approved_at",
+             "approved_sha256", "approved_version", "continuity_review") if k in shot})
     shot.update(status="planned", revision=shot.get("revision", 0) + 1, feedback=reason)
-    for key in ("file", "sha256", "evidence", "review", "job_id", "refined_prompt", "approved_at", "approved_sha256"):
+    for key in ("file", "sha256", "evidence", "review", "job_id", "refined_prompt", "approved_at", "approved_sha256", "approved_version", "generation_error"):
         shot.pop(key, None)
+
+
+def _invalidate_render(ep, reason):
+    """Retire a stale edit without requesting any other generated clip again."""
+    if ep.get("file"):
+        ep.setdefault("history", []).append({key: copy.deepcopy(ep[key]) for key in
+            ("file", "sha256", "version", "render_manifest", "approved_at", "approved_sha256") if key in ep})
+    ep.update(status="revision_requested", feedback=reason, subtitle_status="needs_retiming")
+    for key in ("file", "sha256", "approved_at", "approved_sha256", "verified_subtitles", "subtitle_file",
+                "render_manifest", "progress_stage", "progress_started_at"):
+        ep.pop(key, None)
+
+
+def _request_shot_revision(state, shot, feedback):
+    """Only the named clip is regenerated; downstream video awaits human review."""
+    source = {"id": shot["id"], "version": shot["version"], "sha256": shot.get("sha256"),
+              "at": now(), "reason": feedback}
+    owner = next(ep for ep in state["episodes"] if any(sh is shot for sh in ep["shots"]))
+    episode_index, shot_index = state["episodes"].index(owner), owner["shots"].index(shot)
+    _shot_decision(shot, "revision_requested", feedback)
+    _invalidate_shot(shot, feedback)
+    _invalidate_render(owner, feedback)
+    for index, ep in enumerate(state["episodes"][episode_index:], start=episode_index):
+        affected = []
+        for current_index, current in enumerate(ep["shots"]):
+            downstream = index > episode_index or (current_index > shot_index and current["scene_id"] == shot["scene_id"])
+            if downstream and current.get("file"):
+                current["status"] = "review_required"
+                pending = current.setdefault("continuity_review", {"required": True, "source_shots": []})
+                pending["required"] = True
+                sources = pending.setdefault("source_shots", [])
+                if not any(existing["id"] == source["id"] and existing["version"] == source["version"] for existing in sources):
+                    sources.append(copy.deepcopy(source))
+                for key in ("approved_at", "approved_sha256", "approved_version"):
+                    current.pop(key, None)
+                affected.append(current["id"])
+        if index > episode_index and (affected or ep.get("file")):
+            _invalidate_render(ep, "上游片段已申请返工，请人工复核已有视频衔接：" + feedback)
+
+
+def _check_shot_rejection(root, state, shot):
+    if shot.get("file"):
+        _check_shot_artifact(root, state, shot)
+        return
+    failed = state["jobs"].get(shot.get("job_id", ""), {})
+    if (not shot.get("generation_error") or failed.get("state") != "failed" or
+            failed.get("accounting") not in {"spent", "released"} or
+            failed.get("item_id") != shot["id"] or failed.get("kind") != "video" or
+            type(shot.get("version")) is not int or shot["version"] < 1):
+        raise GateError("生成失败记录尚未核实，不能再次提交；请先核实原调用结果")
 
 
 def _invalidate_episode(ep, reason, shot_ids=None):
@@ -554,10 +692,12 @@ def _invalidate_episode(ep, reason, shot_ids=None):
 
 
 def reject(root, kind, item_id, version, feedback, shot_ids=None):
-    if not feedback or not feedback.strip():
+    if not isinstance(feedback, str) or not feedback.strip():
         raise ValueError("返工意见不能为空")
     with run_lock(root), transaction(root) as s:
-        if any(j["accounting"] in {"reserved", "unknown"} for j in s["jobs"].values()):
+        if any(j["accounting"] in {"reserved", "unknown"} or
+               j.get("state") in {"submitting", "submitted", "download_pending", "uncertain"}
+               for j in s["jobs"].values()):
             raise GateError("尚有调用在执行，请先暂停并等待在途任务落盘后再返工")
         item = _find(s, kind, item_id)
         _check_version(item, version)
@@ -582,17 +722,30 @@ def reject(root, kind, item_id, version, feedback, shot_ids=None):
             if item["status"] not in {"awaiting_review", "approved", "revision_requested"}:
                 raise GateError("本集尚未进入审片阶段")
             valid_ids = {sh["id"] for sh in item["shots"]}
-            if shot_ids and not set(shot_ids) <= valid_ids:
+            if shot_ids is not None and (not isinstance(shot_ids, list) or
+                                        any(not isinstance(value, str) for value in shot_ids) or
+                                        not set(shot_ids) <= valid_ids):
                 raise ValueError("返工镜头 ID 不属于本集")
-            idx = s["episodes"].index(item)
-            _invalidate_episode(item, feedback, shot_ids)
-            for later in s["episodes"][idx + 1:]:
-                if any(sh.get("file") for sh in later["shots"]):
-                    _invalidate_episode(later, "前集已修改，连续性需重建：" + feedback)
+            selected = set(shot_ids or valid_ids)
+            targets = [sh for sh in item["shots"] if sh["id"] in selected]
+            for shot in targets:
+                # A clip already queued by a human decision needs no new attempt
+                # authorization. New instructions still apply to its next render.
+                if shot.get("status") == "planned" and not shot.get("file") and not shot.get("job_id"):
+                    continue
+                _check_shot_rejection(root, s, shot)
+            for shot in targets:
+                if shot.get("status") == "planned" and not shot.get("file") and not shot.get("job_id"):
+                    shot["feedback"] = feedback
+                else:
+                    _request_shot_revision(s, shot, feedback)
+            _invalidate_render(item, feedback)
+            shot_ids = [shot["id"] for shot in targets]
         elif kind == "shot":
-            if item["status"] != "review_required":
+            if item["status"] not in {"review_required", "accepted"}:
                 raise GateError("镜头不在人工复核阶段")
-            _invalidate_shot(item, feedback)
+            _check_shot_rejection(root, s, item)
+            _request_shot_revision(s, item, feedback)
         event(s, "human_rejected", kind=kind, id=item_id, version=version,
               feedback=feedback, shot_ids=shot_ids)
         s["status"] = "ready"

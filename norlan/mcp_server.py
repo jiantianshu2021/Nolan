@@ -110,7 +110,7 @@ TOOLS = [
           {"project": PATH, "episode_id": IDENTIFIER,
            "groups": {"type": "array", "minItems": 1, "maxItems": 100,
                       "items": {"type": "array", "items": IDENTIFIER, "minItems": 1, "maxItems": 3}}}),
-    _tool("run_production", "后台推进项目到下一审批、预算或配置关卡，立即返回。同项目不会重复启动。请先说明用户要求的生成工作；不自动批准、不增加预算。", {"project": PATH}),
+    _tool("run_production", "后台推进项目到下一审批、预算或配置关卡，立即返回。同项目不会重复启动。每个视频版本完成后仅提供GPT审查报告，等待用户本人在网页通过或填写意见返工；不能因GPT报告不通过而重生成。请先说明用户要求的生成工作；不自动批准、不增加预算。", {"project": PATH}),
     _tool("pause_production", "请求暂停明确项目；已提交供应商的任务可能继续，保留任务记录以便恢复。", {"project": PATH}),
     _tool("request_revision", "按用户明确意见对当前版本申请返工，自动使依赖结果失效。声音资产返工仅调整稳定声线属性，保持原文试音段落及中性语气；若选句不合适，先重新确认该角色的原文段落，不能把自由反馈直接当作台词。剧情表演意见应修改对应分镜。必须先查状态取得版本；不批准或自动启动。",
           {"project": PATH, "kind": {"type": "string", "enum": ["plan", "asset", "episode", "shot"]},
@@ -124,7 +124,7 @@ TOOLS = [
            "audition_reason": {"type": "string", "minLength": 1, "maxLength": 4000}}),
     _tool("correct_captions", "为明确集数和版本登记字幕修改意见，保留画面及时间轴；之后用 run_production 处理并等待重新审片。",
           {"project": PATH, "id": IDENTIFIER, "version": VERSION, "correction": NONEMPTY}),
-    _tool("open_review", "在本机浏览器打开项目审片页，供用户本人批准规划、资产与每集成片。模型不能代替用户操作审批。", {"project": PATH}),
+    _tool("open_review", "在本机浏览器打开项目审片页，供用户本人批准规划、资产、每个视频片段与每集成片。GPT报告只供参考，模型不能代替用户操作审批或返工按钮。", {"project": PATH}),
     _tool("set_creative_brief", "仅保存创作要求，不更改模型、凭证、预算或审批状态；已有规划需另行修改。", {"project": PATH, "brief": TEXT}),
 ]
 TOOL_MAP = {item["name"]: item for item in TOOLS}

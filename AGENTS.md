@@ -2,7 +2,10 @@
 
 Use Chinese for user-facing copy. Keep provider/model choices explicit.
 
-- Never auto-approve a person, scene, voice, plan or episode.
+- Never auto-approve a person, scene, voice, plan, video segment or episode.
+- GPT video reviews are advisory only. Every new video version waits for the
+  user's decision. Only explicit human rework requests authorize another video
+  submission; resuming a task or a failed report never does.
 - Each next episode is blocked until the preceding final render is approved.
 - Reserve cost before a paid POST. Unknown submission outcomes must not be
   retried. Persist the provider ID before polling or downloading.

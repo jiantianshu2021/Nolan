@@ -11,7 +11,7 @@ from norlan import core, dashboard, pipeline
 from norlan.billing import IMAGE_MODEL
 from norlan.progress import episode_progress
 from test_asset_inputs import data_url, png_data
-from test_pipeline import choose_gpt_assets, fake_media, write
+from test_pipeline import choose_gpt_assets, fake_media, write, run_with_shot_approvals
 
 
 class PipelineIntakeTests(unittest.TestCase):
@@ -127,7 +127,7 @@ class PipelineIntakeTests(unittest.TestCase):
         brain.assert_not_called()
         reserve.assert_not_called()
 
-    def test_automatic_retry_moves_failed_clip_to_history_before_next_refinement(self):
+    def test_human_retry_moves_failed_clip_to_history_before_next_refinement(self):
         with fake_media():
             choose_gpt_assets(self.root)
             state = pipeline.run(self.root)
@@ -152,7 +152,7 @@ class PipelineIntakeTests(unittest.TestCase):
                     shot = current["episodes"][0]["shots"][0]
                     for field in ("file", "sha256", "evidence", "review", "refined_prompt", "job_id"):
                         self.assertNotIn(field, shot)
-                    self.assertEqual(shot.get("revision", 0), initial.get("revision", 0))
+                    self.assertEqual(shot.get("revision", 0), initial.get("revision", 0) + 1)
                     self.assertEqual(shot["feedback"], "修正人物位置")
                     history = shot["history"][0]
                     self.assertEqual(history["version"], 1)
@@ -164,14 +164,18 @@ class PipelineIntakeTests(unittest.TestCase):
                     self.assertFalse(public["progress"]["completed"])
                     self.assertEqual(public["progress"]["stage"], "shot_preparation")
                     self.assertEqual(public["progress"]["target_version"], 2)
-                    self.assertEqual(public["history"], [{"file": history["file"], "version": 1}])
+                    self.assertEqual(public["history"][0]["file"], history["file"])
+                    self.assertEqual(public["history"][0]["version"], 1)
                     raise core.GateError("Synthetic stop before second submission")
                 return {"prompt": "SYNTHETIC VIDEO", "dialogue": "", "continuity_notes": "synthetic"}
 
             with patch.object(pipeline, "_ark", return_value=provider), \
-                 patch.object(pipeline, "_brain", side_effect=brain), \
-                 self.assertRaisesRegex(core.GateError, "Synthetic stop before second submission"):
-                pipeline._shot(self.root, "E001", "E001-S001", None)
+                 patch.object(pipeline, "_brain", side_effect=brain):
+                self.assertFalse(pipeline._shot(self.root, "E001", "E001-S001", None))
+                self.assertEqual(refinements, [0])
+                core.reject(self.root, "shot", "E001-S001", 1, "修正人物位置")
+                with self.assertRaisesRegex(core.GateError, "Synthetic stop before second submission"):
+                    pipeline._shot(self.root, "E001", "E001-S001", None)
             self.assertEqual(refinements, [0, 1])
             provider.submit_video.assert_called_once()
 
@@ -225,7 +229,7 @@ class PipelineIntakeTests(unittest.TestCase):
             with patch.object(pipeline, "_ark", return_value=provider), \
                  patch.object(pipeline, "_brain", side_effect=brain), \
                  patch.object(pipeline, "_progress", side_effect=record):
-                state = pipeline.run(self.root)
+                state = run_with_shot_approvals(self.root)
 
         self.assertEqual(state["status"], "awaiting_episode_review", state.get("last_error"))
         stages = [stage for stage, _ in observed]

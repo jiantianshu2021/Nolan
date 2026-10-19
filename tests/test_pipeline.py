@@ -26,6 +26,20 @@ def choose_gpt_assets(root):
                              input_state(asset)["revision"], "gpt", "")
 
 
+def run_with_shot_approvals(root):
+    """Synthetic human decisions for fixtures that need a rendered episode."""
+    for _ in range(20):
+        state = pipeline.run(root)
+        if state["status"] != "review_required":
+            return state
+        pending = [shot for episode in state["episodes"] for shot in episode["shots"]
+                   if shot["status"] == "review_required"]
+        if not pending or not pending[0].get("file"):
+            raise AssertionError("Synthetic fixture has no candidate for a human to approve")
+        core.approve(root, "shot", pending[0]["id"], pending[0]["version"])
+    raise AssertionError("Synthetic fixture exceeded its bounded approval loop")
+
+
 @contextmanager
 def fake_media():
     """Fast deterministic media for state-machine tests; real smoke test below."""
@@ -85,7 +99,7 @@ class PipelineTests(unittest.TestCase):
     def test_episode_gate_rework_and_cross_episode_actual_context(self):
         with fake_media():
             self.ready()
-            state = pipeline.run(self.root)
+            state = run_with_shot_approvals(self.root)
             self.assertEqual(state["status"], "awaiting_episode_review")
             first = state["episodes"][0]
             self.assertEqual(state["episodes"][1]["status"], "planned")
@@ -94,13 +108,13 @@ class PipelineTests(unittest.TestCase):
             pipeline.run(self.root)
             self.assertEqual(len(core.load_project(self.root)["jobs"]), before)
             core.reject(self.root, "episode", "E001", first["version"], "最后一镜动作修正", ["E001-S002"])
-            state = pipeline.run(self.root)
+            state = run_with_shot_approvals(self.root)
             self.assertEqual(state["episodes"][0]["shots"][0]["version"], 1)
             self.assertEqual(state["episodes"][0]["shots"][1]["version"], 2)
             with self.assertRaises(core.GateError):
                 core.approve(self.root, "episode", "E001", first["version"])
             core.approve(self.root, "episode", "E001", state["episodes"][0]["version"])
-            state = pipeline.run(self.root)
+            state = run_with_shot_approvals(self.root)
             self.assertEqual(state["episodes"][1]["status"], "awaiting_review")
             context = state["episodes"][1]["shots"][0]["reference_manifest"]["context"]
             self.assertEqual(context["previous_actual"]["shot_id"], "E001-S002")
@@ -219,11 +233,11 @@ class PipelineTests(unittest.TestCase):
     def test_changed_approved_episode_export_blocks_next_episode(self):
         with fake_media():
             self.ready()
-            state = pipeline.run(self.root)
+            state = run_with_shot_approvals(self.root)
             first = state["episodes"][0]
             core.approve(self.root, "episode", "E001", first["version"])
             write(self.root / first["file"], b"changed approved episode")
-            state = pipeline.run(self.root)
+            state = run_with_shot_approvals(self.root)
             self.assertEqual(state["status"], "blocked")
             self.assertFalse(any(j["item_id"].startswith("E002") for j in state["jobs"].values()))
 
@@ -239,7 +253,7 @@ class PipelineTests(unittest.TestCase):
                 state = pipeline.run(self.root)
             self.assertEqual(len(state["jobs"]), before)
             state = pipeline.run(self.root)
-            self.assertEqual(state["status"], "awaiting_episode_review")
+            self.assertEqual(state["status"], "review_required")
 
     def test_demo_cannot_call_paid_services_even_when_configured(self):
         core.configure(self.root, {"music": {"mode": "volc", "call_cap": 1},
@@ -270,51 +284,58 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(state["budget"]["unknown"], 4)
             ark.assert_not_called()
 
-    def test_human_revision_does_not_reset_total_attempt_cap(self):
+    def test_explicit_human_revision_can_generate_once_beyond_old_attempt_cap(self):
         with fake_media():
             self.ready()
             core.configure(self.root, {"max_attempts": 1})
             state = pipeline.run(self.root)
-            core.reject(self.root, "episode", "E001", state["episodes"][0]["version"], "重做第二镜", ["E001-S002"])
+            self.assertEqual(state["status"], "review_required")
+            shot = state["episodes"][0]["shots"][0]
+            core.reject(self.root, "shot", shot["id"], shot["version"], "用户明确要求改正动作")
             before = len(core.load_project(self.root)["jobs"])
             state = pipeline.run(self.root)
-            self.assertEqual(state["status"], "blocked")
-            self.assertIn("达到上限", state["last_error"])
-            self.assertEqual(len(state["jobs"]), before)
+            self.assertEqual(state["status"], "review_required")
+            self.assertEqual(state["episodes"][0]["shots"][0]["version"], 2)
+            self.assertEqual(len(state["jobs"]), before + 1)
+            self.assertEqual(len(pipeline.run(self.root)["jobs"]), before + 1)
 
     def test_approved_episode_invalidated_when_prior_episode_changes(self):
         with fake_media():
             self.ready()
-            state = pipeline.run(self.root)
+            state = run_with_shot_approvals(self.root)
             core.approve(self.root, "episode", "E001", state["episodes"][0]["version"])
-            state = pipeline.run(self.root)
+            state = run_with_shot_approvals(self.root)
             core.approve(self.root, "episode", "E002", state["episodes"][1]["version"])
             core.reject(self.root, "episode", "E001", state["episodes"][0]["version"], "改变结尾", ["E001-S002"])
             state = core.load_project(self.root)
             self.assertEqual(state["episodes"][1]["status"], "revision_requested")
-            self.assertTrue(all(sh["status"] == "planned" for sh in state["episodes"][1]["shots"]))
+            self.assertTrue(all(sh["status"] == "review_required" for sh in state["episodes"][1]["shots"]))
             self.assertNotIn("approved_sha256", state["episodes"][1])
 
-    def test_attempt_cap_includes_provider_failures_and_prior_revisions(self):
+    def test_provider_failure_waits_for_explicit_human_retry(self):
         with fake_media():
             self.ready()
-            core.configure(self.root, {"max_attempts": 2})
             self.live()
             api = Mock()
             api.submit_video.side_effect = ProviderError("rejected", uncertain=False)
             refinement = {"prompt": "new", "dialogue": "", "continuity_notes": "none"}
             with patch.object(pipeline, "_ark", return_value=api), patch.object(pipeline, "_brain", return_value=refinement):
-                pipeline.run(self.root)
+                state = pipeline.run(self.root)
                 pipeline.run(self.root)
                 state = pipeline.run(self.root)
+                self.assertEqual(state["status"], "review_required")
+                self.assertEqual(api.submit_video.call_count, 1)
+                core.reject(self.root, "shot", "E001-S001", 1, "用户要求再试一次")
+                state = pipeline.run(self.root)
+                pipeline.run(self.root)
             self.assertEqual(api.submit_video.call_count, 2)
-            self.assertIn("达到上限", state["last_error"])
+            self.assertEqual(state["status"], "review_required")
             self.assertEqual(state["budget"]["spent"], 8)
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires FFmpeg")
     def test_real_synthetic_media_end_to_end(self):
         self.ready()
-        state = pipeline.run(self.root)
+        state = run_with_shot_approvals(self.root)
         self.assertEqual(state["status"], "awaiting_episode_review", state.get("last_error"))
         first = state["episodes"][0]
         info = pipeline.media.probe(self.root / first["file"])
@@ -322,7 +343,7 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(info["duration"], 7)
         self.assertFalse(any(j["item_id"].startswith("E002") for j in state["jobs"].values()))
         core.approve(self.root, "episode", "E001", first["version"])
-        state = pipeline.run(self.root)
+        state = run_with_shot_approvals(self.root)
         self.assertEqual(state["episodes"][1]["status"], "awaiting_review", state.get("last_error"))
 
 
