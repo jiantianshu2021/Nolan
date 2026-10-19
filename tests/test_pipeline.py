@@ -223,6 +223,24 @@ class PipelineTests(unittest.TestCase):
             state = pipeline.run(self.root)
             self.assertEqual(state["status"], "awaiting_episode_review")
 
+    def test_demo_cannot_call_paid_services_even_when_configured(self):
+        core.configure(self.root, {"music": {"mode": "volc", "call_cap": 1},
+                                  "subtitles": {"mode": "openai", "call_cap": 1}}, limit=10)
+        episode = pipeline.demo_plan()["episodes"][0]
+        for shot in episode["shots"]:
+            shot["sha256"] = "synthetic-test-hash"
+        with patch("norlan.music.MusicProvider") as music, patch("norlan.transcription.Transcriber") as asr, patch("norlan.brain.Brain") as brain:
+            with self.assertRaises(core.GateError):
+                pipeline._soundtrack(self.root, episode)
+            with self.assertRaises(core.GateError):
+                pipeline._captions(self.root, episode)
+            with self.assertRaises(core.GateError):
+                pipeline._brain(self.root, "plan", "test")
+            music.assert_not_called()
+            asr.assert_not_called()
+            brain.assert_not_called()
+        self.assertFalse(core.load_project(self.root)["jobs"])
+
     def test_interrupted_submission_enters_unknown_gate(self):
         with fake_media():
             self.ready()

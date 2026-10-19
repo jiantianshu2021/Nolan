@@ -46,6 +46,8 @@ def _gate(root):
 def _brain(root, method, *args, **kwargs):
     from .brain import Brain
     s = _gate(root)
+    if s["mode"] == "demo":
+        raise core.GateError("演示项目不调用在线模型；请新建 live 项目进行真实制作")
     job_id = "gpt-" + uuid.uuid4().hex[:12]
     amount = 0 if s["mode"] == "demo" else s["settings"]["caps"]["llm"]
     core.reserve(root, job_id, "llm", method, amount)
@@ -389,6 +391,8 @@ def _soundtrack(root, ep):
         return target
     if mode != "volc":
         raise core.GateError("配乐模式必须为 none / file / volc")
+    if s["mode"] == "demo":
+        raise core.GateError("演示项目不能提交在线配乐任务，请新建 live 项目")
     from .music import MusicProvider
     provider = MusicProvider(music_cfg)
     provider._credentials()
@@ -459,6 +463,8 @@ def _captions(root, ep):
         return None, "disabled"
     if config.get("mode") != "openai":
         raise core.GateError("字幕模式只能是 none / openai")
+    if s["mode"] == "demo":
+        raise core.GateError("演示项目不能提交在线转录任务，请新建 live 项目")
     from .transcription import Transcriber
     transcriber = Transcriber(config)
     # Validate credentials before reserving a paid call.
