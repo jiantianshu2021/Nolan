@@ -128,6 +128,7 @@ def _bound_shot_job(state, shot):
 def _public_shot_failures(state, shot):
     """Expose only sanitized diagnostics, bound to the current attempt or history."""
     from .failures import sanitize_failure
+    from .core import execution_unsettled
     job = _bound_shot_job(state, shot)
     unknown = job.get("state") == "uncertain" or job.get("accounting") == "unknown"
     recoverable = bool(not unknown and job.get("task_id") and job.get("state") in {"submitted", "download_pending"}
@@ -151,9 +152,7 @@ def _public_shot_failures(state, shot):
         result["failure_recoverable"] = recoverable
         if unknown and not job.get("failure"):
             result["failure"]["message"] = "调用结果尚未核实，不能再次提交。请先核实原任务结果。"
-        unsettled = any(isinstance(item, dict) and (item.get("accounting") in {"reserved", "unknown"}
-                        or item.get("state") in {"submitting", "submitted", "download_pending", "uncertain"})
-                        for item in state.get("jobs", {}).values())
+        unsettled = any(execution_unsettled(item) for item in state.get("jobs", {}).values() if isinstance(item, dict))
         result["can_retry"] = bool(failed and shot.get("generation_error") and job.get("state") == "failed"
                                    and job.get("accounting") in {"spent", "released"}
                                    and not result["failure"].get("uncertain") and not unsettled
@@ -308,6 +307,7 @@ def _public_asset_failure(state, asset):
     if asset.get("status") != "generation_failed":
         return {}
     from .failures import sanitize_failure
+    from .core import execution_unsettled
     value = asset.get("generation_error")
     diagnostic = sanitize_failure({"message": value}) if isinstance(value, str) and value else {}
     result = {"generation_error": diagnostic.get("message") or "本次资产生成失败，旧版本保留，等待你处理。"}
@@ -322,9 +322,7 @@ def _public_asset_failure(state, asset):
         failure.update(uncertain=True)
     if failure:
         result["failure"] = failure
-    unsettled = any(isinstance(item, dict) and (item.get("accounting") in {"reserved", "unknown"}
-                    or item.get("state") in {"submitting", "submitted", "download_pending", "uncertain"})
-                    for item in state.get("jobs", {}).values())
+    unsettled = any(execution_unsettled(item) for item in state.get("jobs", {}).values() if isinstance(item, dict))
     result["can_retry"] = bool(not uncertain and not unsettled and not failure.get("uncertain")
                                and job.get("state") == "failed" and job.get("accounting") in {"spent", "released"}
                                and _version(asset.get("version")) > 0)
@@ -346,7 +344,7 @@ def _public_shot_report(record, version):
     for key in ("observed_end_state", "repair_prompt", "scope"):
         if isinstance(review.get(key), str):
             result[key] = review[key][:16000]
-    for key in ("audio_checked", "whole_video_checked", "audio_assessed"):
+    for key in ("audio_checked", "whole_video_checked", "audio_assessed", "report_unavailable", "review_interrupted"):
         if type(review.get(key)) is bool:
             result[key] = review[key]
     return result
@@ -467,7 +465,9 @@ def _shot_progress(state, episode, shot, episode_status, stamp):
     elif status == "generation_failed" or (status == "review_required" and not artifact) or job.get("state") == "failed":
         result.update(stage="failed", label="生成失败，等待处理", waiting_for_human=True)
     elif status == "review_required":
-        result.update(stage="review_required", label="已生成，等待你审批", waiting_for_human=True)
+        report = _public_shot_report(shot, version) if artifact else None
+        interrupted = report and report.get("report_unavailable") is True and report.get("review_interrupted") is True
+        result.update(stage="review_required", label="视频已生成，GPT 报告中断，等待你审批" if interrupted else "已生成，等待你审批", waiting_for_human=True)
     else:
         if status == "reviewing" and artifact:
             phase = "shot_review"
@@ -501,6 +501,11 @@ def _shot_progress(state, episode, shot, episode_status, stamp):
 def public_state(state: dict) -> dict:
     """Keep credentials, source novel, provider responses and settings off the UI API."""
     result = _pick(state, ("id", "title", "mode", "status", "paused", "created_at", "updated_at"))
+    from .core import is_nonblocking_advisory_unknown
+    result["pending_advisory_count"] = sum(is_nonblocking_advisory_unknown(job)
+                                            for job in state.get("jobs", {}).values() if isinstance(job, dict))
+    result["pending_advisory_notice"] = (f"有 {result['pending_advisory_count']} 次 GPT 审查调用的费用或额度待核实，未自动重试。"
+                                         if result["pending_advisory_count"] else "")
     result["plan"] = _pick(state.get("plan", {}), ("status", "version", "style", "ratio", "feedback"))
     if state.get("last_error"):
         message = str(state["last_error"])[:1500]

@@ -86,6 +86,36 @@ def event(project_state, action, **details):
     project_state["events"].append({"time": now(), "action": action, **details})
 
 
+def is_nonblocking_advisory_unknown(job):
+    """A lost advisory result may be skipped without inventing a billing outcome.
+
+    This narrow execution exception never settles the ledger. A recovered
+    review needs an explicit durable no-retry marker; amount zero, an LLM kind,
+    or an arbitrary purpose label alone cannot exempt an unknown submission.
+    """
+    if not isinstance(job, dict):
+        return False
+    recovery = job.get("advisory_recovery")
+    return (job.get("kind") == "llm" and job.get("item_id") == "review"
+            and job.get("task_id") is None and job.get("accounting") == "unknown"
+            and job.get("state") == "uncertain" and isinstance(recovery, dict)
+            and recovery.get("status") == "interrupted" and recovery.get("no_retry") is True)
+
+
+def blocking_unknown_jobs(state):
+    """Return unresolved jobs whose execution still blocks new production."""
+    return [job for job in state.get("jobs", {}).values()
+            if (job.get("accounting") == "unknown" or job.get("state") == "uncertain")
+            and not is_nonblocking_advisory_unknown(job)]
+
+
+def execution_unsettled(job):
+    """Separate execution gates from honest, still-unresolved cost accounting."""
+    return (isinstance(job, dict) and not is_nonblocking_advisory_unknown(job)
+            and (job.get("accounting") in {"reserved", "unknown"}
+                 or job.get("state") in {"submitting", "submitted", "download_pending", "uncertain"}))
+
+
 def _totals(state):
     from .billing import summarize_costs
     b = state["budget"]
@@ -297,7 +327,7 @@ def install_plan(root, plan):
             except AuditionSelectionError:
                 raise PlanValidationError("voice_selection_invalid", f"plan.assets[{index}].audition_source") from None
     with transaction(root) as s:
-        if any(j["state"] in {"submitting", "submitted", "download_pending", "uncertain"} for j in s["jobs"].values()):
+        if any(execution_unsettled(job) for job in s["jobs"].values()):
             raise GateError("尚有未完成或结果不明的调用，不能覆盖规划")
         if any(a.get("file") for a in s["assets"]) or any(e.get("file") for e in s["episodes"]):
             raise GateError("已生成素材的项目不能直接覆盖规划，请新建项目或进行局部返工")
@@ -403,10 +433,9 @@ def normalize_voice_sources(root, *, already_locked=False):
             return state
         source_ids = {asset["id"] for asset in sources}
         for job in state["jobs"].values():
-            if job.get("accounting") == "unknown" or job.get("state") == "uncertain":
+            if (job.get("accounting") == "unknown" or job.get("state") == "uncertain") and not is_nonblocking_advisory_unknown(job):
                 raise GateError("存在结果不明的调用，请先核实原任务；内部声源记录暂不迁移")
-            if job.get("item_id") in source_ids and (job.get("accounting") == "reserved" or
-                    job.get("state") in {"submitting", "submitted", "download_pending"}):
+            if job.get("item_id") in source_ids and execution_unsettled(job):
                 raise GateError("声源自身尚有未完成的旧素材任务，请先恢复原任务；内部绑定暂不迁移")
         valid_baselines = []
         for amendment in state.get("asset_amendments", []):
@@ -475,7 +504,7 @@ def _editable_asset_input(state, asset_id, asset_version, input_revision):
         raise GateError("资产输入已更新，请刷新网页后重新确认。")
     if has_started(state, asset) or asset.get("status") != "planned":
         raise GateError("该资产已开始生成，初始描述和参考图不能再修改；请通过资产返工提出修改意见。")
-    if any(job.get("accounting") in {"reserved", "unknown"} for job in state["jobs"].values()):
+    if any(execution_unsettled(job) for job in state["jobs"].values()):
         raise GateError("尚有在途或结果不明的调用，请等待落盘或完成对账后再修改资产输入。")
     return asset, data
 
@@ -487,7 +516,7 @@ def set_remaining_asset_inputs_gpt(root, plan_version):
         _check_version(state["plan"], plan_version)
         if state["plan"].get("status") != "approved":
             raise GateError("请先批准当前策划，再确认资产生成方式。")
-        if any(job.get("accounting") in {"reserved", "unknown"} for job in state["jobs"].values()):
+        if any(execution_unsettled(job) for job in state["jobs"].values()):
             raise GateError("尚有在途或结果不明的调用，请等待落盘或完成对账后再修改资产输入。")
         selected = []
         for asset in state["assets"]:
@@ -647,12 +676,22 @@ def _shot_decision(shot, decision, feedback="", *, continuity_checked=None):
                     review.get("sha256") == shot["sha256"] and
                     ("version" not in review or (type(review["version"]) is int and
                                                  review["version"] == shot["version"])))
+    report_unavailable = isinstance(review, dict) and review.get("report_unavailable") is True
+    report_available = report_bound and not report_unavailable
+    report = ({key: copy.deepcopy(review[key]) for key in ("verdict", "issues") if key in review}
+              if report_available else {})
+    if report_bound and report_unavailable:
+        report = {key: copy.deepcopy(review[key]) for key in
+                  ("report_unavailable", "review_interrupted", "scope", "version", "sha256") if key in review}
+    note = ("自动审查报告未完成或不可用；这里仅保留缺失状态和版本元数据，人工决定针对实际观看的这个版本视频。"
+            if report_unavailable else
+            "报告保留 GPT 的原始检查意见，未经用户逐条核实；人工决定针对这个版本的整体成片。"
+            if report_bound else
+            "现有检查报告未绑定当前视频版本，未作为本次人工决定的报告依据；人工决定针对实际观看的这个版本。")
     record = {"decision": decision, "version": shot["version"], "sha256": shot.get("sha256"),
               "at": now(), "feedback": feedback,
-              "report": {key: copy.deepcopy(review[key]) for key in ("verdict", "issues") if key in review} if report_bound else {},
-              "report_bound": report_bound,
-              "report_note": ("报告保留 GPT 的原始检查意见，未经用户逐条核实；人工决定针对这个版本的整体成片。"
-                              if report_bound else "现有检查报告未绑定当前视频版本，未作为本次人工决定的报告依据；人工决定针对实际观看的这个版本。")}
+              "report": report, "report_bound": report_bound, "report_available": report_available,
+              "report_note": note}
     if not shot.get("file"):
         record.update(job_id=shot.get("job_id"), revision=shot.get("revision", 0),
                       outcome="generation_failed")
@@ -816,9 +855,7 @@ def reject(root, kind, item_id, version, feedback, shot_ids=None):
     if not isinstance(feedback, str) or not feedback.strip():
         raise ValueError("返工意见不能为空")
     with run_lock(root), transaction(root) as s:
-        if any(j["accounting"] in {"reserved", "unknown"} or
-               j.get("state") in {"submitting", "submitted", "download_pending", "uncertain"}
-               for j in s["jobs"].values()):
+        if any(execution_unsettled(job) for job in s["jobs"].values()):
             raise GateError("尚有调用在执行，请先暂停并等待在途任务落盘后再返工")
         item = _find(s, kind, item_id)
         _check_version(item, version)
@@ -917,8 +954,7 @@ def request_caption_fix(root, item_id, version, feedback):
 
 
 def _amendment_idle(state):
-    if any(job.get("accounting") in {"reserved", "unknown"} or job.get("state") in
-           {"submitting", "submitted", "download_pending", "uncertain"} for job in state["jobs"].values()):
+    if any(execution_unsettled(job) for job in state["jobs"].values()):
         raise GateError("尚有在途或结果不明的调用，请先恢复原任务或核实结果，再提出资产增补")
 
 
@@ -1216,15 +1252,60 @@ def configure(root, settings=None, limit=None, currency=None):
     return load_project(root)
 
 
-def reserve(root, job_id, kind, item_id, amount, *, pricing=None):
+def _validate_advisory_target(root, state, kind, item_id, target):
+    if target is None:
+        return None
+    if kind != "llm" or item_id != "review" or not isinstance(target, dict):
+        raise ValueError("审查目标只可登记到 llm/review 调用，且必须为对象")
+    target_kind = target.get("kind")
+    if not isinstance(target_kind, str) or target_kind not in {"shot", "rough_cut"}:
+        raise ValueError("审查目标类型或字段不合法；仅支持片段或累计粗剪的完整绑定")
+    common = {"kind", "id", "sha256", "file"}
+    expected = common | ({"version", "video_job_id"} if target_kind == "shot" else {"key"})
+    if set(target) != expected:
+        raise ValueError("审查目标类型或字段不合法；仅支持片段或累计粗剪的完整绑定")
+    if (not isinstance(target["id"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", target["id"])
+            or not isinstance(target["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", target["sha256"])
+            or not isinstance(target["file"], str) or not 1 <= len(target["file"]) <= 4096
+            or Path(target["file"]).is_absolute()):
+        raise ValueError("审查目标须提供有效 ID、SHA256 与项目内相对文件路径")
+    safe_path(root, target["file"])
+    if target["kind"] == "shot":
+        if (type(target["version"]) is not int or target["version"] < 1
+                or not isinstance(target["video_job_id"], str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", target["video_job_id"])):
+            raise ValueError("片段审查目标须绑定整数版本和原视频任务 ID")
+        shot = _find(state, "shot", target["id"])
+        if any(shot.get(key) != target[key] for key in ("version", "sha256", "file")) or shot.get("job_id") != target["video_job_id"]:
+            raise GateError("审查目标与当前视频版本不符，未提交审查")
+        video_job = state["jobs"].get(target["video_job_id"], {})
+        if (video_job.get("kind") != "video" or video_job.get("item_id") != shot["id"]
+                or video_job.get("state") != "completed" or video_job.get("output") != target["file"]):
+            raise GateError("审查目标缺少已完成且匹配的原视频任务，未提交审查")
+        _check_shot_artifact(root, state, shot)
+    else:
+        if not isinstance(target["key"], str) or not 1 <= len(target["key"]) <= 128:
+            raise ValueError("累计粗剪审查目标须提供非空批次标识")
+        episode = _find(state, "episode", target["id"])
+        same_key = [cut for cut in episode.get("rough_cuts", []) if cut.get("key") == target["key"]]
+        if same_key and not any(cut.get("file") == target["file"] and cut.get("sha256") == target["sha256"] for cut in same_key):
+            raise GateError("累计粗剪审查目标与已登记批次不符，未提交审查")
+        # A one-shot episode can have a verified cut before it is registered in
+        # rough_cuts; its exact bytes are still bound here before the LLM call.
+        _check_artifact(root, target)
+    return copy.deepcopy(target)
+
+
+def reserve(root, job_id, kind, item_id, amount, *, pricing=None, advisory_target=None):
     """Persist BEFORE calling provider. Unknown outcomes stay charged/reserved."""
     with transaction(root) as s:
         if job_id in s["jobs"]:
             raise GateError("调用已登记，必须恢复原调用，不能重复提交")
         if s["paused"]:
             raise GateError("制作已暂停")
-        if any(j["accounting"] == "unknown" for j in s["jobs"].values()):
+        if blocking_unknown_jobs(s):
             raise GateError("存在未核实调用，必须先对账才能提交新任务")
+        checked_target = _validate_advisory_target(root, s, kind, item_id, advisory_target)
         if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount) or amount < 0:
             raise ValueError("预算金额无效")
         if s["mode"] == "live" and kind != "llm" and (not s["budget"]["approved"] or amount <= 0):
@@ -1241,6 +1322,8 @@ def reserve(root, job_id, kind, item_id, amount, *, pricing=None):
         s["jobs"][job_id] = {"id": job_id, "kind": kind, "item_id": item_id,
             "amount": round(amount, 6), "accounting": "reserved", "state": "submitting",
             "created_at": now(), "task_id": None}
+        if kind == "llm" and item_id == "review":
+            s["jobs"][job_id].update(purpose="advisory_review", advisory_target=checked_target)
         if pricing is not None:
             s["jobs"][job_id]["billing"] = {"price": copy.deepcopy(pricing),
                 "currency": s["budget"]["currency"], "status": "usage_missing"}
@@ -1251,7 +1334,7 @@ def reserve(root, job_id, kind, item_id, amount, *, pricing=None):
 def update_job(root, job_id, **values):
     with transaction(root) as s:
         j = s["jobs"][job_id]
-        if set(values) & {"id", "item_id", "kind", "amount", "created_at", "billing"}:
+        if set(values) & {"id", "item_id", "kind", "amount", "created_at", "billing", "purpose", "advisory_target"}:
             raise ValueError("已登记的调用身份和预算金额不可更改")
         if "accounting" in values and values["accounting"] not in {"spent", "reserved", "unknown", "released"}:
             raise ValueError("账本状态无效")
@@ -1361,8 +1444,7 @@ def set_voice_audition(root, asset_id, text, source, reason):
             raise GateError("仅待制作或已申请返工的声音可调整选句；候选或已批准声音须先由用户明确提出返工。")
         jobs = [job for job in state["jobs"].values()
                 if job.get("kind") == "voice" and job.get("item_id") == asset_id]
-        if any(job.get("accounting") == "unknown" or job.get("state") in
-               {"submitting", "submitted", "download_pending"} for job in jobs):
+        if any(execution_unsettled(job) for job in jobs):
             raise GateError("该声音尚有在途或结果不明的调用；请先恢复原任务或完成对账，再调整试音选句。")
         active = state["jobs"].get(asset.get("job_id", ""), {})
         if asset["status"] != "rejected" and active.get("state") == "completed":

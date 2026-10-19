@@ -123,7 +123,7 @@ TOOLS = [
           {"project": PATH, "episode_id": IDENTIFIER,
            "groups": {"type": "array", "minItems": 1, "maxItems": 100,
                       "items": {"type": "array", "items": IDENTIFIER, "minItems": 1, "maxItems": 3}}}),
-    _tool("run_production", "后台推进项目到下一审批、预算或配置关卡，立即返回。同项目不会重复启动。每个视频版本完成后仅提供GPT审查报告，等待用户本人在网页通过或填写意见返工；不能因GPT报告不通过而重生成。请先说明用户要求的生成工作；不自动批准、不增加预算。", {"project": PATH}),
+    _tool("run_production", "后台推进项目到下一审批、预算或配置关卡，立即返回。同项目不会重复启动。每个视频版本完成后仅提供GPT审查报告，等待用户本人在网页通过或填写意见返工；不能因GPT报告不通过而重生成。审查报告中断不表示视频失败；已有视频通过文件/版本校验后恢复原报告，缺失则标记未完成交给用户审批，不自动重新审查或生成。审查调用的未知费用保持待核实，不能无凭据要求对账成已花费或未收费。请先说明用户要求的生成工作；不自动批准、不增加预算。", {"project": PATH}),
     _tool("pause_production", "请求暂停明确项目；已提交供应商的任务可能继续，保留任务记录以便恢复。", {"project": PATH}),
     _tool("request_revision", "按用户明确意见对当前版本申请返工，自动使依赖结果失效。声音资产返工仅调整稳定声线属性，保持原文试音段落及中性语气；若选句不合适，先重新确认该角色的原文段落，不能把自由反馈直接当作台词。剧情表演意见应修改对应分镜。必须先查状态取得版本；不批准或自动启动。",
           {"project": PATH, "kind": {"type": "string", "enum": ["plan", "asset", "episode", "shot"]},
@@ -215,6 +215,7 @@ def _diagnostic(message):
     """Classify known failures without echoing arbitrary provider/local text."""
     raw = str(message).lower()
     rules = (
+        ("advisory_review", ("审查报告未完成", "审查报告中断", "报告中断"), "GPT 审查报告未完成不表示视频失败；请查看已保存视频并由用户审批。恢复不重新审查或生成，原审查调用费用仍按记录待核实，不能凭空认定已收费或免费。"),
         ("voice_selection", ("试音", "选句"), "声音试音选句尚未就绪或未通过原文、说话人归属及长度校验；请查看该声音的 audition_text/source/reason，用 set_voice_audition 保存合适原句；缺少合适原文时须请用户补充。"),
         ("unknown_submission", ("结果不明", "未核实", "必须先对账", "未知任务", "缺少 id"), "存在结果不明或需对账的调用；请用户核实原任务，不能重复提交。"),
         ("budget", ("预算", "caps.llm", "价格上限", "费用上限"), "项目预算或每次调用费用上限未设置或不足；请用户在终端核对，模型不能提高预算。"),
@@ -303,6 +304,7 @@ class MCPServer:
             "asset_creation": "首次生成资产前，请用户在网页选择由 GPT 决定或自行描述并提供参考图片；模型不能代替用户选择。",
             "segment_proposal": "重分组仅限暂停且无在途任务时的尚未启动尾部；用 propose_segments 保存候选，再由用户在网页确认。不能重跑资产或替换现有规划。",
             "asset_amendment": "片段返修需要新资产时，使用 propose_asset_amendment；先由用户确认增补方案，再批准新增资产，最后确认返修提示词。不能调用 save_plan 替换旧计划。",
+            "advisory_review": "GPT 审查报告中断不等于视频失败；有已核实视频时请 open_review 供用户看片审批，不自动重新审查或生成。未知审查费用保留待核实，不要求用户无凭据对账成已花费或未收费。",
             "budget": "预算仅由用户在终端执行 nolan configure PROJECT --budget AMOUNT 设置；模型不能提高预算。",
             "configuration": "模型、单次调用价格上限及服务凭证须由用户通过本机配置设置。",
         }

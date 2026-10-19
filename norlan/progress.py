@@ -72,7 +72,7 @@ def episode_progress(state, episode, *, now=None):
     ``now`` accepts an ISO timestamp or datetime; without it elapsed counters
     are null, keeping this function deterministic for the supplied state.
     """
-    from .core import asset_ready, is_internal_voice_source
+    from .core import asset_ready, is_internal_voice_source, blocking_unknown_jobs
     public_assets = [asset for asset in state.get("assets", []) if not is_internal_voice_source(asset)]
     shots = episode.get("shots", [])
     weights = [_weight(shot) for shot in shots]
@@ -154,7 +154,7 @@ def episode_progress(state, episode, *, now=None):
     if state.get("paused") or state.get("status") == "paused":
         label = "已暂停；已提交的视频任务可能仍在生成" if active_jobs else "本集制作已暂停"
         return finish("paused", label)
-    if any(job.get("accounting") == "unknown" or job.get("state") == "uncertain" for job in jobs.values() if isinstance(job, dict)):
+    if blocking_unknown_jobs(state):
         return finish("unknown", "存在结果不明的调用，需核实原任务后继续", waiting=True)
     prompt_shot = next((shot for shot in shots if shot.get("status") == "awaiting_prompt_approval"), None)
     if prompt_shot:
@@ -171,7 +171,12 @@ def episode_progress(state, episode, *, now=None):
     if review_shot:
         result["current_shot"] = review_shot.get("id")
         result["current_shot_index"] = shots.index(review_shot) + 1
-        return finish("review_required", f"片段 {result['current_shot_index']}/{total} 需要人工复核", waiting=True)
+        report = review_shot.get("review", {})
+        interrupted = (isinstance(report, dict) and report.get("report_unavailable") is True
+                       and report.get("review_interrupted") is True and report.get("sha256") == review_shot.get("sha256")
+                       and report.get("version") == review_shot.get("version"))
+        label = f"片段 {result['current_shot_index']}/{total} GPT 报告中断，视频可人工审片" if interrupted else f"片段 {result['current_shot_index']}/{total} 需要人工复核"
+        return finish("review_required", label, waiting=True)
     if state.get("status") == "blocked":
         return finish("blocked", "制作暂时停止，请查看错误说明后继续", waiting=True)
     if active_job.get("state") == "failed":

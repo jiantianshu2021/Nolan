@@ -43,7 +43,7 @@ def _gate(root):
     state = core.load_project(root)
     if state["paused"]:
         raise core.GateError("已暂停；在途任务可能仍由供应商继续执行")
-    unknown = [j["id"] for j in state["jobs"].values() if j["accounting"] == "unknown"]
+    unknown = [j["id"] for j in core.blocking_unknown_jobs(state)]
     if unknown:
         raise core.GateError("存在结果不明的调用，请先对账，避免重复计费：" + ", ".join(unknown))
     return state
@@ -74,10 +74,12 @@ def _brain(root, method, *args, **kwargs):
             amount <= 0 or not s["budget"]["approved"]):
         raise core.GateError("GPT API 制作调用需要你先设置项目预算及 caps.llm 每次调用费用上限；尚未提交请求。")
     job_id = "gpt-" + uuid.uuid4().hex[:12]
-    core.reserve(root, job_id, "llm", method, amount)
+    target = (args[0].get("advisory_target") if method == "review" and args and isinstance(args[0], dict) else None)
+    core.reserve(root, job_id, "llm", method, amount, advisory_target=target)
     try:
         result = getattr(Brain(config), method)(*args, **kwargs)
-        core.update_job(root, job_id, state="completed", accounting="spent")
+        cached = {"review_result": copy.deepcopy(result), "review_result_hash": core._json_digest(result)} if method == "review" else {}
+        core.update_job(root, job_id, state="completed", accounting="spent", **cached)
         return result
     except Exception:
         # A response/schema error does not imply a free request.
@@ -121,6 +123,104 @@ def _archive_stale_shot_file(shot):
     for key in ("file", "sha256", "evidence", "review", "approved_at", "approved_sha256", "approved_version"):
         shot.pop(key, None)
     return True
+
+
+def _unavailable_review(message="GPT 审查中断，报告不可用。请自行观看当前视频，决定通过或返工。"):
+    return {"verdict": "uncertain", "issues": [message], "observed_end_state": "未核实", "repair_prompt": "",
+            "scope": "sampled_frames_only", "report_unavailable": True, "review_interrupted": True,
+            "advisory": True, "audio_checked": False, "whole_video_checked": False}
+
+
+def _cached_review(state, target):
+    """A persisted answer is reusable only for the exact completed artifact."""
+    from .brain import BrainError, REVIEW_SCHEMA, _validate
+    for job in reversed(list(state["jobs"].values())):
+        if (job.get("kind") != "llm" or job.get("item_id") != "review" or job.get("state") != "completed"
+                or job.get("advisory_target") != target or not isinstance(job.get("review_result"), dict)):
+            continue
+        result = job["review_result"]
+        try:
+            if core._json_digest(result) != job.get("review_result_hash"):
+                continue
+            fields = set(REVIEW_SCHEMA["properties"])
+            if set(result) - fields - {"scope", "audio_assessed"}:
+                continue
+            _validate({key: result[key] for key in fields if key in result}, REVIEW_SCHEMA)
+            if result.get("scope", "sampled_frames_only") != "sampled_frames_only" or result.get("audio_assessed", False) is not False:
+                continue
+        except (BrainError, ValueError, TypeError):
+            continue
+        return {**copy.deepcopy(result), "recovered_from_cache": True, "advisory": True,
+                "audio_checked": False, "whole_video_checked": False}
+    return None
+
+
+def _shot_review_target(shot):
+    return {"kind": "shot", "id": shot["id"], "version": shot["version"], "sha256": shot["sha256"],
+            "file": shot["file"], "video_job_id": shot["job_id"]}
+
+
+def _cut_review_target(episode_id, cut):
+    return {"kind": "rough_cut", "id": episode_id, "key": cut["key"],
+            "sha256": cut["sha256"], "file": cut["file"]}
+
+
+def _recover_advisory_reports(root, state):
+    """Restore human review without repeating an interrupted GPT or media call."""
+    recovered = {"shots": [], "rough_cuts": []}
+    for job in state["jobs"].values():
+        if (job.get("kind") == "llm" and job.get("item_id") == "review" and not job.get("task_id")
+                and job.get("state") == "uncertain" and job.get("accounting") == "unknown"
+                and job.get("purpose") in {None, "advisory_review"}
+                and not core.is_nonblocking_advisory_unknown(job)):
+            # This acknowledges only the review method. Legacy jobs did not
+            # record a target, so never invent one from nearby timestamps.
+            job["advisory_recovery"] = {"status": "interrupted", "no_retry": True,
+                "detected_at": core.now(), "result": "unavailable", "accounting_unresolved": True}
+            core.event(state, "advisory_review_interrupted", id=job["id"], accounting=job["accounting"])
+    for episode in state["episodes"]:
+        for shot in episode["shots"]:
+            if shot.get("status") != "reviewing":
+                continue
+            job = state["jobs"].get(shot.get("job_id"), {})
+            if (job.get("kind") != "video" or job.get("item_id") != shot["id"]
+                    or job.get("state") != "completed" or not job.get("output")):
+                raise core.GateError("审查中断后的原视频任务尚未核实，不能直接转入人工审批；请先恢复原任务。")
+            core._check_shot_artifact(root, state, shot)
+            review = _cached_review(state, _shot_review_target(shot)) or _unavailable_review()
+            review.update(version=shot["version"], sha256=shot["sha256"])
+            shot.update(review=review, status="review_required")
+            recovered["shots"].append(shot["id"])
+            core.event(state, "advisory_review_restored", id=shot["id"], version=shot["version"],
+                       from_cache=bool(review.get("recovered_from_cache")))
+        hint = episode.get("progress_stage", {})
+        for cut in episode.get("rough_cuts", []):
+            if any(review.get("key") == cut.get("key") and review.get("sha256") == cut.get("sha256")
+                   for review in episode.get("reviews", [])):
+                continue
+            count = cut.get("shot_count", len(cut.get("shots", [])))
+            if type(count) is not int or not 0 < count <= len(episode["shots"]):
+                continue
+            prefix = episode["shots"][:count]
+            manifest = [{"id": item["id"], "version": item.get("version", 0), "sha256": item.get("sha256")} for item in prefix]
+            if not all(core.human_approved_shot(item) for item in prefix) or cut.get("shots") != manifest:
+                continue
+            target = _cut_review_target(episode["id"], cut)
+            relevant_job = any(job.get("kind") == "llm" and job.get("item_id") == "review"
+                               and job.get("advisory_target") == target for job in state["jobs"].values())
+            legacy_hint = hint.get("stage") == "batch_review" and hint.get("shot_id") == prefix[-1]["id"]
+            if not relevant_job and not legacy_hint:
+                continue
+            for item in prefix:
+                core._check_shot_artifact(root, state, item)
+            core._check_artifact(root, cut)
+            review = _cached_review(state, target) or _unavailable_review("GPT 拼接审查中断，报告不可用。请自行播放累计拼接检查衔接。")
+            review.update(key=cut["key"], file=cut["file"], sha256=cut["sha256"])
+            episode.setdefault("reviews", []).append(review)
+            recovered["rough_cuts"].append(cut["key"])
+            core.event(state, "advisory_cut_review_restored", id=episode["id"], key=cut["key"],
+                       from_cache=bool(review.get("recovered_from_cache")))
+    return recovered
 
 
 def _recover(root):
@@ -169,6 +269,33 @@ def _recover(root):
                              ("file", "sha256", "version", "evidence", "review") if key in candidate})
                 shot.update(status="review_required", feedback="")
                 core.event(s, "automatic_retry_cancelled", id=shot["id"], version=shot["version"])
+        recovered = _recover_advisory_reports(root, s)
+        legacy_single = []
+        for episode in s["episodes"]:
+            hint = episode.get("progress_stage", {})
+            if (len(episode["shots"]) == 1 and hint.get("stage") == "batch_review"
+                    and hint.get("shot_id") == episode["shots"][0]["id"]
+                    and core.human_approved_shot(episode["shots"][0])):
+                shot = episode["shots"][0]
+                manifest = [{"id": shot["id"], "version": shot["version"], "sha256": shot["sha256"]}]
+                if not any(cut.get("shots") == manifest for cut in episode.get("rough_cuts", [])):
+                    legacy_single.append(episode["id"])
+    # Older releases did not register one-clip cuts. Rebuild that local cut
+    # from the approved original outside the state transaction; never reissue
+    # its missing GPT report or pretend that the old call had a target binding.
+    for episode_id in legacy_single:
+        episode = core._find(core.load_project(root), "episode", episode_id)
+        cut = _rough_cut(root, episode, 1)
+        with core.transaction(root) as state:
+            episode = core._find(state, "episode", episode_id)
+            if not any(review.get("key") == cut["key"] for review in episode.get("reviews", [])):
+                review = _cached_review(state, _cut_review_target(episode_id, cut)) or _unavailable_review(
+                    "GPT 拼接审查中断，报告不可用。请自行播放本集检查衔接。")
+                review.update(key=cut["key"], file=cut["file"], sha256=cut["sha256"])
+                episode.setdefault("reviews", []).append(review)
+                recovered["rough_cuts"].append(cut["key"])
+                core.event(state, "legacy_single_cut_review_restored", id=episode_id, key=cut["key"])
+    return recovered
 
 
 def _save_asset(root, asset_id, **values):
@@ -855,7 +982,8 @@ def _shot(root, ep_id, shot_id, previous):
     has_prior_frame = any(item.get("role") in {"previous_actual_tail", "previous_official_tail", "previous_observation_tail"}
                           for item in context.get("observation_images", []) if isinstance(item, dict))
     prior_scope = ("含前段实际尾帧参考。" if has_prior_frame else "未提供前段实际画面，不能核实跨段画面衔接。")
-    review_context = {**context, "shot": shot, "actual": relative,
+    current_shot = core._find(core.load_project(root), "shot", shot_id)
+    review_context = {**context, "shot": shot, "actual": relative, "advisory_target": _shot_review_target(current_shot),
         "current_frame_image_indices": list(range(len(observations) + 1, len(review_images) + 1)),
         "current_frame_samples": [{"image_index": len(observations) + index + 1, "time_seconds": instant}
                                   for index, instant in enumerate(evidence.get("sample_times", []))],
@@ -1065,11 +1193,10 @@ def _rough_cut(root, episode, count, *, include_pending=False):
     record = {"key": key, "file": _rel(root, path), "sha256": core.digest(path),
               "shot_count": count,
               "shots": manifest, "created_at": core.now()}
-    if count >= 2:
-        with core.transaction(root) as state:
-            cuts = core._find(state, "episode", episode["id"]).setdefault("rough_cuts", [])
-            if not any(cut.get("key") == key for cut in cuts):
-                cuts.append(record)
+    with core.transaction(root) as state:
+        cuts = core._find(state, "episode", episode["id"]).setdefault("rough_cuts", [])
+        if not any(cut.get("key") == key for cut in cuts):
+            cuts.append(record)
     return record
 
 
@@ -1137,6 +1264,7 @@ def _episode(root, ep_id):
                 review = ({"verdict": "pass", "issues": [], "observed_end_state": "Synthetic demo",
                            "repair_prompt": ""} if s["mode"] == "demo" else
                           _brain(root, "review", {"episode": ep_id, "shots": fresh["shots"][:count],
+                              "advisory_target": _cut_review_target(ep_id, rough_cut),
                               "scope": "分段粗剪抽帧检查；听觉未评估，运动过程未完整评估。",
                               "evidence": _relative_evidence(root, ev)}, [Path(f) for f in ev["frames"]]))
             except Exception:
@@ -1181,9 +1309,12 @@ def run(root):
     try:
         with core.run_lock(root):
             acquired = True
-            _recover(root)
+            recovered = _recover(root)
             s = _gate(root)
             _set(root, last_error=None)
+            if recovered["shots"] or recovered["rough_cuts"]:
+                _set(root, status="review_required")
+                return core.load_project(root)
             if any(item.get("status") == "candidate" for item in s.get("asset_amendments", [])):
                 _set(root, status="awaiting_asset_amendment")
                 return core.load_project(root)
