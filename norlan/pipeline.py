@@ -20,7 +20,7 @@ def demo_plan():
         {"id": "hero", "kind": "character", "name": "演示人物卡", "prompt": "DEMO placeholder, blue character identity card"},
         {"id": "station", "kind": "location", "name": "演示场景卡", "prompt": "DEMO placeholder, railway station environment"},
     ]
-    return {"title": "Norlan · 两集流程演示", "style": "流程占位素材，不代表 AI 漫剧质量", "ratio": "16:9",
+    return {"title": "Nolan · 两集流程演示", "style": "流程占位素材，不代表 AI 漫剧质量", "ratio": "16:9",
         "assets": assets,
         "episodes": [{"id": f"E{i:03}", "title": f"第 {i} 集：流程演示", "summary": "用于验证资产审批、逐集放行和局部返工。",
           "music_prompt": "无配乐；本演示只验证制作流程。",
@@ -117,6 +117,27 @@ def _save_episode(root, ep_id, **values):
         core._find(s, "episode", ep_id).update(values)
 
 
+def _progress(root, ep_id, stage, shot_id=None):
+    """Persist actual phase transitions; elapsed time never increases percent."""
+    with core.transaction(root) as state:
+        ep = core._find(state, "episode", ep_id)
+        previous = ep.get("progress_stage", {})
+        if previous.get("stage") == stage and previous.get("shot_id") == shot_id:
+            return
+        stamp = core.now()
+        ep.setdefault("progress_started_at", stamp)
+        ep["progress_stage"] = {"stage": stage, "shot_id": shot_id, "started_at": stamp, "updated_at": stamp}
+
+
+def _job_progress(root, job, stage):
+    if job.get("kind") != "video":
+        return
+    state = core.load_project(root)
+    ep = next((e for e in state["episodes"] if any(sh["id"] == job["item_id"] for sh in e["shots"])), None)
+    if ep:
+        _progress(root, ep["id"], stage, job["item_id"])
+
+
 def _poll_video(root, job_id, output):
     provider = _ark(root)
     started = time.monotonic()
@@ -125,12 +146,15 @@ def _poll_video(root, job_id, output):
         job = s["jobs"][job_id]
         if not job.get("task_id"):
             raise core.GateError("视频任务没有供应商 ID，必须先对账")
+        if job["state"] != "download_pending":
+            _job_progress(root, job, "shot_generation")
         result = provider.poll_video(job["task_id"])
         if result["status"] == "completed":
             core.record_usage(root, job_id, result)
             # Retain ID before download. An expired/download-failed URL is never
             # permission to resubmit the paid generation task.
             core.update_job(root, job_id, state="download_pending", accounting="spent")
+            _job_progress(root, job, "shot_download")
             if not result.get("url"):
                 raise core.GateError("供应商任务已完成，但未返回可下载地址；用量已保存，继续时只查询原任务。")
             provider.download(result["url"], output)
@@ -181,6 +205,7 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
         core.update_job(root, job_id, state="completed", accounting="spent", output=_rel(root, output))
         return job_id
     try:
+        _job_progress(root, {"kind": kind, "item_id": item_id}, "shot_submission")
         result = provider.submit_video(prompt, duration, references,
                                        audio_references=audio_references or [])
     except Exception as exc:
@@ -206,10 +231,11 @@ def _select_audition(root, asset, character):
 
     needs_selection = not asset.get("audition_text") or (asset["status"] == "rejected" and asset.get("audition_selection_key") != signature)
     if needs_selection and asset.get("audition_selection_key") != signature:
-        selection = _brain(root, "select_voice_audition", novel, asset, character)
+        from .asset_inputs import compose_prompt
+        selection = _brain(root, "select_voice_audition", novel, {**asset, "prompt": compose_prompt(asset)}, character)
         if not isinstance(selection, dict) or any(not isinstance(selection.get(key), str) or len(selection[key]) > 4000
                 for key in ("audition_text", "audition_reason", "audition_source")):
-            invalid_selection("声音选句返回无效；尚未提交试音，请在 Norlan 中检查原文选句。")
+            invalid_selection("声音选句返回无效；尚未提交试音，请在 Nolan 中检查原文选句。")
         candidate = {**asset, **{key: selection[key] for key in ("audition_text", "audition_reason", "audition_source")}}
         if candidate["audition_text"].strip():
             try:
@@ -232,21 +258,29 @@ def _select_audition(root, asset, character):
 
 def _assets(root):
     s = _gate(root)
+    from .asset_inputs import pending_assets, reference_paths, compose_prompt
+    waiting_for_input = bool(pending_assets(s))
     for original in s["assets"]:
         s = _gate(root)
         asset = core._find(s, "asset", original["id"])
         if asset["status"] in {"approved", "candidate"}:
             continue
-        if asset["kind"] == "voice":
+        active_job = s["jobs"].get(asset.get("job_id", ""))
+        recovering = bool(asset["status"] != "rejected" and active_job and active_job["state"] in {"submitted", "download_pending", "completed"})
+        # An upgraded project can already have a submitted task while later
+        # assets still lack the new choice. Recover that task without any new
+        # POST so its reservation cannot permanently block the user's choices.
+        if waiting_for_input and not recovering:
+            continue
+        if asset["kind"] == "voice" and not recovering:
             # A voice audition must use approved visual identity references.
             if any(a["status"] != "approved" for a in s["assets"] if a["kind"] != "voice"):
                 continue
-        active_job = s["jobs"].get(asset.get("job_id", ""))
-        recovering = bool(asset["status"] != "rejected" and active_job and active_job["state"] in {"submitted", "download_pending", "completed"})
         if not recovering:
             total_attempts = sum(j["item_id"] == asset["id"] and j["kind"] in {"voice", "image"} for j in s["jobs"].values())
             if total_attempts >= s["settings"]["max_attempts"]:
                 raise core.GateError("资产已达到尝试上限；请调整方案或显式提高上限：" + asset["id"])
+            references = reference_paths(root, asset)
             if asset["kind"] == "voice" and s["mode"] == "live":
                 character = core._find(s, "asset", asset["character_id"])
                 core._check_artifact(root, character)
@@ -265,18 +299,19 @@ def _assets(root):
         out.parent.mkdir(parents=True, exist_ok=True)
         if recovering and active_job.get("output") and core.safe_path(root, active_job["output"]) != out.resolve():
             raise core.GateError("恢复素材任务的输出路径与候选版本不符，不会覆盖旧素材")
-        prompt = f"{s['plan'].get('style','')}\n{asset['prompt']}\n修改意见：{asset.get('feedback','')}"
+        prompt = compose_prompt(asset, s['plan'].get('style', ''))
         if asset["kind"] == "voice":
             character = next((a for a in s["assets"] if a["id"] == asset.get("character_id") and a["kind"] == "character"), None)
             if character is None or character["status"] != "approved":
                 raise core.GateError("声音试音必须绑定一个已批准的角色，不能猜测说话人")
             core._check_artifact(root, character)
             images = [core.safe_path(root, character["file"])]
+            voice_asset = {**asset, "prompt": compose_prompt(asset)}
             voice_prompt = asset.get("audition_prompt", "已提交声音试片，仅恢复原任务") if recovering else (
-                "DEMO / SYNTHETIC PLACEHOLDER voice audition" if s["mode"] == "demo" else build_audition_prompt(asset))
+                "DEMO / SYNTHETIC PLACEHOLDER voice audition" if s["mode"] == "demo" else build_audition_prompt(voice_asset))
             duration = 5 if recovering or s["mode"] == "demo" else audition_duration(asset)
             if not recovering:
-                _save_asset(root, asset["id"], audition_profile=audition_profile(asset), audition_prompt=voice_prompt)
+                _save_asset(root, asset["id"], audition_profile=audition_profile(voice_asset), audition_prompt=voice_prompt)
             _video(root, "voice", asset["id"], out, duration,
                 voice_prompt, images,
                 old_job=asset.get("job_id") if recovering else None)
@@ -296,11 +331,12 @@ def _assets(root):
                 a = core._find(current, "asset", asset["id"])
                 a["job_id"] = job_id
                 a.setdefault("attempts", []).append({"job_id": job_id, "time": core.now()})
+                current["jobs"][job_id]["input_references"] = copy.deepcopy(a.get("creation_input", {}).get("references", []))
             try:
                 if s["mode"] == "demo":
                     media.synthetic_asset(out, asset["id"] + " / DEMO", "#2563eb" if asset["kind"] == "character" else "#059669")
                 else:
-                    result = provider.generate_image(prompt, out,
+                    result = provider.generate_image(prompt, out, references=references,
                         on_usage=lambda usage: core.record_usage(root, job_id, usage))
                     core.record_usage(root, job_id, result)
                 core.update_job(root, job_id, state="completed", accounting="spent", output=_rel(root, out))
@@ -313,6 +349,9 @@ def _assets(root):
             raise core.GateError("已登记成功的素材文件缺失，请从供应商取回；不会重复生成")
         _save_asset(root, asset["id"], status="candidate", file=_rel(root, out), sha256=core.digest(out))
     s = core.load_project(root)
+    if pending_assets(s):
+        _set(root, status="awaiting_asset_input")
+        return False
     if any(a["status"] != "approved" for a in s["assets"]):
         _set(root, status="awaiting_assets")
         return False
@@ -390,6 +429,8 @@ def _shot(root, ep_id, shot_id, previous):
             if shot.get("file"):
                 _save_shot(root, shot_id, status="review_required")
             raise core.GateError("自动返工达到上限，请人工审查：" + shot_id)
+        if not recovering:
+            _progress(root, ep_id, "shot_preparation", shot_id)
         context, images, voices = _shot_context(root, ep, shot, previous)
         if not recovering:
             if s["mode"] == "demo":
@@ -410,6 +451,7 @@ def _shot(root, ep_id, shot_id, previous):
         prompt += "\n不添加画面字幕，不添加背景配乐。"
         _video(root, "video", shot_id, out, shot["duration"], prompt, images, voices,
                old_job=shot.get("job_id") if recovering else None)
+        _progress(root, ep_id, "shot_checks", shot_id)
         evidence = media.extract_evidence(out, Path(root) / "evidence" / f"{shot_id}-v{version}")
         relative = _relative_evidence(root, evidence)
         _save_shot(root, shot_id, file=_rel(root, out), sha256=core.digest(out), evidence=relative, status="reviewing")
@@ -418,6 +460,7 @@ def _shot(root, ep_id, shot_id, previous):
         review_context = {**context, "shot": shot, "actual": relative,
             "current_frame_image_indices": list(range(len(images) + 1, len(review_images) + 1)),
             "review_scope": "当前镜头首/中/尾抽样画面与前镜实际尾帧。没有审听音频；不可宣称整段动作或音色已核实。"}
+        _progress(root, ep_id, "shot_review", shot_id)
         review = ({"verdict": "pass", "issues": [], "observed_end_state": "Synthetic demo only",
                    "repair_prompt": "", "scope": "synthetic smoke test"} if s["mode"] == "demo"
                   else _brain(root, "review", review_context, review_images))
@@ -582,6 +625,46 @@ def _captions(root, ep):
         raise
 
 
+def _rough_cut(root, episode, count):
+    """Publish a local cumulative cut before any batch model review.
+
+    Source hashes preserve the old batch-review identity for existing projects.
+    Registered outputs are immutable and verified before reuse; an unregistered
+    file left by an interruption is never mistaken for a completed render.
+    """
+    shots = episode["shots"][:count]
+    if not shots or len(shots) != count or any(shot["status"] != "accepted" for shot in shots):
+        raise core.GateError("累计粗剪只能使用已经验收的连续镜头。")
+    for shot in shots:
+        core._check_artifact(root, shot)
+    key = hashlib.sha256("-".join(shot["sha256"] for shot in shots).encode()).hexdigest()
+    existing = next((cut for cut in episode.get("rough_cuts", []) if cut.get("key") == key), None)
+    if existing:
+        core._check_artifact(root, existing)
+        return copy.deepcopy(existing)
+    legacy = next((review for review in episode.get("reviews", [])
+                   if review.get("key") == key and review.get("file") and review.get("sha256")), None)
+    if legacy:
+        core._check_artifact(root, legacy)
+        path = core.safe_path(root, legacy["file"])
+    else:
+        _progress(root, episode["id"], "batch_assembly", shots[-1]["id"])
+        path = Path(root) / "exports" / f"{episode['id']}-rough-{count}-{key[:16]}.mp4"
+        if path.exists():
+            path = path.with_name(f"{path.stem}-{uuid.uuid4().hex[:8]}{path.suffix}")
+        media.compose([core.safe_path(root, shot["file"]) for shot in shots], path)
+    record = {"key": key, "file": _rel(root, path), "sha256": core.digest(path),
+              "shot_count": count,
+              "shots": [{"id": shot["id"], "version": shot.get("version", 0), "sha256": shot["sha256"]}
+                        for shot in shots], "created_at": core.now()}
+    if count >= 2:
+        with core.transaction(root) as state:
+            cuts = core._find(state, "episode", episode["id"]).setdefault("rough_cuts", [])
+            if not any(cut.get("key") == key for cut in cuts):
+                cuts.append(record)
+    return record
+
+
 def _episode(root, ep_id):
     s = _gate(root)
     ep = core._find(s, "episode", ep_id)
@@ -603,13 +686,15 @@ def _episode(root, ep_id):
         fresh = core._find(core.load_project(root), "episode", ep_id)
         previous = fresh["shots"][index]
         count = index + 1
+        rough_cut = _rough_cut(root, fresh, count) if count >= 2 else None
         if count % s["settings"]["batch_size"] == 0 or count == len(ep["shots"]):
             batch_key = hashlib.sha256("-".join(sh["sha256"] for sh in fresh["shots"][:count]).encode()).hexdigest()
             if any(r.get("key") == batch_key for r in fresh["reviews"]):
                 continue
-            path = Path(root) / "exports" / f"{ep_id}-rough-{count}-{batch_key[:16]}.mp4"
-            media.compose([core.safe_path(root, sh["file"]) for sh in fresh["shots"][:count]], path)
+            rough_cut = rough_cut or _rough_cut(root, fresh, count)
+            path = core.safe_path(root, rough_cut["file"])
             ev = media.extract_evidence(path, Path(root) / "evidence" / f"rough-{ep_id}-{batch_key[:16]}")
+            _progress(root, ep_id, "batch_review", original["id"])
             review = ({"verdict": "pass", "issues": [], "observed_end_state": "Synthetic demo",
                        "repair_prompt": ""} if s["mode"] == "demo" else
                       _brain(root, "review", {"episode": ep_id, "shots": fresh["shots"][:count],
@@ -627,10 +712,13 @@ def _episode(root, ep_id):
                 return
     fresh = core._find(core.load_project(root), "episode", ep_id)
     _gate(root)
+    _progress(root, ep_id, "music")
     music = _soundtrack(root, fresh)
+    _progress(root, ep_id, "subtitles")
     captions, subtitle_status = _captions(root, fresh)
     version = fresh["version"] + 1
     out = Path(root) / "exports" / f"{ep_id}-v{version}.mp4"
+    _progress(root, ep_id, "rendering")
     result = media.compose([core.safe_path(root, sh["file"]) for sh in fresh["shots"]], out,
                            subtitles=captions, music=music)
     _save_episode(root, ep_id, version=version, file=_rel(root, out), sha256=core.digest(out),

@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from norlan import core, pipeline
 from norlan.providers import ProviderError
-from test_pipeline import fake_media, write
+from test_pipeline import choose_gpt_assets, fake_media, write
 
 
 class CaptionPipelineTests(unittest.TestCase):
@@ -22,6 +22,7 @@ class CaptionPipelineTests(unittest.TestCase):
         self.addCleanup(self.media_context.__exit__, None, None, None)
         state = pipeline.run(self.root)
         core.approve(self.root, "plan", "plan", state["plan"]["version"])
+        choose_gpt_assets(self.root)
         state = pipeline.run(self.root)
         for asset in state["assets"]:
             core.approve(self.root, "asset", asset["id"], asset["version"])

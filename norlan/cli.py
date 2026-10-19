@@ -31,6 +31,7 @@ def last_project():
 
 
 STATUS = {"initialized": "等待策划", "awaiting_plan": "等待批准分集规划", "awaiting_assets": "等待资产审批",
+    "awaiting_asset_input": "等待资产创作选择",
     "awaiting_episode_review": "等待本集审片", "review_required": "需要人工复核镜头",
     "blocked": "等待处理", "paused": "已暂停", "complete": "全部完成", "ready": "可继续",
     "planned": "待生成", "candidate": "待批准", "approved": "已批准", "generating": "生成中",
@@ -46,7 +47,7 @@ def summary(s):
     usage = f"{b['usage_cost']:.6f}".rstrip("0").rstrip(".") + " " + b["currency"] if b.get("usage_cost_jobs") else "暂无可计费用量"
     rows.append(f"已核对实际费用：{actual}；按实际用量计费（未对账）：{usage}")
     rows.append(f"预算 {b['currency']}：上限 {b['limit']:.2f} / 已结束调用占用上限 {b['spent']:.2f} / 在途预留 {b['reserved']:.2f} / 结果待核实 {b['unknown']:.2f}")
-    rows.append("用量计费未含折扣、赠额等账单调整；预算占用不等于实际扣款。可用 norlan costs 查看逐调用明细。")
+    rows.append("用量计费未含折扣、赠额等账单调整；预算占用不等于实际扣款。可用 nolan costs 查看逐调用明细。")
     p = s["plan"]
     rows.append(f"规划 v{p['version']}：{STATUS.get(p['status'],p['status'])}")
     for a in s["assets"]:
@@ -59,7 +60,9 @@ def summary(s):
     if s.get("last_error"):
         rows.append("提示：" + s["last_error"])
     if s["status"] == "awaiting_plan":
-        rows.append("可说：查看规划 / 规划通过。规划审批后才会生成资产。")
+        rows.append("可说：查看规划 / 规划通过。批准规划后先在网页选择资产创作方式。")
+    elif s["status"] == "awaiting_asset_input":
+        rows.append("请先在网页选择“由 GPT 自己决定”或“我来描述”（可粘贴参考图片）；选择前不会开始生成资产。")
     elif s["status"] == "awaiting_assets":
         rows.append("可说：看一下资产 / hero 通过 / station 改成傍晚。每项单独批准。")
     elif s["status"] == "awaiting_episode_review":
@@ -96,16 +99,16 @@ def preview(root, kind="", item_id=""):
 
 
 def doctor():
-    findings = {"Norlan": __version__, "Python": sys.version.split()[0]}
+    findings = {"Nolan": __version__, "Python": sys.version.split()[0]}
     for command in ("ffmpeg", "ffprobe", "codex", "jimeng"):
         findings[command] = shutil.which(command) or "未安装"
     try:
         from .brain import BrainError, resolve_codex
         selected_codex = resolve_codex()
-        findings["Norlan 实际使用的 Codex"] = selected_codex
+        findings["Nolan 实际使用的 Codex"] = selected_codex
     except BrainError as exc:
         selected_codex = None
-        findings["Norlan 实际使用的 Codex"] = str(exc)
+        findings["Nolan 实际使用的 Codex"] = str(exc)
     if selected_codex:
         try:
             result = subprocess.run([selected_codex, "login", "status"], text=True, capture_output=True, timeout=15)
@@ -120,9 +123,9 @@ def doctor():
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="norlan", description="Norlan · 在终端对话，逐集监督 AI 漫剧制作")
+    parser = argparse.ArgumentParser(prog="nolan", description="Nolan · 在终端对话，逐集监督 AI 漫剧制作")
     parser.add_argument("--version", action="version", version=__version__)
-    parser.add_argument("--resume", action="store_true", help="继续最近一次 Norlan GPT 对话")
+    parser.add_argument("--resume", action="store_true", help="继续最近一次 Nolan GPT 对话")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("doctor", help="检查本地工具与账户配置，不显示密钥")
     sub.add_parser("connection", help="查看 GPT 订阅/API 连接选择")
@@ -184,7 +187,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.resume and args.command not in {None, "chat"}:
-            raise ValueError("--resume 用于恢复 GPT 对话；使用 norlan --resume 或 norlan chat --resume。")
+            raise ValueError("--resume 用于恢复 GPT 对话；使用 nolan --resume 或 nolan chat --resume。")
         if args.command == "setup":
             from .connection import setup
             return setup(args.provider, args.model)
@@ -234,14 +237,14 @@ def main(argv=None):
             return 1 if synced and synced["errors"] else 0
         if args.command in {"new", "demo"}:
             mode = "demo" if args.command == "demo" else args.mode
-            novel = "Norlan synthetic workflow demo." if args.command == "demo" else args.novel.expanduser().read_text(encoding="utf-8")
+            novel = "Nolan synthetic workflow demo." if args.command == "demo" else args.novel.expanduser().read_text(encoding="utf-8")
             core.create_project(root, novel, mode)
             if args.brief:
                 core.configure(root, {"creative_brief": args.brief})
             remember(root)
             print(summary(pipeline.run(root)))
             entry = "console" if mode == "demo" else "chat"
-            print(f"\n进入{'演示控制台' if mode == 'demo' else 'GPT 对话'}：norlan {entry} {root}")
+            print(f"\n进入{'演示控制台' if mode == 'demo' else 'GPT 对话'}：nolan {entry} {root}")
             return 0
         if args.command == "studio":
             from .dashboard import serve
@@ -277,9 +280,12 @@ def main(argv=None):
             print(json.dumps(state, ensure_ascii=False, indent=2))
         else:
             print(summary(state))
+        if args.command in {"run", "resume"} and state["status"] == "awaiting_asset_input":
+            from .dashboard import serve
+            serve(root, port=0, open_browser=True)
         return 1 if state["status"] == "blocked" else 0
     except (ValueError, OSError, KeyError, ProviderError) as exc:
-        print("Norlan：" + str(exc), file=sys.stderr)
+        print("Nolan：" + str(exc), file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("\n已退出。再次运行会从已保存的进度继续；在途供应商任务可能仍在执行。")

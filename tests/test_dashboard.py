@@ -83,6 +83,8 @@ class DashboardTests(unittest.TestCase):
         status, headers, body = self.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn(self.server.context.token.encode(), body)
+        self.assertIn(b'"X-Norlan-Token":TOKEN', body)
+        self.assertNotIn(b'X-Nolan-Token', body)
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
         self.assertNotIn(b"https://", body)
 

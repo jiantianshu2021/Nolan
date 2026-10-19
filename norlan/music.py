@@ -169,7 +169,7 @@ class MusicProvider:
         if not isinstance(prompt, str) or not prompt.strip() or not re.search(r"[\u3400-\u9fff]", prompt):
             raise ProviderError("纯音乐提示词需要中文描述。")
         if len(prompt) > 4000:
-            raise ProviderError("Norlan 将音乐提示词限制为 4000 字，请先精简。")
+            raise ProviderError("Nolan 将音乐提示词限制为 4000 字，请先精简。")
         if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not math.isfinite(duration):
             raise ProviderError("音乐时长必须是 30–120 秒内的整数。")
         if int(duration) != duration or not 30 <= duration <= 120:

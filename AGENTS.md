@@ -1,4 +1,4 @@
-# Norlan development
+# Nolan development
 
 Use Chinese for user-facing copy. Keep provider/model choices explicit.
 

@@ -27,6 +27,7 @@ class PipelineBillingTests(unittest.TestCase):
         core.create_project(self.root, "Synthetic billing test novel.", mode="demo")
         state = pipeline.run(self.root)
         core.approve(self.root, "plan", "plan", state["plan"]["version"])
+        fixtures.choose_gpt_assets(self.root)
         state = pipeline.run(self.root)
         for asset in state["assets"]:
             core.approve(self.root, "asset", asset["id"], asset["version"])

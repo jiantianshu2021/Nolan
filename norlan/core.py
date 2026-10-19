@@ -154,7 +154,7 @@ def load_project(root):
     return state
 
 
-def create_project(root, novel: str, mode="demo", title="Norlan 漫剧"):
+def create_project(root, novel: str, mode="demo", title="Nolan 漫剧"):
     root = Path(root).expanduser().resolve()
     if mode not in {"demo", "live"}:
         raise ValueError("模式只能是 demo 或 live")
@@ -274,6 +274,7 @@ def validate_plan(plan):
 
 def install_plan(root, plan):
     validate_plan(plan)
+    from .asset_inputs import empty_input
     from .voice import AuditionSelectionError, validate_audition
     novel = (Path(root) / "source/novel.txt").read_text(encoding="utf-8")
     characters = {a["id"]: a["name"] for a in plan["assets"] if a["kind"] == "character"}
@@ -293,7 +294,8 @@ def install_plan(root, plan):
                      "ratio": plan.get("ratio", "16:9"), "feedback": ""}
         s["title"] = plan["title"]
         s["assets"] = [{"character_id": "", **copy.deepcopy(a), "status": "planned", "version": 0,
-                         "history": [], "feedback": ""} for a in plan["assets"]]
+                         "history": [], "feedback": "", "creation_input": empty_input()}
+                        for a in plan["assets"]]
         s["episodes"] = []
         for ep in plan["episodes"]:
             ep = copy.deepcopy(ep)
@@ -341,6 +343,136 @@ def _check_artifact(root, item):
         audio = safe_path(root, item["audio_file"])
         if not audio.is_file() or digest(audio) != item.get("audio_sha256"):
             raise GateError("声音参考缺失或已改变，必须重新审核试听")
+
+
+def _editable_asset_input(state, asset_id, asset_version, input_revision):
+    from .asset_inputs import has_started, input_state
+    if state["plan"].get("status") != "approved":
+        raise GateError("请先批准当前策划，再确认资产生成方式或上传参考图。")
+    asset = _find(state, "asset", asset_id)
+    _check_version(asset, asset_version)
+    data = input_state(asset)
+    if (isinstance(input_revision, bool) or not isinstance(input_revision, int)
+            or input_revision != data["revision"]):
+        raise GateError("资产输入已更新，请刷新网页后重新确认。")
+    if has_started(state, asset) or asset.get("status") != "planned":
+        raise GateError("该资产已开始生成，初始描述和参考图不能再修改；请通过资产返工提出修改意见。")
+    if any(job.get("accounting") in {"reserved", "unknown"} for job in state["jobs"].values()):
+        raise GateError("尚有在途或结果不明的调用，请等待落盘或完成对账后再修改资产输入。")
+    return asset, data
+
+
+def set_remaining_asset_inputs_gpt(root, plan_version):
+    """Confirm only untouched first-time inputs; retain every custom draft."""
+    from .asset_inputs import has_started, input_state
+    with run_lock(root), transaction(root) as state:
+        _check_version(state["plan"], plan_version)
+        if state["plan"].get("status") != "approved":
+            raise GateError("请先批准当前策划，再确认资产生成方式。")
+        if any(job.get("accounting") in {"reserved", "unknown"} for job in state["jobs"].values()):
+            raise GateError("尚有在途或结果不明的调用，请等待落盘或完成对账后再修改资产输入。")
+        selected = []
+        for asset in state["assets"]:
+            if has_started(state, asset) or asset.get("status") != "planned":
+                continue
+            data = input_state(asset)
+            if (data.get("mode") not in {None, ""} or data.get("description")
+                    or data.get("references") or data.get("confirmed")):
+                continue
+            data.update(mode="gpt", description="", confirmed=True, revision=data["revision"] + 1)
+            asset["creation_input"] = data
+            selected.append({"id": asset["id"], "asset_version": asset["version"],
+                             "input_revision": data["revision"]})
+        if selected:
+            event(state, "human_remaining_asset_inputs_confirmed", plan_version=plan_version,
+                  mode="gpt", assets=selected)
+            state["last_error"] = None
+    return load_project(root)
+
+
+def set_asset_input(root, asset_id, asset_version, input_revision, mode, description):
+    """A version-bound human choice; never approves or generates an asset."""
+    from .asset_inputs import MAX_DESCRIPTION_CHARS, reference_paths
+    if not isinstance(mode, str) or mode not in {"gpt", "custom"}:
+        raise ValueError("请选择由 GPT 决定，或由你提供描述。")
+    if not isinstance(description, str) or len(description) > MAX_DESCRIPTION_CHARS:
+        raise ValueError("资产描述须为文本，最多 4000 字。")
+    description = description.strip()
+    with run_lock(root), transaction(root) as state:
+        asset, data = _editable_asset_input(state, asset_id, asset_version, input_revision)
+        references = data.get("references", [])
+        if mode == "gpt" and (description or references):
+            raise ValueError("由 GPT 决定时请清空自定义描述和参考图，或选择由你提供描述。")
+        if mode == "custom" and not (description or references):
+            raise ValueError("请填写资产描述，或提供至少一张参考图片。")
+        if asset["kind"] == "voice" and references:
+            raise ValueError("声音资产只接受稳定声线描述；视觉参考使用已批准的绑定角色图片。")
+        data.update(mode=mode, description=description, confirmed=True,
+                    revision=data["revision"] + 1)
+        candidate = {**asset, "creation_input": data}
+        reference_paths(root, candidate)
+        asset["creation_input"] = data
+        event(state, "human_asset_input_confirmed", id=asset_id, asset_version=asset_version,
+              input_revision=data["revision"], mode=mode,
+              reference_hashes=[ref["sha256"] for ref in references])
+        state["last_error"] = None
+    return load_project(root)
+
+
+def add_asset_reference(root, asset_id, asset_version, input_revision, data_url):
+    """Store a validated local image; uploads invalidate the prior confirmation."""
+    from .asset_inputs import MAX_REFERENCES, decode_reference, validate_image_file
+    content, mime, suffix = decode_reference(data_url)
+    with run_lock(root):
+        state = load_project(root)
+        asset, data = _editable_asset_input(state, asset_id, asset_version, input_revision)
+        if asset["kind"] == "voice":
+            raise ValueError("声音资产不接受参考图片；请描述稳定声线，画面使用已批准的绑定角色图。")
+        if len(data["references"]) >= MAX_REFERENCES:
+            raise ValueError("每项资产最多上传 9 张参考图片。")
+        sha256 = hashlib.sha256(content).hexdigest()
+        if any(ref.get("sha256") == sha256 for ref in data["references"]):
+            raise ValueError("这张参考图片已经上传，无需重复添加。")
+        directory = safe_path(root, "inputs/assets/" + asset_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        reference_id = uuid.uuid4().hex
+        relative = str((directory / (reference_id + suffix)).relative_to(Path(root).resolve()))
+        path = safe_path(root, relative)
+        try:
+            with path.open("xb") as file:
+                file.write(content)
+                file.flush()
+                os.fsync(file.fileno())
+            validate_image_file(path, mime)
+            with transaction(root) as state:
+                asset, data = _editable_asset_input(state, asset_id, asset_version, input_revision)
+                data["references"].append({"id": reference_id, "file": relative, "sha256": sha256,
+                                           "mime": mime, "bytes": len(content)})
+                data.update(confirmed=False, revision=data["revision"] + 1)
+                asset["creation_input"] = data
+                event(state, "asset_reference_added", id=asset_id, reference_id=reference_id,
+                      sha256=sha256, input_revision=data["revision"])
+        except BaseException:
+            # Preserve any image whose state was published before an fsync error.
+            saved = _find(load_project(root), "asset", asset_id).get("creation_input", {})
+            if not any(ref.get("file") == relative for ref in saved.get("references", [])):
+                path.unlink(missing_ok=True)
+            raise
+    return load_project(root)
+
+
+def remove_asset_reference(root, asset_id, asset_version, input_revision, reference_id):
+    """Remove a draft selection while retaining its original immutable bytes."""
+    with run_lock(root), transaction(root) as state:
+        asset, data = _editable_asset_input(state, asset_id, asset_version, input_revision)
+        if not isinstance(reference_id, str) or not any(ref.get("id") == reference_id for ref in data["references"]):
+            raise ValueError("参考图片不存在或已经移除，请刷新后重试。")
+        data["references"] = [ref for ref in data["references"] if ref["id"] != reference_id]
+        data.update(confirmed=False, revision=data["revision"] + 1)
+        asset["creation_input"] = data
+        event(state, "asset_reference_removed", id=asset_id, reference_id=reference_id,
+              input_revision=data["revision"])
+    return load_project(root)
 
 
 def approve(root, kind, item_id, version):
@@ -409,7 +541,8 @@ def _invalidate_episode(ep, reason, shot_ids=None):
             changed_scenes.add(shot["scene_id"])
             _invalidate_shot(shot, reason)
     ep.update(status="revision_requested", feedback=reason)
-    for key in ("file", "sha256", "approved_at", "approved_sha256", "verified_subtitles", "render_manifest"):
+    for key in ("file", "sha256", "approved_at", "approved_sha256", "verified_subtitles", "render_manifest",
+                "progress_stage", "progress_started_at"):
         ep.pop(key, None)
     ep["subtitle_status"] = "needs_retiming"
 
@@ -476,7 +609,7 @@ def request_caption_fix(root, item_id, version, feedback):
         ep["history"].append({k: ep[k] for k in ("file", "sha256", "version")})
         ep.update(caption_feedback=feedback, caption_source=copy.deepcopy(segments),
                   caption_source_clips=[sh["sha256"] for sh in ep["shots"]], status="revision_requested")
-        for key in ("approved_at", "approved_sha256"):
+        for key in ("approved_at", "approved_sha256", "progress_stage", "progress_started_at"):
             ep.pop(key, None)
         s["status"] = "ready"
         event(s, "caption_fix_requested", id=item_id, version=version, feedback=feedback)

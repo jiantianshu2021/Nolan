@@ -1,61 +1,65 @@
-# Norlan
+# Nolan
 
-在 Mac mini 终端运行的 GPT 对话与 AI 漫剧制作助手。启动就能自由聊天、讨论创意、写故事和修改方案，不需要先提供小说或创建制作项目。你决定制作时，GPT 再调用 Norlan 的工具规划分集、资产和分镜。**每集都交给你完整观看；你批准当前版本后，才开始下一集。**
+在 Mac mini 终端运行的 GPT 对话与 AI 漫剧制作助手。启动就能自由聊天、讨论创意、写故事和修改方案，不需要先提供小说或创建制作项目。你决定制作时，GPT 再调用 Nolan 的工具规划分集、资产和分镜。**每集都交给你完整观看；你批准当前版本后，才开始下一集。**
 
-默认入口采用原生 Codex 对话界面，支持流式回答、多轮上下文和会话恢复，Norlan 制作能力通过专用 MCP 工具提供。本地审片页面用于观看素材和成片、批准版本、提交修改意见。视频生成使用火山引擎官方 Ark API；GPT 可选择 ChatGPT 订阅或 OpenAI API。即梦网页会员、现有即梦 CLI 登录与火山 API 权限互不等同。
+默认入口采用原生 Codex 对话界面，支持流式回答、多轮上下文和会话恢复，Nolan 制作能力通过专用 MCP 工具提供。本地审片页面用于观看素材和成片、批准版本、提交修改意见。视频生成使用火山引擎官方 Ark API；GPT 可选择 ChatGPT 订阅或 OpenAI API。即梦网页会员、现有即梦 CLI 登录与火山 API 权限互不等同。
 
-本项目已包含真实 API 适配器和本地模拟测试。本机 ChatGPT 登录下的真实 GPT 规划调用已经验证；视频、图片、音乐和转写服务尚未进行付费实测。演示素材带有 `NORLAN DEMO / SYNTHETIC PLACEHOLDER` 标记，只用于检验流程；实际媒体权限、费用和生成质量需要首次小额实测。
+本项目已包含真实 API 适配器和本地模拟测试。本机 ChatGPT 登录下的真实 GPT 规划调用已经验证；视频、图片、音乐和转写服务尚未进行付费实测。演示素材带有 `NOLAN DEMO / SYNTHETIC PLACEHOLDER` 标记，只用于检验流程；实际媒体权限、费用和生成质量需要首次小额实测。
 
 ## 安装
 
 需要 macOS、Python 3.11 或更新版本、Git、FFmpeg（包含 ffprobe）。默认 GPT 方式还需要已安装并登录的 Codex CLI。
 
 ```bash
-git clone https://github.com/jiantianshu2021/Norlan.git
-cd Norlan
+git clone https://github.com/jiantianshu2021/Nolan.git
+cd Nolan
 bash scripts/install.sh
-norlan doctor
-norlan
+nolan doctor
+nolan
 ```
 
-仓库是私有的，克隆需要具有访问权限的 GitHub 登录。安装脚本将入口放在 `~/.local/bin/norlan`；若终端找不到命令，可先使用该完整路径，或把 `~/.local/bin` 加入 `PATH`。程序需要在运行制作任务时保持启动，关闭终端后可以从项目目录继续。
+仓库是私有的，克隆需要具有访问权限的 GitHub 登录。安装脚本将入口放在 `~/.local/bin/nolan`；若终端找不到命令，可先使用该完整路径，或把 `~/.local/bin` 加入 `PATH`。程序需要在运行制作任务时保持启动，关闭终端后可以从项目目录继续。
 
-直接输入 `norlan` 打开新的 GPT 对话，不会自动进入旧演示项目。你可以说“先聊聊我的故事，不要开始制作”，也可以贴入故事，或明确提供 TXT/MD 小说路径让它读取。对话可以持续修改创意；决定制作时，直接说“把我们刚才确定的故事创建成漫剧项目”。
+从 Norlan 升级后，推荐用 `nolan` 启动，旧命令 `norlan` 仍可兼容使用。已有项目、GPT 登录和会话不搬迁：内部 Python 包与 pip 分发名仍为 `norlan` / `norlan-agent`，数据继续保存在 `~/.local/share/norlan`，连接配置继续保存在 `~/.config/norlan`。现有 `NORLAN_*` 环境变量仍有效；安装脚本也接受新的 `NOLAN_INSTALL_DIR`、`NOLAN_BIN_DIR` 和 `NOLAN_PYTHON`。
+
+每次安装都会创建独立的 `~/.local/share/norlan/runtimes/<版本>-<随机标识>/venv`，包括重新安装同一个版本。安装成功并核验两个启动入口的版本后，才切换 `nolan` 和兼容命令；失败时原入口继续可用。旧 `venv` 和历史运行目录保留，正在生成的旧进程仍读取自己的代码。等当前任务结束，再退出原会话并运行 `nolan --resume`，即可加载新版本。
+
+直接输入 `nolan` 打开新的 GPT 对话，不会自动进入旧演示项目。你可以说“先聊聊我的故事，不要开始制作”，也可以贴入故事，或明确提供 TXT/MD 小说路径让它读取。对话可以持续修改创意；决定制作时，直接说“把我们刚才确定的故事创建成漫剧项目”。
 
 ```bash
-norlan                    # 新的自由对话
-norlan --resume           # 恢复最近的 Norlan 对话
-norlan chat ./my-drama    # 带着指定制作项目开始对话
-norlan setup              # 选择或切换 GPT 连接方式
-norlan connection         # 查看当前连接选择
+nolan                    # 新的自由对话
+nolan --resume           # 恢复最近的 Nolan 对话
+nolan chat ./my-drama    # 带着指定制作项目开始对话
+nolan setup              # 选择或切换 GPT 连接方式
+nolan connection         # 查看当前连接选择
 ```
 
-原生对话里的 `/new` 是新对话，不是旧控制台的导入小说命令。导入小说直接使用自然语言即可。退出后制作文件与历史仍保留；重新打开可让 Norlan 查看项目并继续。
+原生对话里的 `/new` 是新对话，不是旧控制台的导入小说命令。导入小说直接使用自然语言即可。退出后制作文件与历史仍保留；重新打开可让 Nolan 查看项目并继续。
 
 ### 选择 GPT 连接
 
-运行 `norlan setup` 后选择：
+运行 `nolan setup` 后选择：
 
 - **ChatGPT 订阅**：使用现有 ChatGPT 登录与账户额度，默认保留当前的订阅方式和模型选择。
-- **OpenAI API**：填写自己账户可用的模型 ID，在本机终端隐藏输入 API Key；也可从终端的 `OPENAI_API_KEY` 环境变量读取。认证由官方 Codex CLI 保存到 Norlan 的独立 API 登录目录，密钥不会写入项目或仓库。
+- **OpenAI API**：填写自己账户可用的模型 ID，在本机终端隐藏输入 API Key；也可从终端的 `OPENAI_API_KEY` 环境变量读取。认证由官方 Codex CLI 保存到 Nolan 的独立 API 登录目录，密钥不会写入项目或仓库。
 
 连接选择会保存，订阅和 API 的登录目录、会话各自独立；切换不会复制两边的登录凭据或静默改用另一个服务。自由对话的 API 费用由 OpenAI 账户单独计费，**不受漫剧项目预算控制**。制作流程内部的 GPT API 调用必须设置项目预算和 `caps.llm`，与媒体调用一起记账。账户级消费限制应在 API 平台设置。
 
-Norlan 的模型只可使用专用制作工具，不能替你批准资产/成片、提高预算或直接改写项目状态。需要审批时，它打开本机审片页供你操作。预算配置仍由你在终端执行 `norlan configure`。
+Nolan 的模型只可使用专用制作工具，不能替你批准资产/成片、提高预算或直接改写项目状态。需要审批时，它打开本机审片页供你操作。预算配置仍由你在终端执行 `nolan configure`。
 
-Norlan 会比较 `PATH` 中的 Codex 与 ChatGPT/Codex 桌面应用内置 CLI，自动使用其中较新的已安装版本，不替换系统安装，也不自动更换你的模型。需要固定某个 CLI 时，可设置 `NORLAN_CODEX_PATH` 或 `brain.codex_command`。
+Nolan 会比较 `PATH` 中的 Codex 与 ChatGPT/Codex 桌面应用内置 CLI，自动使用其中较新的已安装版本，不替换系统安装，也不自动更换你的模型。需要固定某个 CLI 时，可设置 `NORLAN_CODEX_PATH` 或 `brain.codex_command`。
 
 ## 先走一遍无付费演示
 
 ```bash
-norlan demo ./demo-project
-norlan console ./demo-project
+nolan demo ./demo-project
+nolan console ./demo-project
 ```
 
-演示创建两集占位分镜，保留规划、资产和逐集审批。`console` 是显式保留的旧流程控制台，演示时不调用 GPT 或付费媒体服务；`norlan` / `norlan chat` 始终是实际 GPT 对话入口。可在另一个终端打开审片页面：
+演示创建两集占位分镜，保留规划、资产和逐集审批。`console` 是显式保留的旧流程控制台，演示时不调用 GPT 或付费媒体服务；`nolan` / `nolan chat` 始终是实际 GPT 对话入口。可在另一个终端打开审片页面：
 
 ```bash
-norlan studio ./demo-project
+nolan studio ./demo-project
 ```
 
 根据终端显示的项目状态和版本操作。批准并不会跳过其余审批；继续制作会推进到下一个需要你决定的位置。
@@ -63,8 +67,8 @@ norlan studio ./demo-project
 ## 用小说开始制作
 
 ```bash
-norlan new ./my-drama --novel ./novel.txt --mode live
-norlan chat ./my-drama
+nolan new ./my-drama --novel ./novel.txt --mode live
+nolan chat ./my-drama
 ```
 
 可在创建时加 `--brief "竖屏国风漫画，每集约一分钟"` 表达创作要求；分集方案仍需要你批准。
@@ -74,19 +78,23 @@ norlan chat ./my-drama
 在 GPT 对话中可以查看当前状态、继续制作、提出返工意见、暂停或恢复。人工审批通过审片页或另一个终端进行，例如批准界面上显示的第 1 版规划：
 
 ```bash
-norlan approve ./my-drama plan plan --version 1
-norlan run ./my-drama
+nolan approve ./my-drama plan plan --version 1
+nolan run ./my-drama
 ```
 
+首次生成资产前，程序会先打开网页，等你选择“由 GPT 自己决定”或“我来描述”。每项新资产都有独立选择。第二项允许填写资产描述；人物、场景和道具还可粘贴或上传 PNG、JPEG、WebP 参考图片，每张最多 8 MiB、每项最多 9 张。声音资产使用声线描述和原剧本选句，不把图片当作声音参考。全部新资产选择完成后才开始生成，之后仍须逐一审批生成的候选资产。终端执行 `nolan run` 到达此步骤时会保持审片服务运行，按 Ctrl+C 可退出。
+
 审批对象可以是 `plan`、`asset`、`episode` 或需要人工复核的 `shot`。ID 和版本必须来自当前项目；旧页面上的批准不会覆盖新版本。审片建议指出镜头 ID、时间位置与具体问题，例如“E001-S002 的人物转身后服装变了，请保留其他镜头”。
+
+每集制作时，网页展示动态百分比、已完成镜头数、当前镜头或后期步骤，以及已等待时间。百分比按已验收镜头的计划时长和后期步骤计算，表示制作流程完成度；视频引擎没有提供内部百分比时，会显示正在等待生成，不编造预计完成时间。成片合成完成显示 100%，仍需你人工审批。
 
 审片页中的图片可点击放大，支持适应窗口、原始尺寸、缩放和拖动查看，也可在新窗口打开原图。按 Esc 或点击关闭返回资产列表。预览显示资产版本和像素尺寸；页面自动更新时保留当前视图，若资产已换版会提示重新打开查看新版本。
 
 ```bash
-norlan status ./my-drama
-norlan preview ./my-drama episode E001
-norlan reject ./my-drama episode E001 --version 1 --shots E001-S002 --feedback "转身后服装变化，请修复"
-norlan run ./my-drama
+nolan status ./my-drama
+nolan preview ./my-drama episode E001
+nolan reject ./my-drama episode E001 --version 1 --shots E001-S002 --feedback "转身后服装变化，请修复"
+nolan run ./my-drama
 ```
 
 ## 配置账户与预算
@@ -96,15 +104,15 @@ norlan run ./my-drama
 ```bash
 cp examples/settings.example.json ./settings.json
 # 编辑 settings.json 后，在当前终端配置 ARK_API_KEY。
-norlan configure ./my-drama --file ./settings.json --budget 30
+nolan configure ./my-drama --file ./settings.json --budget 30
 ```
 
 上面 `30` 只是你自行批准的项目预算示例，默认单位为人民币，**不是平台价格报价**。不要原样接受它；按实际模型、分辨率、时长、参考素材与重试需求填写。
 
 | 配置 | 用途 |
 | --- | --- |
-| `brain.provider: "codex"` | 跟随 `norlan setup` 选定的订阅/API 登录。订阅记录调用次数；API 还须设置 `caps.llm` 和项目预算。 |
-| `brain.provider: "openai"` | 可选的直接 Responses API 适配器；需 `OPENAI_API_KEY` 和明确的 `brain.model`。若当前选择订阅，程序会提示连接冲突并停止，不会静默付费。通常保留 `codex` 并用 `norlan setup` 切换即可。 |
+| `brain.provider: "codex"` | 跟随 `nolan setup` 选定的订阅/API 登录。订阅记录调用次数；API 还须设置 `caps.llm` 和项目预算。 |
+| `brain.provider: "openai"` | 可选的直接 Responses API 适配器；需 `OPENAI_API_KEY` 和明确的 `brain.model`。若当前选择订阅，程序会提示连接冲突并停止，不会静默付费。通常保留 `codex` 并用 `nolan setup` 切换即可。 |
 | `ark.image_model` / `ark.video_model` | 填写你在火山 Ark 实际开通的模型或接入点 ID，不由程序猜测。 |
 | `caps.image` | 每次图片生成的保守费用上限。 |
 | `caps.video_second` | 每秒视频生成的保守费用上限；也用于声音试片。 |
@@ -120,7 +128,7 @@ norlan configure ./my-drama --file ./settings.json --budget 30
 
 ## 查看费用与核对账单
 
-审片室、`status` 和 `costs` 共用项目费用记录。网页每3秒刷新；新生成任务自动保存用量，点击“同步用量”可补查已有任务，后台查询期间仍可审看页面。也可在 Norlan 对话中要求“同步并查看本项目费用”，由 `get_costs` 查询。查询不触发新生成；已运行的旧版 Norlan 需重启才能加载新后台。
+审片室、`status` 和 `costs` 共用项目费用记录。网页每3秒刷新；新生成任务自动保存用量，点击“同步用量”可补查已有任务，后台查询期间仍可审看页面。也可在 Nolan 对话中要求“同步并查看本项目费用”，由 `get_costs` 查询。查询不触发新生成；已运行的旧版 Nolan 需重启才能加载新后台。
 
 界面会区分三类金额：
 
@@ -133,9 +141,9 @@ norlan configure ./my-drama --file ./settings.json --budget 30
 查看逐调用记录，或只查询已有视频、声音试片任务的用量：
 
 ```bash
-norlan costs ./my-drama
-norlan costs ./my-drama --json
-norlan costs ./my-drama --sync
+nolan costs ./my-drama
+nolan costs ./my-drama --json
+nolan costs ./my-drama --sync
 ```
 
 `--sync` 需要当前终端已有方舟凭据。它只向已有任务发出 GET 查询，不提交生成、不下载素材，也不批准资产或解除结果不明的任务。查不到用量时保留未知，不从视频时长、分辨率或本地文件数量反推“实际用量”。账单查询与任务用量查询是两回事：当前命令不会自动读取账户扣款账单。
@@ -145,12 +153,12 @@ norlan costs ./my-drama --sync
 历史视频若没有保存请求时的价格与参考视频设置，默认只补录接口用量。**只有你已确认这些历史任务均未输入参考视频时**，才使用以下选项，按当前公开价折算；记录会注明这是历史用量的当前价格计算，不是历史账单：
 
 ```bash
-norlan costs ./my-drama --sync --confirm-no-video-input
+nolan costs ./my-drama --sync --confirm-no-video-input
 ```
 
 历史图片通常没有可供补查的异步任务 ID。如果旧版本没有保存图片响应中的 `usage.generated_images`，升级不会从已保存的图片、生成次数或文件数量补造用量；这部分实际费用需要供应商账单依据。
 
-导入账单前，先从 `norlan costs` 获取调用的 `job_id`，并用任务 ID、请求 ID 等信息核对供应商明细。将已核对的逐调用金额整理为 JSON 列表，例如下面的**虚构格式示例**；请替换 ID、金额和账单依据，不要直接导入示例：
+导入账单前，先从 `nolan costs` 获取调用的 `job_id`，并用任务 ID、请求 ID 等信息核对供应商明细。将已核对的逐调用金额整理为 JSON 列表，例如下面的**虚构格式示例**；请替换 ID、金额和账单依据，不要直接导入示例：
 
 ```json
 [
@@ -165,7 +173,7 @@ norlan costs ./my-drama --sync --confirm-no-video-input
 ```
 
 ```bash
-norlan costs ./my-drama --import-bill ./bill-lines.json
+nolan costs ./my-drama --import-bill ./bill-lines.json
 ```
 
 金额必须与项目币种一致，每条必须有逐调用账单依据。账户总额、日期汇总或月账单不能自行均摊到某个调用。重复导入相同记录不会重复计费；与已有记录冲突时停止导入，不覆盖旧票据。批次中任一记录不合法时，整批不写入。
@@ -201,7 +209,7 @@ norlan costs ./my-drama --import-bill ./bill-lines.json
 
 项目状态保存在制作目录的 `project.json`。`source/` 保存输入，`plans/` 保存规划，`media/` 保存素材，`evidence/` 保存检查证据，`exports/` 保存粗剪与各版成片。恢复制作时使用同一个目录，不要重新创建来绕过未知账单或审批。
 
-保存规划失败时，Norlan 会向 GPT 返回出错的字段位置与修复建议，供其修改候选草案。声音资产必须绑定角色，引用声音的镜头也须引用对应角色；画外声源应在提示词中明确不出镜。关联校验不能保证生成模型不会画出画外人物，仍需审片确认。修正保存失败的规划不会自动批准或触发付费生成。升级后退出并运行 `norlan --resume`，即可在原会话中加载更新后的工具。
+保存规划失败时，Nolan 会向 GPT 返回出错的字段位置与修复建议，供其修改候选草案。声音资产必须绑定角色，引用声音的镜头也须引用对应角色；画外声源应在提示词中明确不出镜。关联校验不能保证生成模型不会画出画外人物，仍需审片确认。修正保存失败的规划不会自动批准或触发付费生成。升级后退出并运行 `nolan --resume`，即可在原会话中加载更新后的工具。
 
 开发结构和状态约束见 [架构说明](docs/architecture.md)。运行测试：
 
@@ -211,4 +219,4 @@ python3 -m unittest discover -s tests -v
 
 ## 思路来源
 
-制作流程参考了“从零开始做 AI 短剧”系列的 [第 1 篇](https://naiyous.com/12276.html)、[第 2 篇](https://naiyous.com/12298.html)、[第 3 篇](https://naiyous.com/12329.html)、[第 4 篇](https://naiyous.com/12363.html)、[第 5 篇](https://naiyous.com/12388.html)、[第 6 篇](https://naiyous.com/12450.html)。它们提供前期规划、资产、异步生成与拼接方面的思路；前期文本审稿不等于已生成视频的完整审片。本仓库代码独立编写，逐集人工审批、版本追踪和结果不明时的预算保留是 Norlan 的具体实现。
+制作流程参考了“从零开始做 AI 短剧”系列的 [第 1 篇](https://naiyous.com/12276.html)、[第 2 篇](https://naiyous.com/12298.html)、[第 3 篇](https://naiyous.com/12329.html)、[第 4 篇](https://naiyous.com/12363.html)、[第 5 篇](https://naiyous.com/12388.html)、[第 6 篇](https://naiyous.com/12450.html)。它们提供前期规划、资产、异步生成与拼接方面的思路；前期文本审稿不等于已生成视频的完整审片。本仓库代码独立编写，逐集人工审批、版本追踪和结果不明时的预算保留是 Nolan 的具体实现。

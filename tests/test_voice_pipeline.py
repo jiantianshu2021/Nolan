@@ -33,6 +33,8 @@ class VoicePipelineTests(unittest.TestCase):
         plan["assets"][0]["name"] = "测试父亲"
         core.install_plan(self.root, plan)
         core.approve(self.root, "plan", "plan", 1)
+        for asset in core.load_project(self.root)["assets"]:
+            core.set_asset_input(self.root, asset["id"], 0, 0, "gpt", "")
         with core.transaction(self.root) as state:
             for asset in state["assets"]:
                 path = write(self.root / "media" / f"{asset['id']}.png", b"SYNTHETIC IMAGE")
@@ -45,6 +47,7 @@ class VoicePipelineTests(unittest.TestCase):
             state["assets"].append({"id": "voice", "kind": "voice", "name": "测试父亲声音",
                                     "character_id": "hero", "prompt": "55岁男声，略沙哑，疲惫、气息短、急切。",
                                     "status": "planned", "version": 0, "history": [], "feedback": ""})
+        core.set_asset_input(self.root, "voice", 0, 0, "gpt", "")
         core.configure(self.root, {"caps": {"video_second": 1}, "max_poll_seconds": 1}, limit=100)
         self.selector = self.enterContext(patch.object(pipeline, "_brain", return_value=copy.deepcopy(SELECTION)))
         # Any unexpected provider path fails immediately instead of networking.

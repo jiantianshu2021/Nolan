@@ -36,7 +36,7 @@ def load_connection() -> dict:
     try:
         return validate_connection(json.loads(raw))
     except (ValueError, TypeError) as exc:
-        raise ValueError("Norlan GPT 连接配置无效，请运行 norlan setup 重新选择。") from exc
+        raise ValueError("Nolan GPT 连接配置无效，请运行 nolan setup 重新选择。") from exc
 
 
 def save_connection(value: dict) -> None:
@@ -59,7 +59,7 @@ def save_connection(value: dict) -> None:
 def describe_connection() -> str:
     value = load_connection()
     name = "ChatGPT 订阅" if value["provider"] == "chatgpt" else "OpenAI API（独立计费）"
-    return f"GPT 连接：{name}\n模型：{value.get('model') or '沿用你的 Codex 模型选择'}\n切换连接：norlan setup"
+    return f"GPT 连接：{name}\n模型：{value.get('model') or '沿用你的 Codex 模型选择'}\n切换连接：nolan setup"
 
 
 def production_connection_info(config: dict) -> dict:
@@ -84,7 +84,7 @@ def setup(provider: str | None = None, model: str | None = None) -> int:
     """Interactive local setup. Credentials go to official CLI stdin only."""
     from .interactive import prepare_launch
     if provider is None:
-        print("选择 Norlan 的 GPT 连接方式：\n  1. ChatGPT 订阅\n  2. OpenAI API（按 API 用量计费）")
+        print("选择 Nolan 的 GPT 连接方式：\n  1. ChatGPT 订阅\n  2. OpenAI API（按 API 用量计费）")
         choice = input("选择 [1/2]：").strip()
         if choice not in {"1", "2"}:
             raise ValueError("请输入 1 或 2；原连接未更改。")
@@ -104,7 +104,7 @@ def setup(provider: str | None = None, model: str | None = None) -> int:
                 key = os.environ.get("OPENAI_API_KEY")
                 if not key:
                     if not sys.stdin.isatty():
-                        raise ValueError("请在交互终端运行 norlan setup 隐藏输入密钥，或先设置 OPENAI_API_KEY。")
+                        raise ValueError("请在交互终端运行 nolan setup 隐藏输入密钥，或先设置 OPENAI_API_KEY。")
                     key = getpass.getpass("OpenAI API Key（隐藏输入）：")
                 if not key.strip() or "\n" in key or "\r" in key:
                     raise ValueError("未提供有效 API Key，原连接未更改。")
@@ -112,18 +112,18 @@ def setup(provider: str | None = None, model: str | None = None) -> int:
                                         env=env, capture_output=True, text=True, timeout=60)
                 del key
                 if result.returncode != 0:
-                    raise ValueError("API 登录未成功，原连接未更改。请检查密钥并重新运行 norlan setup。")
+                    raise ValueError("API 登录未成功，原连接未更改。请检查密钥并重新运行 nolan setup。")
             else:
                 print("将打开官方 ChatGPT 登录流程；完成登录后回到终端。")
                 result = subprocess.run(login_args, env=env, timeout=600)
                 if result.returncode != 0:
                     raise ValueError("ChatGPT 登录未完成，原连接未更改。")
     except subprocess.TimeoutExpired:
-        raise ValueError("登录检查超时，原连接未更改；请重新运行 norlan setup。") from None
+        raise ValueError("登录检查超时，原连接未更改；请重新运行 nolan setup。") from None
     save_connection(selected)
     print(describe_connection())
-    print("运行 norlan 开始对话。" if provider == "chatgpt" else
-          "运行 norlan 开始对话。自由对话的 API 费用由 OpenAI 账户计费，独立于漫剧项目预算。")
+    print("运行 nolan 开始对话。" if provider == "chatgpt" else
+          "运行 nolan 开始对话。自由对话的 API 费用由 OpenAI 账户计费，独立于漫剧项目预算。")
     return 0
 
 
@@ -131,7 +131,7 @@ def production_brain_config(config: dict) -> dict:
     """Use the operator's connection for Codex-backed production as well.
 
     An explicitly configured direct Responses provider remains explicit. API
-    credentials in the native CLI cache are read by Codex, never by Norlan.
+    credentials in the native CLI cache are read by Codex, never by Nolan.
     """
     result = dict(config)
     selected = load_connection()
@@ -141,7 +141,7 @@ def production_brain_config(config: dict) -> dict:
     if result.get("provider", "codex") != "codex":
         if result.get("provider") == "openai" and (inherited == "subscription" or (
                 inherited not in {"api", "subscription"} and selected["provider"] == "chatgpt")):
-            raise ValueError("这个项目固定使用 OpenAI API，但当前选择了 ChatGPT 订阅；请将项目 brain.provider 改为 codex 以跟随连接，或用 norlan setup 明确选择 API。尚未提交请求。")
+            raise ValueError("这个项目固定使用 OpenAI API，但当前选择了 ChatGPT 订阅；请将项目 brain.provider 改为 codex 以跟随连接，或用 nolan setup 明确选择 API。尚未提交请求。")
         return result
     if inherited in {"api", "subscription"} and os.environ.get("CODEX_HOME"):
         result["codex_home"] = os.environ["CODEX_HOME"]

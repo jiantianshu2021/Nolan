@@ -242,7 +242,7 @@ def _demo_drawtext(directory: Path, label: str) -> str:
     if not _has_filter("drawtext"):
         raise MediaError("演示素材需要带 drawtext 的 FFmpeg，以明确标记占位画面。")
     # Text is read as data; expansion=none prevents %{...} interpretation.
-    text = "NORLAN DEMO / SYNTHETIC PLACEHOLDER\n" + str(label)[:500]
+    text = "NOLAN DEMO / SYNTHETIC PLACEHOLDER\n" + str(label)[:500]
     (directory / "label.txt").write_text(text, encoding="utf-8")
     font = _font_path()
     if font:

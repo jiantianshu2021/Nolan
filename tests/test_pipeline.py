@@ -18,6 +18,14 @@ def write(path, data):
     return path
 
 
+def choose_gpt_assets(root):
+    """Explicit synthetic human choices; do not bypass the production gate."""
+    from norlan.asset_inputs import input_state, pending_assets
+    for asset in pending_assets(core.load_project(root)):
+        core.set_asset_input(root, asset["id"], asset.get("version", 0),
+                             input_state(asset)["revision"], "gpt", "")
+
+
 @contextmanager
 def fake_media():
     """Fast deterministic media for state-machine tests; real smoke test below."""
@@ -60,6 +68,10 @@ class PipelineTests(unittest.TestCase):
         state = pipeline.run(self.root)
         self.assertEqual(state["status"], "awaiting_plan")
         core.approve(self.root, "plan", "plan", state["plan"]["version"])
+        state = pipeline.run(self.root)
+        self.assertEqual(state["status"], "awaiting_asset_input")
+        self.assertFalse(state["jobs"])
+        choose_gpt_assets(self.root)
         state = pipeline.run(self.root)
         self.assertEqual(state["status"], "awaiting_assets")
         for a in state["assets"]:
@@ -184,6 +196,7 @@ class PipelineTests(unittest.TestCase):
                 state["assets"].append(character)
                 state["assets"].append({"id": "second_voice", "kind": "voice", "name": "第二角色声音", "prompt": "沉稳声音",
                                         "character_id": "second_hero", "status": "planned", "version": 0, "history": [], "feedback": ""})
+            choose_gpt_assets(self.root)
             captured = []
             def video(root, kind, item_id, output, duration, prompt, references, **kwargs):
                 captured.extend(references)

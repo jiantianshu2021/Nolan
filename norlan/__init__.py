@@ -1,3 +1,3 @@
-"""Norlan: a local, supervised animation production agent."""
+"""Nolan: a local, supervised animation production agent."""
 
-__version__ = "0.2.4"
+__version__ = "0.3.0"

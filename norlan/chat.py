@@ -22,7 +22,7 @@ HELP = """你可以直接用中文：
   总预算设为 30 元
 演示模式不调用 GPT：用 ID（如 hero、E001）明确指定对象。
 退出：/quit。退出会暂停新的提交，已提交的任务可能仍在供应商执行。
-详细配置：norlan configure 项目目录 --file settings.json --budget 金额
+详细配置：nolan configure 项目目录 --file settings.json --budget 金额
 """
 
 
@@ -200,14 +200,14 @@ def execute_intent(root, message, intent, seen):
     elif action == "help":
         print(HELP)
     elif action == "answer":
-        print("Norlan：" + intent["reply"])
+        print("Nolan：" + intent["reply"])
     return core.load_project(root)
 
 
 def _new_from_message(message):
     # Paths are supplied explicitly; no scan of personal files is performed.
     if message.strip().lower() in {"演示", "创建演示", "demo", "/demo"}:
-        target = Path.cwd() / ("norlan-demo-" + time.strftime("%Y%m%d-%H%M%S"))
+        target = Path.cwd() / ("nolan-demo-" + time.strftime("%Y%m%d-%H%M%S"))
         core.create_project(target, "Synthetic workflow demo", "demo")
         return target
     if message.startswith("/new "):
@@ -227,7 +227,7 @@ def _new_from_message(message):
         source = Path(match.group(1) or match.group(2)).expanduser()
     if source.suffix.lower() not in {".txt", ".md"} or not source.is_file():
         raise ValueError("请提供存在的小说 TXT/MD 文件；带空格的路径请用引号包围")
-    target = Path.cwd() / ("norlan-project-" + time.strftime("%Y%m%d-%H%M%S"))
+    target = Path.cwd() / ("nolan-project-" + time.strftime("%Y%m%d-%H%M%S"))
     core.create_project(target, source.read_text(encoding="utf-8"), "live")
     core.configure(target, {"creative_brief": message})
     return target
@@ -243,7 +243,7 @@ def chat(project_dir=None):
     root = Path(project_dir).expanduser().resolve() if project_dir else None
     worker = None
     lock = threading.Lock()
-    print("Norlan · 终端导演助手\n直接用中文交流；/help 查看用法，/quit 保存并退出。")
+    print("Nolan · 终端导演助手\n直接用中文交流；/help 查看用法，/quit 保存并退出。")
     if root:
         print(summary(core.load_project(root)))
     else:
@@ -252,7 +252,7 @@ def chat(project_dir=None):
     def start():
         nonlocal worker
         if worker and worker.is_alive():
-            print("Norlan：正在制作，你可以查询进度或暂停。")
+            print("Nolan：正在制作，你可以查询进度或暂停。")
             return
         core.set_paused(root, False)
         def work():
@@ -262,10 +262,10 @@ def chat(project_dir=None):
             except Exception as exc:
                 report = str(exc) if isinstance(exc, ValueError) else "制作已停止，请查看进度及配置。"
             with lock:
-                print("\nNorlan：" + report + "\n你：", end="", flush=True)
+                print("\nNolan：" + report + "\n你：", end="", flush=True)
         worker = threading.Thread(target=work, daemon=True, name="norlan-production")
         worker.start()
-        print("Norlan：开始执行。你可以继续输入“进度”或“暂停”。")
+        print("Nolan：开始执行。你可以继续输入“进度”或“暂停”。")
 
     while True:
         try:
@@ -278,19 +278,19 @@ def chat(project_dir=None):
             if root:
                 core.set_paused(root, True)
                 remember(root)
-            print("Norlan：进度已保存。下次运行 norlan 后说“继续”；在途任务不会被重复提交。" if root else "Norlan：已退出，尚未创建项目。")
+            print("Nolan：进度已保存。下次运行 nolan 后说“继续”；在途任务不会被重复提交。" if root else "Nolan：已退出，尚未创建项目。")
             return 0
         try:
             if root is not None and _requests_new(message):
                 if worker and worker.is_alive():
-                    print("Norlan：当前项目正在制作。请先暂停并等本轮停止，再创建新项目；原项目会完整保留。")
+                    print("Nolan：当前项目正在制作。请先暂停并等本轮停止，再创建新项目；原项目会完整保留。")
                     continue
                 with core.run_lock(root):
                     core.set_paused(root, True)
                 created = _new_from_message(message)
                 root = created
                 remember(root)
-                print(f"Norlan：新项目已创建于 {root}，原项目已保留。")
+                print(f"Nolan：新项目已创建于 {root}，原项目已保留。")
                 start()
                 continue
             if root is None:
@@ -298,11 +298,11 @@ def chat(project_dir=None):
                     print(HELP)
                     continue
                 if message.lower() in {"状态", "进度", "查看进度", "status", "/status", "预算", "查看预算"}:
-                    print("Norlan：还没有制作项目。提供小说 TXT/MD 路径，或输入“演示”。")
+                    print("Nolan：还没有制作项目。提供小说 TXT/MD 路径，或输入“演示”。")
                     continue
                 root = _new_from_message(message)
                 remember(root)
-                print(f"Norlan：项目已创建于 {root}")
+                print(f"Nolan：项目已创建于 {root}")
                 start()
                 continue
             state = core.load_project(root)
@@ -310,12 +310,12 @@ def chat(project_dir=None):
             intent = quick_command(message, seen)
             if intent is None:
                 if state["mode"] == "demo":
-                    print("Norlan：演示模式不会调用 GPT。请用明确的 ID 和指令，例如“hero 通过”。\n" + HELP)
+                    print("Nolan：演示模式不会调用 GPT。请用明确的 ID 和指令，例如“hero 通过”。\n" + HELP)
                     continue
                 if worker and worker.is_alive():
-                    print("Norlan：制作正在进行，暂不同时发起新的 GPT 对话。可以输入“进度”“暂停”或预览指令，其他要求请在本轮停止后提出。")
+                    print("Nolan：制作正在进行，暂不同时发起新的 GPT 对话。可以输入“进度”“暂停”或预览指令，其他要求请在本轮停止后提出。")
                     continue
-                print("Norlan：正在理解你的要求……", flush=True)
+                print("Nolan：正在理解你的要求……", flush=True)
                 intent, seen = _model_command(root, message)
             result = execute_intent(root, message, intent, seen)
             action = intent["action"]
@@ -325,7 +325,7 @@ def chat(project_dir=None):
                 print(summary(result))
         except Exception as exc:
             message = str(exc) if isinstance(exc, (ValueError, OSError)) or getattr(exc, "safe_message", False) else type(exc).__name__ + "：未执行，请检查配置"
-            print("Norlan：" + message)
+            print("Nolan：" + message)
 
 
 if __name__ == "__main__":

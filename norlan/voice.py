@@ -40,7 +40,8 @@ class AuditionSelectionError(ValueError):
 
 def audition_selection_key(asset: Mapping, character_name: str, novel_digest: str) -> str:
     """Bind selection/cache decisions to the same voice, feedback and source."""
-    inputs = [asset.get("prompt"), asset.get("feedback"), character_name, novel_digest]
+    inputs = [asset.get("prompt"), asset.get("feedback"), character_name, novel_digest,
+              asset.get("creation_input", {}).get("description", "")]
     return hashlib.sha256(json.dumps(inputs, ensure_ascii=False).encode()).hexdigest()
 
 

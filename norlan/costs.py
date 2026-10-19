@@ -125,7 +125,7 @@ def format_report(report):
     budget = report["budget"]
     currency = budget["currency"]
     exposure = sum(budget.get(key, 0) for key in ("spent", "reserved", "unknown"))
-    rows = ["Norlan · 费用明细",
+    rows = ["Nolan · 费用明细",
             "已核对实际费用：" + _money(budget["actual_cost"], currency)
             + f"（{budget['actual_cost_jobs']} / {budget['cost_jobs']} 次调用已核对）",
             "按实际用量计费（未对账）：" + _money(budget["usage_cost"], currency, "暂无可计费用量")

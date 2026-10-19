@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "norlan-agent"
-version = "0.2.4"
+version = "0.3.0"
 description = "A local, supervised AI animation production agent"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
+nolan = "norlan.cli:main"
 norlan = "norlan.cli:main"
 
 [tool.setuptools]
