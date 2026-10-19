@@ -1180,10 +1180,21 @@ def activate_asset_amendment(root, amendment_id):
         else:
             _request_shot_revision(state, target, amendment["feedback"])
         target.pop("pending_asset_amendment", None)
-        target["revision_analysis"] = {
-            "signature": hashlib.sha256(json.dumps([target.get("revision", 0), target.get("feedback", "")],
-                                                    ensure_ascii=False).encode()).hexdigest(),
-            "amendment_id": amendment_id, "blockers": [], "summary": "新增资产已获人工批准，按已确认方案准备片段返修提示词。"}
+        for update in amendment["shot_updates"]:
+            shot = _find(state, "shot", update["id"])
+            # A full prompt update was reviewed together with the exact saved
+            # feedback baseline. Do not interpret that same feedback again as
+            # a new amendment when production reaches a future segment. Merely
+            # adding a reference/continuity note cannot resolve other feedback.
+            if shot is not target and ("prompt" not in update or not shot.get("feedback", "").strip()):
+                continue
+            if shot.get("revision_analysis"):
+                shot.setdefault("revision_analysis_history", []).append(copy.deepcopy(shot["revision_analysis"]))
+            shot["revision_analysis"] = {
+                "signature": hashlib.sha256(json.dumps([shot.get("revision", 0), shot.get("feedback", "")],
+                                                        ensure_ascii=False).encode()).hexdigest(),
+                "amendment_id": amendment_id, "blockers": [],
+                "summary": "资产与片段更新方案已获人工确认，沿用已批准素材准备提示词，仍须确认后才生成。"}
         if amendment.get("audio_policy"):
             state.setdefault("audio_policy", {}).update(copy.deepcopy(amendment["audio_policy"]))
         amendment.update(status="applied", applied_at=now())
@@ -1201,6 +1212,64 @@ def approve_prompt(root, shot_id, candidate_id, sha256):
 def reject_prompt(root, shot_id, candidate_id, sha256, feedback):
     from .prompt_gate import reject
     return reject(root, shot_id, candidate_id, sha256, feedback)
+
+
+def submit_planning_feedback(root, shot_id, feedback, expected_version, analysis_signature):
+    """Resolve a visible planning question with new human instructions only.
+
+    This does not select a timing option, approve an asset/prompt, clear a media
+    failure, or submit work. The next production run must analyze the changed
+    instructions and still present its exact prompt for human confirmation.
+    """
+    if not isinstance(feedback, str) or not feedback.strip() or len(feedback) > 8000:
+        raise ValueError("请填写不超过 8000 字的规划调整意见")
+    if (type(expected_version) is not int or expected_version < 0
+            or not isinstance(analysis_signature, str) or not re.fullmatch(r"[0-9a-f]{64}", analysis_signature)):
+        raise GateError("规划问题已更新，请刷新后针对当前问题填写意见")
+    feedback = feedback.strip()
+    with run_lock(root), transaction(root) as state:
+        if state["plan"].get("status") != "approved":
+            raise GateError("请先确认当前策划，再补充分镜制作意见")
+        if any(execution_unsettled(job) for job in state["jobs"].values()):
+            raise GateError("尚有调用在执行或结果待核实，请先等待落盘或核实原任务，再调整规划意见")
+        shot = _find(state, "shot", shot_id)
+        if (shot.get("status") != "planned" or shot.get("file") or shot.get("job_id")
+                or type(shot.get("version", 0)) is not int or shot.get("version", 0) != expected_version):
+            raise GateError("片段状态或版本已改变，只有尚未提交生成的待准备片段可以补充规划意见")
+        if shot.get("pending_asset_amendment") or any(
+                amendment.get("status") in {"candidate", "awaiting_assets"}
+                and any(update.get("id") == shot_id for update in amendment.get("shot_updates", []))
+                for amendment in state.get("asset_amendments", [])):
+            raise GateError("此片段仍有待处理的资产变更方案，请先完成或取消该方案")
+        old_feedback, revision = shot.get("feedback", ""), shot.get("revision", 0)
+        if not isinstance(old_feedback, str) or type(revision) is not int or revision < 0:
+            raise GateError("片段规划记录无效，请检查当前项目后再提交意见")
+        current_signature = hashlib.sha256(json.dumps([revision, old_feedback], ensure_ascii=False).encode()).hexdigest()
+        analysis = shot.get("revision_analysis")
+        blockers = analysis.get("blockers") if isinstance(analysis, dict) else None
+        if (analysis_signature != current_signature or not isinstance(analysis, dict)
+                or analysis.get("signature") != current_signature or not isinstance(blockers, list)
+                or not blockers or any(not isinstance(item, str) or not item.strip() for item in blockers)):
+            raise GateError("规划问题已更新或已解决，请刷新后针对当前问题填写意见")
+        combined = (old_feedback + "\n\n用户对规划阻塞的补充意见：" + feedback).strip()
+        if len(combined) > 100000:
+            raise ValueError("累计规划调整意见超过 100000 字，请精简后再提交")
+        stamp = now()
+        history = shot.setdefault("revision_analysis_history", [])
+        if not any(item.get("signature") == current_signature for item in history if isinstance(item, dict)):
+            history.append({**copy.deepcopy(analysis), "superseded_at": stamp,
+                            "resolution": "human_planning_feedback", "human_feedback": feedback})
+        candidate = shot.pop("prompt_candidate", None)
+        if candidate:
+            shot.setdefault("prompt_history", []).append({**copy.deepcopy(candidate), "status": "invalidated",
+                "invalidation_reason": "用户补充规划意见，须重新准备并确认提示词"})
+        for key in ("revision_analysis", "prompt_approval", "refined_prompt"):
+            shot.pop(key, None)
+        shot.update(status="planned", revision=revision + 1, feedback=combined)
+        state.update(status="paused" if state["paused"] else "ready", last_error=None)
+        event(state, "human_planning_feedback", id=shot_id, version=expected_version, revision=shot["revision"],
+              analysis_signature=current_signature, feedback=feedback)
+    return load_project(root)
 
 
 def set_paused(root, paused):

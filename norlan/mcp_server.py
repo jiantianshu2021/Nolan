@@ -305,6 +305,7 @@ class MCPServer:
             "segment_proposal": "重分组仅限暂停且无在途任务时的尚未启动尾部；用 propose_segments 保存候选，再由用户在网页确认。不能重跑资产或替换现有规划。",
             "asset_amendment": "片段返修需要新资产时，使用 propose_asset_amendment；先由用户确认增补方案，再批准新增资产，最后确认返修提示词。不能调用 save_plan 替换旧计划。",
             "advisory_review": "GPT 审查报告中断不等于视频失败；有已核实视频时请 open_review 供用户看片审批，不自动重新审查或生成。未知审查费用保留待核实，不要求用户无凭据对账成已花费或未收费。",
+            "planning_feedback": "当前片段提示词准备有冲突时，请用 open_review；用户在片段卡填写调整意见并重新准备提示词，再确认生成。普通继续、建议或未答复都不是调整时间安排的同意；不能清掉阻塞后直接提交视频。",
             "budget": "预算仅由用户在终端执行 nolan configure PROJECT --budget AMOUNT 设置；模型不能提高预算。",
             "configuration": "模型、单次调用价格上限及服务凭证须由用户通过本机配置设置。",
         }
@@ -339,6 +340,8 @@ class MCPServer:
     def _review_gate_key(state):
         """Identify a saved human decision, excluding feedback and provider text."""
         status = state.get("status")
+        if block := dashboard._current_planning_block(state):
+            return ("planning", json.dumps([block["shot_id"], block["signature"]]))
         if status == "awaiting_prompt_approval":
             candidates = [(shot.get("id", ""), shot.get("prompt_candidate", {}).get("id", ""))
                           for episode in state.get("episodes", []) for shot in episode.get("shots", [])
@@ -407,7 +410,14 @@ class MCPServer:
                 if any(episode.get("segment_proposal", {}).get("status") == "candidate"
                        for episode in state["episodes"]):
                     raise ToolError("生成片段重分组方案尚待人工审批，本次未启动制作；请调用 open_review，由用户确认采用或保留原方案。")
-                core.set_paused(root, False)
+                planning_block = dashboard._current_planning_block(state)
+                if not planning_block:
+                    core.set_paused(root, False)
+            if planning_block:
+                review = self._open_review(root, gate_key=self._review_gate_key(state))
+                return {"started": False,
+                        "reason": "当前片段的提示词尚未准备完成，请用户在审片室该片段卡提交调整意见；随后先确认完整提示词，再生成。",
+                        "review": review, "state": self._status(root)}
             self.worker_errors.pop(root, None)
 
             def work():

@@ -97,6 +97,42 @@ class AssetAmendmentTests(unittest.TestCase):
             self.assertEqual(current.get(key), original.get(key))
         self.assertFalse(core.activate_asset_amendment(self.root, proposal["id"]))
 
+    def test_confirmed_future_prompt_consumes_only_its_saved_feedback(self):
+        with core.transaction(self.root) as state:
+            future = core._find(state, "shot", "future-shot")
+            future["feedback"] = "让加工柜更有未来科技感"
+            future["revision_analysis"] = {"signature": "old", "summary": "历史分析"}
+        updates = copy.deepcopy(self.updates)
+        updates[1]["prompt"] = "复用批准的加工柜，用工程光层增强科技感。"
+        proposal = self.propose(shot_updates=updates)
+        core.apply_asset_amendment(self.root, proposal["id"], "approve")
+        self.approve_new_assets()
+        core.activate_asset_amendment(self.root, proposal["id"])
+        future = core._find(core.load_project(self.root), "shot", "future-shot")
+        self.assertEqual(future["feedback"], "让加工柜更有未来科技感")
+        self.assertEqual(future["revision_analysis"]["amendment_id"], proposal["id"])
+        self.assertEqual(future["revision_analysis_history"], [{"signature": "old", "summary": "历史分析"}])
+        with patch.object(pipeline, "_brain", side_effect=AssertionError("Do not reanalyse consumed feedback")):
+            self.assertTrue(pipeline._revision_analysis(self.root, future))
+        # A later human request has a different signature and must be analysed.
+        with core.transaction(self.root) as state:
+            core._find(state, "shot", "future-shot")["feedback"] += "\n系统播报提前到第3秒"
+            state["mode"] = "live"
+        changed = core._find(core.load_project(self.root), "shot", "future-shot")
+        with patch.object(pipeline, "_brain", side_effect=RuntimeError("New feedback needs analysis")):
+            with self.assertRaisesRegex(RuntimeError, "New feedback"):
+                pipeline._revision_analysis(self.root, changed)
+
+    def test_reference_only_update_does_not_consume_unrelated_future_feedback(self):
+        with core.transaction(self.root) as state:
+            core._find(state, "shot", "future-shot")["feedback"] = "重新安排人物动作"
+        proposal = self.propose()
+        core.apply_asset_amendment(self.root, proposal["id"], "approve")
+        self.approve_new_assets()
+        core.activate_asset_amendment(self.root, proposal["id"])
+        future = core._find(core.load_project(self.root), "shot", "future-shot")
+        self.assertNotIn("revision_analysis", future)
+
     def test_initial_plan_voice_only_source_is_internal_without_image_generation(self):
         other = Path(self.temp.name) / "initial-voice-source"
         core.create_project(other, "系统：" + self.line)

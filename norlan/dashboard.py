@@ -43,6 +43,7 @@ INPUT_ERRORS = frozenset({
     "请先确认或取消新增资产方案。",
     "请在片段下确认提示词后再生成。",
     "请先查看资产失败原因，并明确提出重试意见。",
+    "请在当前片段填写调整意见，重新准备提示词；尚未提交视频生成。",
 })
 MEDIA_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".m4v", ".mov", ".webm", ".wav", ".mp3", ".m4a", ".ogg", ".srt", ".vtt"})
 
@@ -350,6 +351,64 @@ def _public_shot_report(record, version):
     return result
 
 
+def _public_planning_block(shot):
+    """Only show cached blockers still bound to this exact human revision."""
+    if shot.get("status") != "planned" or shot.get("file") or shot.get("job_id"):
+        return None
+    analysis = shot.get("revision_analysis")
+    feedback = shot.get("feedback", "")
+    revision, version = shot.get("revision", 0), shot.get("version", 0)
+    if (not isinstance(analysis, dict) or not isinstance(feedback, str) or not feedback.strip()
+            or type(revision) is not int or revision < 0 or type(version) is not int or version < 0):
+        return None
+    signature = hashlib.sha256(json.dumps([revision, feedback], ensure_ascii=False).encode()).hexdigest()
+    if (analysis.get("signature") != signature or not isinstance(analysis.get("blockers"), list)
+            or any(not isinstance(text, str) or not text.strip() for text in analysis["blockers"])):
+        return None
+    from .failures import sanitize_failure
+    blockers = [sanitize_failure({"provider_message": text}).get("provider_message", "")
+                for text in analysis["blockers"][:30] if isinstance(text, str) and text.strip()]
+    blockers = [text for text in blockers if text]
+    if not blockers:
+        return None
+    summary = sanitize_failure({"provider_message": analysis.get("summary")}).get("provider_message", "")
+    result = {"shot_id": shot.get("id"), "summary": summary, "blockers": blockers,
+              "signature": signature, "version": version, "revision": revision}
+    options = analysis.get("resolution_options", [])
+    if isinstance(options, list):
+        choices = []
+        for option in options[:5]:
+            if not isinstance(option, dict):
+                continue
+            label, feedback_text = option.get("label"), option.get("feedback")
+            # Never submit a truncated suggestion as if the user had read it.
+            if (not isinstance(label, str) or not label.strip() or len(label) > 120
+                    or not isinstance(feedback_text, str) or not feedback_text.strip() or len(feedback_text) > 800):
+                continue
+            safe = sanitize_failure({"message": label, "provider_message": feedback_text})
+            if safe.get("provider_message"):
+                choices.append({"label": safe["message"], "feedback": safe["provider_message"]})
+        if choices:
+            result["resolution_options"] = choices
+    return result
+
+
+def _current_planning_block(state):
+    """Future cached conflicts cannot prevent work on the current earlier clip."""
+    from .core import asset_ready, human_approved_shot
+    if (state.get("plan", {}).get("status") != "approved"
+            or any(not asset_ready(asset) for asset in state.get("assets", []))
+            or any(value.get("status") in {"candidate", "awaiting_assets"}
+                   for value in state.get("asset_amendments", []) if isinstance(value, dict))):
+        return None
+    for episode in state.get("episodes", []):
+        if episode.get("status") == "approved":
+            continue
+        shot = next((value for value in episode.get("shots", []) if not human_approved_shot(value)), None)
+        return _public_planning_block(shot) if shot else None
+    return None
+
+
 def _public_shot_history(shot):
     history, seen = [], set()
     for record in shot.get("history", []):
@@ -541,6 +600,17 @@ def public_state(state: dict) -> dict:
     result["asset_amendments"] = [candidate for value in state.get("asset_amendments", [])
                                   if (candidate := _public_asset_amendment(value, state)) is not None]
     episodes = []
+    planning_block = _current_planning_block(state)
+    if planning_block:
+        from .core import asset_ready, execution_unsettled
+        planning_block["can_submit"] = bool(not state.get("paused")
+            and state.get("plan", {}).get("status") == "approved"
+            and all(asset_ready(asset) for asset in state.get("assets", []))
+            and not any(execution_unsettled(job) for job in state.get("jobs", {}).values() if isinstance(job, dict))
+            and not any(value.get("status") in {"candidate", "awaiting_assets"}
+                        for value in state.get("asset_amendments", []) if isinstance(value, dict))
+            and not any(episode.get("segment_proposal", {}).get("status") == "candidate"
+                        for episode in state.get("episodes", [])))
     stamp = now()
     for episode in state.get("episodes", []):
         item = _pick(episode, ("id", "title", "summary", "status", "version", "file", "feedback", "subtitle_status", "music_status", "subtitles_burned", "render_warnings", "review_note", "subtitle_file"))
@@ -569,6 +639,8 @@ def public_state(state: dict) -> dict:
                 entry["subshots"] = [_pick(part, ("start", "end", "prompt"))
                                      for part in shot["subshots"] if isinstance(part, dict)]
             entry["version"] = _version(shot.get("version"))
+            if planning_block and planning_block["shot_id"] == shot.get("id"):
+                entry["planning_block"] = dict(planning_block)
             amendment_id = shot.get("pending_asset_amendment")
             if amendment_id and any(value.get("id") == amendment_id and value.get("status") in {"candidate", "awaiting_assets"}
                                     for value in state.get("asset_amendments", []) if isinstance(value, dict)):
@@ -588,6 +660,9 @@ def public_state(state: dict) -> dict:
                 if report:
                     entry["review"] = report
             entry["progress"] = _shot_progress(state, episode, shot, item["progress"], stamp)
+            if entry.get("planning_block") and entry["progress"]["stage"] not in {"failed", "unknown"}:
+                entry["progress"].update(stage="planning_blocked", label="等待你调整制作要求，尚未提交生成",
+                                          waiting_for_human=True, is_working=False)
             if entry["progress"]["stage"] == "failed":
                 entry["status"] = "generation_failed"
             entry["history"] = _public_shot_history(shot)
@@ -731,6 +806,8 @@ class _Context:
             if any(shot.get("status") == "awaiting_prompt_approval"
                    for episode in state.get("episodes", []) for shot in episode.get("shots", [])):
                 raise ValueError("请在片段下确认提示词后再生成。")
+            if _current_planning_block(state):
+                raise ValueError("请在当前片段填写调整意见，重新准备提示词；尚未提交视频生成。")
             self.running = True
             self.worker_error = None
         try:
@@ -935,6 +1012,15 @@ class _Handler(BaseHTTPRequestHandler):
                         if not isinstance(feedback, str) or not feedback.strip() or len(feedback) > 8000:
                             raise ValueError
                         _core().reject_prompt(context.project_dir, item_id, candidate_id, request_hash, feedback.strip())
+                    return self._json(200, context.state())
+                if action == "planning_feedback":
+                    item_id, version = data.get("id"), data.get("version")
+                    signature, feedback = data.get("analysis_signature"), data.get("feedback")
+                    if (not isinstance(item_id, str) or not 0 < len(item_id) <= 128
+                            or type(version) is not int or version < 0 or not _valid_sha(signature)
+                            or not isinstance(feedback, str) or not feedback.strip() or len(feedback) > 8000):
+                        raise ValueError
+                    _core().submit_planning_feedback(context.project_dir, item_id, feedback.strip(), version, signature)
                     return self._json(200, context.state())
                 if action == "asset_amendment":
                     amendment_id, decision = data.get("id"), data.get("decision")

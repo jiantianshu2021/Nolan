@@ -780,6 +780,18 @@ def _final_shot_prompt(state, shot, refined, context):
     return prompt
 
 
+def _save_revision_analysis(root, shot_id, record):
+    """Keep superseded diagnoses while binding the current one to its feedback."""
+    with core.transaction(root) as state:
+        shot = core._find(state, "shot", shot_id)
+        old = shot.get("revision_analysis")
+        if isinstance(old, dict) and old and old.get("signature") != record.get("signature"):
+            history = shot.setdefault("revision_analysis_history", [])
+            if not any(item.get("signature") == old.get("signature") for item in history):
+                history.append({**copy.deepcopy(old), "superseded_at": core.now()})
+        shot["revision_analysis"] = copy.deepcopy(record)
+
+
 def _revision_analysis(root, shot):
     """Resolve a human request for new assets before preparing a paid rework."""
     if not shot.get("feedback", "").strip():
@@ -809,7 +821,7 @@ def _revision_analysis(root, shot):
         raise core.GateError("返修需求分析结果不完整，尚未提交视频。")
     record = {"signature": signature, "blockers": result.get("blockers", []), "summary": result.get("summary", "")}
     if record["blockers"]:
-        _save_shot(root, shot["id"], revision_analysis=record)
+        _save_revision_analysis(root, shot["id"], record)
         raise core.GateError("；".join(record["blockers"]))
     policy = result.get("audio_policy") or {}
     previous_policy = state.get("audio_policy", {})
@@ -822,10 +834,10 @@ def _revision_analysis(root, shot):
                     result["additions"], result["shot_updates"], audio_policy=policy or None, already_locked=True)
         amendment = changed["asset_amendments"][-1]
         record["amendment_id"] = amendment["id"]
-        _save_shot(root, shot["id"], revision_analysis=record)
+        _save_revision_analysis(root, shot["id"], record)
         _set(root, status="awaiting_asset_amendment")
         return False
-    _save_shot(root, shot["id"], revision_analysis=record)
+    _save_revision_analysis(root, shot["id"], record)
     return True
 
 

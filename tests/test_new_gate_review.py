@@ -1,5 +1,7 @@
 """Synthetic human gates open one reusable review page; no browser or model calls."""
 import copy
+import hashlib
+import json
 from contextlib import redirect_stdout
 import io
 from pathlib import Path
@@ -76,6 +78,39 @@ class NewGateReviewTests(unittest.TestCase):
         state["assets"][0]["version"] = 2
         self.launch(state)
         self.assertEqual(self.browser.call_count, 2)
+
+    def planning_state(self):
+        state = self.state("blocked")
+        state["plan"]["status"] = "approved"
+        for asset in state["assets"]:
+            asset["status"] = "approved"  # Synthetic projection fixture; no media calls.
+        shot = state["episodes"][0]["shots"][0]
+        shot.update(status="planned", version=0, feedback="增加系统播报", revision=0)
+        signature = hashlib.sha256(json.dumps([0, shot["feedback"]], ensure_ascii=False).encode()).hexdigest()
+        shot["revision_analysis"] = {"signature": signature, "blockers": ["请确认播报起点"], "summary": "等待时间安排"}
+        return state
+
+    def test_new_planning_conflict_opens_review_once(self):
+        state = self.planning_state()
+        self.launch(state)
+        self.launch(state)
+        self.assertEqual(self.browser.call_count, 1)
+        self.assertEqual(self.server._review_gate_key(state)[0], "planning")
+
+    def test_cached_planning_conflict_opens_feedback_instead_of_rerunning(self):
+        state = self.planning_state()
+        with core.transaction(self.root) as stored:
+            stored.update(state)
+        before = (self.root / "project.json").read_bytes()
+        with patch.object(pipeline, "run", side_effect=AssertionError("Do not rerun cached blocker")):
+            first = self.server._launch(self.root)
+            second = self.server._launch(self.root)
+        self.assertFalse(first["started"])
+        self.assertIn("调整意见", first["reason"])
+        self.assertEqual(first["review"]["url"], second["review"]["url"])
+        self.assertEqual(self.browser.call_count, 1)
+        self.assertEqual(self.server.workers, {})
+        self.assertEqual((self.root / "project.json").read_bytes(), before)
 
     def test_review_server_failure_does_not_cache_gate_or_invalidate_the_stop(self):
         state = self.state("awaiting_prompt_approval")
