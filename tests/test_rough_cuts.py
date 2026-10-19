@@ -95,12 +95,16 @@ class RoughCutTests(unittest.TestCase):
         self.assertEqual(state["status"], "awaiting_episode_review", state.get("last_error"))
         cuts = state["episodes"][0]["rough_cuts"]
         self.assertEqual(cuts[:3], old_cuts)
-        self.assertEqual([cut["shot_count"] for cut in cuts], [2, 3, 4, 3, 4])
+        # The repaired candidate is previewed with the retained fourth clip
+        # immediately; the shorter approved prefix can be recorded afterward.
+        self.assertEqual([cut["shot_count"] for cut in cuts], [2, 3, 4, 4, 3])
         self.assertEqual(len({cut["key"] for cut in cuts}), len(cuts))
         for cut in old_cuts:
             self.assertEqual((self.root / cut["file"]).read_bytes(), old_bytes[cut["file"]])
-        self.assertEqual(cuts[-1]["shots"][2]["version"], 2)
-        self.assertNotEqual(cuts[-1]["shots"][2]["sha256"], old_cuts[-1]["shots"][2]["sha256"])
+        latest_full = next(cut for cut in reversed(cuts) if cut["shot_count"] == 4)
+        self.assertEqual(latest_full["shots"][2]["version"], 2)
+        self.assertEqual(latest_full["shots"][3]["version"], 1)
+        self.assertNotEqual(latest_full["shots"][2]["sha256"], old_cuts[-1]["shots"][2]["sha256"])
 
     def test_legacy_batch_review_file_is_indexed_without_reencoding(self):
         with core.transaction(self.root) as state:

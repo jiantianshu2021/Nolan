@@ -495,9 +495,11 @@ def _shot(root, ep_id, shot_id, previous):
             return True
         # A legacy GPT pass is advice, not a human decision.
         _save_shot(root, shot_id, status="review_required")
+        _refresh_candidate_preview(root, ep_id)
         _set(root, status="review_required")
         return False
     if shot["status"] == "review_required":
+        _refresh_candidate_preview(root, ep_id)
         _set(root, status="review_required")
         return False
     active = s["jobs"].get(shot.get("job_id", ""))
@@ -559,6 +561,9 @@ def _shot(root, ep_id, shot_id, previous):
                 if "subshots" in shot else media.extract_evidence(out, evidence_dir))
     relative = _relative_evidence(root, evidence)
     _save_shot(root, shot_id, file=_rel(root, out), sha256=core.digest(out), evidence=relative, status="reviewing")
+    # Human approval needs the seam in motion, not just a standalone clip.
+    # This local preview is published before the advisory GPT call completes.
+    _refresh_candidate_preview(root, ep_id)
     # Review the seam too: prior tail + current sampled frames, tied to hashes.
     review_images = images + [Path(f) for f in evidence["frames"]]
     review_context = {**context, "shot": shot, "actual": relative,
@@ -731,28 +736,37 @@ def _captions(root, ep):
         raise
 
 
-def _rough_cut(root, episode, count):
+def _rough_cut(root, episode, count, *, include_pending=False):
     """Publish a local cumulative cut before any batch model review.
 
-    Source hashes preserve the old batch-review identity for existing projects.
-    Registered outputs are immutable and verified before reuse; an unregistered
-    file left by an interruption is never mistaken for a completed render.
+    Candidate previews are allowed only when explicitly requested here; they
+    never approve clips or become a generation reference. Source identities,
+    versions and hashes bind a cut to its exact timeline. Legacy hash-only cuts
+    remain reusable when their saved manifest matches the current sources.
     """
     shots = episode["shots"][:count]
-    if not shots or len(shots) != count or any(shot["status"] != "accepted" for shot in shots):
-        raise core.GateError("累计粗剪只能使用已经验收的连续镜头。")
+    allowed = {"accepted", "reviewing", "review_required"} if include_pending else {"accepted"}
+    if not shots or len(shots) != count or any(shot["status"] not in allowed for shot in shots):
+        raise core.GateError("累计粗剪需要连续且已落盘的当前版本；待审预览不会批准视频。")
+    state = core.load_project(root)
     for shot in shots:
-        core._check_artifact(root, shot)
-    key = hashlib.sha256("-".join(shot["sha256"] for shot in shots).encode()).hexdigest()
-    existing = next((cut for cut in episode.get("rough_cuts", []) if cut.get("key") == key), None)
+        core._check_shot_artifact(root, state, shot)
+    manifest = [{"id": shot["id"], "version": shot.get("version", 0), "sha256": shot["sha256"]} for shot in shots]
+    key = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    legacy_key = hashlib.sha256("-".join(shot["sha256"] for shot in shots).encode()).hexdigest()
+    existing = next((cut for cut in episode.get("rough_cuts", [])
+                     if cut.get("key") in {key, legacy_key} and cut.get("shots") == manifest), None)
     if existing:
         core._check_artifact(root, existing)
         return copy.deepcopy(existing)
     legacy = next((review for review in episode.get("reviews", [])
-                   if review.get("key") == key and review.get("file") and review.get("sha256")), None)
+                   if review.get("key") in {key, legacy_key} and review.get("file") and review.get("sha256")
+                   and not any(cut.get("file") == review["file"] and cut.get("shots") != manifest
+                               for cut in episode.get("rough_cuts", []))), None)
     if legacy:
         core._check_artifact(root, legacy)
         path = core.safe_path(root, legacy["file"])
+        key = legacy["key"]
     else:
         _progress(root, episode["id"], "batch_assembly", shots[-1]["id"])
         path = Path(root) / "exports" / f"{episode['id']}-rough-{count}-{key[:16]}.mp4"
@@ -761,14 +775,44 @@ def _rough_cut(root, episode, count):
         media.compose([core.safe_path(root, shot["file"]) for shot in shots], path)
     record = {"key": key, "file": _rel(root, path), "sha256": core.digest(path),
               "shot_count": count,
-              "shots": [{"id": shot["id"], "version": shot.get("version", 0), "sha256": shot["sha256"]}
-                        for shot in shots], "created_at": core.now()}
+              "shots": manifest, "created_at": core.now()}
     if count >= 2:
         with core.transaction(root) as state:
             cuts = core._find(state, "episode", episode["id"]).setdefault("rough_cuts", [])
             if not any(cut.get("key") == key for cut in cuts):
                 cuts.append(record)
     return record
+
+
+def _refresh_candidate_preview(root, ep_id):
+    """Join the longest available prefix locally, without changing approvals.
+
+    A preserved downstream clip may still need continuity review. Include its
+    current bytes so a repaired middle clip can be judged on both seams. Missing
+    or still-generating clips terminate the prefix; history is never substituted.
+    Preview failures preserve the paid-for clips and their human review gate.
+    """
+    state = core.load_project(root)
+    episode = core._find(state, "episode", ep_id)
+    count = 0
+    for shot in episode["shots"]:
+        if (shot.get("status") not in {"accepted", "reviewing", "review_required"}
+                or not shot.get("file") or not shot.get("sha256") or not core._shot_file_matches_version(shot)):
+            break
+        count += 1
+    if count < 2:
+        if episode.get("preview_error"):
+            _save_episode(root, ep_id, preview_error=None)
+        return None
+    try:
+        cut = _rough_cut(root, episode, count, include_pending=True)
+    except Exception:
+        _save_episode(root, ep_id, preview_error=
+                      "累计拼接预览暂未生成成功；片段已保留，可以重试本地拼接后再决定。")
+        return None
+    if episode.get("preview_error"):
+        _save_episode(root, ep_id, preview_error=None)
+    return cut
 
 
 def _episode(root, ep_id):
@@ -794,10 +838,10 @@ def _episode(root, ep_id):
         count = index + 1
         rough_cut = _rough_cut(root, fresh, count) if count >= 2 else None
         if count % s["settings"]["batch_size"] == 0 or count == len(ep["shots"]):
-            batch_key = hashlib.sha256("-".join(sh["sha256"] for sh in fresh["shots"][:count]).encode()).hexdigest()
+            rough_cut = rough_cut or _rough_cut(root, fresh, count)
+            batch_key = rough_cut["key"]
             if any(r.get("key") == batch_key for r in fresh["reviews"]):
                 continue
-            rough_cut = rough_cut or _rough_cut(root, fresh, count)
             path = core.safe_path(root, rough_cut["file"])
             ev = media.extract_evidence(path, Path(root) / "evidence" / f"rough-{ep_id}-{batch_key[:16]}")
             _progress(root, ep_id, "batch_review", original["id"])

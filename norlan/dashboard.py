@@ -122,7 +122,8 @@ def _public_shot_report(record, version):
             or ("version" in review and review["version"] != version)):
         return None
     verdict = review.get("verdict")
-    result = {"version": version,
+    identity = json.dumps([record.get("file"), version, record["sha256"]], ensure_ascii=True)
+    result = {"version": version, "key": "report-" + hashlib.sha256(identity.encode()).hexdigest(),
               "verdict": verdict if isinstance(verdict, str) and verdict in {"pass", "fail", "uncertain"} else "uncertain"}
     result["issues"] = [value[:8000] for value in review.get("issues", [])[:100] if isinstance(value, str)] if isinstance(review.get("issues"), list) else []
     for key in ("observed_end_state", "repair_prompt", "scope"):
@@ -156,6 +157,13 @@ def _public_shot_history(shot):
 
 def _public_rough_cuts(episode):
     """Expose explicit cut files and distinguish current from obsolete footage."""
+    from .core import human_approved_shot
+
+    def available(shot):
+        return (shot.get("status") in {"accepted", "reviewing", "review_required"}
+                and _public_video_path(shot.get("file"), "media")
+                and _valid_sha(shot.get("sha256")) and _current_shot_artifact(shot))
+
     output, seen = [], set()
     shots = episode.get("shots", [])
     sources = [(record, False) for record in episode.get("rough_cuts", [])]
@@ -181,7 +189,7 @@ def _public_rough_cuts(episode):
             if valid:
                 public_manifest = [_pick(row, ("id", "version")) for row in manifest]
                 current = all(row["id"] == shot.get("id") and row["version"] == _version(shot.get("version"))
-                              and row["sha256"] == shot.get("sha256") and _current_shot_artifact(shot)
+                              and row["sha256"] == shot.get("sha256") and available(shot)
                               for row, shot in zip(manifest, shots[:count]))
         else:
             match = re.fullmatch(re.escape(str(episode.get("id", ""))) + r"-rough-([1-9]\d*)-([0-9a-f]{16})\.mp4",
@@ -189,7 +197,7 @@ def _public_rough_cuts(episode):
             count = int(match[1]) if match else 0
             if match and 0 < count <= len(shots) and match[2] == record["key"][:16]:
                 originals = shots[:count]
-                if all(_valid_sha(shot.get("sha256")) and _current_shot_artifact(shot) for shot in originals):
+                if all(available(shot) for shot in originals):
                     calculated = hashlib.sha256("-".join(shot["sha256"] for shot in originals).encode()).hexdigest()
                     current = calculated == record["key"]
                     if current:
@@ -197,11 +205,14 @@ def _public_rough_cuts(episode):
         item = {"key": record["key"], "file": record["file"], **_public_timestamps(record)}
         item.update(shot_count=count if type(count) is int and 0 < count <= len(shots) else 0,
                     current=current, legacy=legacy, shots=public_manifest)
+        # A cut is immutable, but approval can change after it was rendered.
+        # Derive pending clips from the live prefix, never the saved cut label.
+        item["pending_shot_ids"] = [shot["id"] for shot in shots[:count] if not human_approved_shot(shot)] if current else []
         matched = next((review for review in reversed(episode.get("reviews", []))
                         if isinstance(review, dict) and review.get("key") == record["key"]
                         and review.get("file") == record["file"] and review.get("sha256") == record["sha256"]), None)
         if matched:
-            report = _public_shot_report({"sha256": record["sha256"], "review": matched}, None)
+            report = _public_shot_report({"file": record["file"], "sha256": record["sha256"], "review": matched}, None)
             if report:
                 item["review"] = report
         output.append(item)
@@ -296,8 +307,14 @@ def public_state(state: dict) -> dict:
     episodes = []
     stamp = now()
     for episode in state.get("episodes", []):
-        item = _pick(episode, ("id", "title", "summary", "status", "version", "file", "feedback", "review", "subtitle_status", "music_status", "subtitles_burned", "render_warnings", "review_note", "subtitle_file"))
+        item = _pick(episode, ("id", "title", "summary", "status", "version", "file", "feedback", "subtitle_status", "music_status", "subtitles_burned", "render_warnings", "review_note", "subtitle_file"))
+        if episode.get("file"):
+            report = _public_shot_report(episode, _version(episode.get("version")))
+            if report:
+                item["review"] = report
         item["has_subtitles"] = bool(episode.get("render_manifest", {}).get("subtitles"))
+        if episode.get("preview_error"):
+            item["preview_error"] = "累计拼接预览暂未生成成功；片段已保留，可以重试本地拼接后再决定。"
         item["progress"] = episode_progress(state, episode, now=stamp)
         item["rough_cuts"] = _public_rough_cuts(episode)
         proposal = episode.get("segment_proposal")

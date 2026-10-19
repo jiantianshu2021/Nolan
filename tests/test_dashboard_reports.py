@@ -65,6 +65,18 @@ class ReportProjectionTests(unittest.TestCase):
         self.shot["history"][0]["review"]["sha256"] = "a" * 64
         self.assertEqual(self.public_shot()["history"][0]["review"]["version"], 1)
 
+    def test_report_expansion_identity_tracks_file_version_and_hash(self):
+        key = self.public_shot()["review"]["key"]
+        self.shot["status"] = "accepted"
+        self.assertEqual(self.public_shot()["review"]["key"], key)
+        self.shot["history"] = [copy.deepcopy(self.shot)]
+        self.assertEqual(self.public_shot()["history"][0]["review"]["key"], key)
+        self.shot["sha256"] = self.shot["review"]["sha256"] = "c" * 64
+        self.assertNotEqual(self.public_shot()["review"]["key"], key)
+        self.shot["sha256"] = self.shot["review"]["sha256"] = "b" * 64
+        self.shot.update(version=3, file="media/E1/S1-v3.mp4")
+        self.assertNotEqual(self.public_shot()["review"]["key"], key)
+
     def test_rough_report_is_attached_to_exact_cut_not_current_shot(self):
         cut = {"key": "c" * 64, "file": "exports/E1-rough-1-" + "c" * 16 + ".mp4", "sha256": "d" * 64,
                "shot_count": 1, "shots": [{"id": "S1", "version": 2, "sha256": "b" * 64}]}
@@ -158,7 +170,7 @@ class ReportRenderingTests(unittest.TestCase):
     def test_reports_stay_below_their_video_and_buttons_never_follow_gpt_verdict(self):
         html = Path(dashboard.__file__).with_name("dashboard.html").read_text()
         sources = []
-        for name in ("el", "mediaURL", "appendPrompt", "shotReview", "advisoryReport", "subshotPlan", "shotCard", "roughCutCard"):
+        for name in ("el", "mediaURL", "appendPrompt", "shotReview", "advisoryReport", "subshotPlan", "shotCard", "roughCutCard", "appendEpisodeProduction"):
             start = html.index("function " + name + "(")
             sources.append(html[start:html.index("\nfunction ", start + 1)])
         program = r'''
@@ -170,8 +182,10 @@ class Element {
  setAttribute(key,value){this.attributes[key]=value;}
  addEventListener(key,handler){this.listeners[key]=handler;}
 }
-const decisions=[],revisions=[];
+const decisions=[],revisions=[],reportCache=new Map();
 const context={document:{createElement:tag=>new Element(tag),createTextNode:text=>({tag:"text",textContent:text})},
+ sessionStorage:{getItem:key=>reportCache.get(key),setItem:(key,value)=>reportCache.set(key,value)},
+ state:{id:'synthetic'},segmentProposal:()=>null,
  perform:(...args)=>decisions.push(args),showRevision:(...args)=>revisions.push(args),assert,decisions,revisions};
 vm.runInNewContext(sources.join("\n")+`
 const walk=node=>[node,...(node.children||[]).flatMap(walk)];
@@ -179,6 +193,9 @@ for(const verdict of ['pass','fail','uncertain']){
  const shot={id:'S1',version:2,status:'review_required',duration:5,file:'media/E1/S1-v2.mp4',review:{version:2,verdict,issues:['审查意见'],repair_prompt:'调整站位'}};
  const card=shotCard(shot,0,null),video=card.children.findIndex(n=>n.tag==='video');
  assert.equal(card.children[video+1].className,'advisory-report');
+ assert.equal(card.children[video+1].tag,'details');assert.equal(card.children[video+1].open,false);
+ assert.equal(card.children[video+1].children[0].tag,'summary');
+ assert.equal(walk(card.children[video+1].children[0]).some(n=>n.textContent.includes('1 项问题')),true);
  assert.equal(card.children[video+1].children.some(n=>n.textContent.includes('GPT 建议不等于最终审批')),true);
  const nodes=walk(card),approve=nodes.find(n=>n.tag==='button'&&n.textContent==='通过本段并继续');
  assert.equal(approve.disabled,true);
@@ -201,6 +218,22 @@ assert.equal(history.children[1].tag,'video');assert.equal(history.children[2].c
 assert.equal(historical.children.some(n=>n.className==='advisory-report'),false);
 const cut=roughCutCard({file:'exports/cut.mp4',shot_count:2,review:{verdict:'uncertain',issues:['接续建议']}},true);
 const cutVideo=cut.children.findIndex(n=>n.tag==='video');assert.equal(cut.children[cutVideo+1].className,'advisory-report');
+assert.equal(cut.children[cutVideo+1].open,false);assert.equal(history.children[2].open,false);
+const sample={key:'report-S1-v2-hash',version:2,verdict:'fail',issues:['one']};
+const initial=advisoryReport(sample);assert.equal(initial.open,false);initial.open=true;initial.listeners.toggle();
+assert.equal(advisoryReport(sample).open,true,'rerender and reload restore this report');
+assert.equal(advisoryReport(sample,'历史报告').open,true,'same footage retains expansion in history');
+assert.equal(advisoryReport({...sample,key:'report-S1-v3-otherhash',version:3}).open,false,'new version starts folded');
+const closed=advisoryReport(sample);closed.open=false;closed.listeners.toggle();assert.equal(advisoryReport(sample).open,false);
+const pending=roughCutCard({file:'exports/pending.mp4',shot_count:2,pending_shot_ids:['S2']},true);
+assert.equal(walk(pending).some(n=>n.textContent.includes('包含待审批片段：S2')),true);
+assert.equal(walk(pending).some(n=>n.textContent.includes('均已批准')),false);
+const holder=el('article');appendEpisodeProduction(holder,{id:'E1',shots:[],rough_cuts:[
+ {current:true,file:'exports/long.mp4',shot_count:3,pending_shot_ids:['S3']},
+ {current:true,file:'exports/short.mp4',shot_count:2,pending_shot_ids:[]}]});
+const preview=walk(holder).find(n=>n.className==='rough-cut');
+assert.equal(preview.children[0].textContent,'当前累计拼接 · 前 3 个片段');
+assert.equal(walk(preview).find(n=>n.tag==='video').src,'/media/exports/long.mp4');
 `,context);
 '''
         result = subprocess.run([shutil.which("node"), "-e", program], input=json.dumps(sources), text=True,

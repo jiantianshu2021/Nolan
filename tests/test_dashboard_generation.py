@@ -118,6 +118,54 @@ class DashboardGenerationTests(unittest.TestCase):
         episode["shots"][0].update(version=1, file="media/E1/S1-v1.mp4", sha256="c" * 64)
         self.assertFalse(self.public()["episodes"][0]["rough_cuts"][0]["current"])
 
+    def test_pending_preview_updates_approval_label_without_changing_saved_cut(self):
+        episode = self.state["episodes"][0]
+        first, second = episode["shots"]
+        first.update(approved_at="2026-01-01T00:00:15+00:00", approved_sha256=first["sha256"],
+                     review={"human_override": True})
+        second.update(status="reviewing", version=1, file="media/E1/S2-v1.mp4", sha256="b" * 64)
+        cut = self.cut(2)
+        cut["pending_shot_ids"] = ["SYNTHETIC-STALE-ID"]
+        episode["rough_cuts"] = [cut]
+        before = copy.deepcopy(cut)
+        for status in ("reviewing", "review_required"):
+            second["status"] = status
+            preview = self.public()["episodes"][0]["rough_cuts"][0]
+            self.assertTrue(preview["current"])
+            self.assertEqual(preview["pending_shot_ids"], ["S2"])
+        second.update(status="accepted", approved_at="2026-01-01T00:00:25+00:00", approved_sha256=second["sha256"],
+                      review={"human_override": True})
+        self.assertEqual(self.public()["episodes"][0]["rough_cuts"][0]["pending_shot_ids"], [])
+        self.assertEqual(cut, before)
+
+    def test_upstream_revision_retires_old_preview_until_entire_prefix_exists(self):
+        episode = self.state["episodes"][0]
+        first, second = episode["shots"]
+        second.update(status="review_required", version=1, file="media/E1/S2-v1.mp4", sha256="b" * 64)
+        old = self.cut(2)
+        episode["rough_cuts"] = [old]
+        first.update(status="planned")
+        first.pop("file")
+        retired = self.public()["episodes"][0]["rough_cuts"][0]
+        self.assertFalse(retired["current"])
+        self.assertEqual(retired["pending_shot_ids"], [])
+        first.update(status="review_required", version=2, file="media/E1/S1-v2.mp4", sha256="d" * 64)
+        new = self.cut(2)
+        episode["rough_cuts"].append(new)
+        previews = self.public()["episodes"][0]["rough_cuts"]
+        self.assertFalse(previews[0]["current"])
+        self.assertTrue(previews[1]["current"])
+        self.assertEqual(previews[1]["pending_shot_ids"], ["S1", "S2"])
+        second["status"] = "planned"
+        self.assertFalse(self.public()["episodes"][0]["rough_cuts"][1]["current"])
+
+    def test_preview_failure_is_safe_and_does_not_invent_a_cut(self):
+        self.state["episodes"][0]["preview_error"] = "PRIVATE-FFMPEG-DETAIL"
+        result = self.public()["episodes"][0]
+        self.assertIn("片段已保留", result["preview_error"])
+        self.assertEqual(result["rough_cuts"], [])
+        self.assertNotIn("PRIVATE-FFMPEG-DETAIL", json.dumps(result))
+
     def test_legacy_cut_verified_by_prefix_hash_or_marked_historical(self):
         episode = self.state["episodes"][0]
         legacy = self.cut()
