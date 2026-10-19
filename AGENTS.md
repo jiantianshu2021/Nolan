@@ -17,6 +17,9 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
 - Keep keys out of project state, logs, tests and version control.
 - Use argv for subprocesses, never shell commands from GPT output.
 - Keep original media immutable and decisions bound to version and file hash.
+- Show the current final export directly in the episode postproduction panel,
+  with its human approval and subtitle/music feedback together. Never substitute
+  a dry cut or retired export for the current final preview.
 - Route segment feedback through the same revision planner for ordinary edits,
   local storyboarding and asset additions. A new storyboard may change only the
   target segment's internal shots and duration within provider limits. GPT

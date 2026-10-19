@@ -786,7 +786,26 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
     library_mode = state.get("settings", {}).get("music", {}).get("mode") == "library"
     shots = episode.get("shots", [])
     result["ready"] = bool(shots) and all(human_approved_shot(shot) for shot in shots)
-    result["final_ready"] = bool(value.get("final_ready") is True and episode.get("status") in {"awaiting_review", "approved"})
+    # A previous export may remain on the episode during postproduction rework.
+    # Publish a final preview only when its saved identity is the current export,
+    # rather than letting the UI fall back to the dry cut or a retired version.
+    final_file = value.get("final_file")
+    final_version = value.get("final_version")
+    final_sha256 = value.get("final_sha256")
+    final_path_ok = (isinstance(final_file, str) and bool(final_file)
+                     and not Path(final_file).is_absolute() and ".." not in Path(final_file).parts
+                     and "\\" not in final_file
+                     and Path(final_file).suffix.lower() in {".mp4", ".m4v", ".mov", ".webm"})
+    result["final_ready"] = bool(result["enabled"] and result["ready"]
+        and value.get("final_ready") is True
+        and value.get("status") in {"awaiting_final_approval", "approved"}
+        and episode.get("status") in {"awaiting_review", "approved"}
+        and final_path_ok and final_file == episode.get("file")
+        and type(final_version) is int and final_version > 0
+        and type(episode.get("version")) is int and final_version == episode["version"]
+        and _valid_sha(final_sha256) and final_sha256 == episode.get("sha256"))
+    if result["final_ready"]:
+        result.update(final_file=final_file, final_version=final_version, final_sha256=final_sha256)
     result["missing_configuration"] = [sanitize_failure({"message": text})["message"] for text in value.get("missing_configuration", [])
                                         if isinstance(text, str) and len(text) <= 1000][:20]
     if library_mode:

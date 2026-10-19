@@ -54,12 +54,73 @@ class PostproductionProjectionTests(unittest.TestCase):
     def test_old_final_file_does_not_enable_new_final_approval(self):
         state = synthetic_state()
         episode = state["episodes"][0]
-        episode.update(status="awaiting_review", file="exports/old.mp4", sha256="c" * 64)
+        episode.update(status="awaiting_review", version=1, file="exports/old.mp4", sha256="c" * 64)
         self.assertFalse(dashboard.public_state(state)["episodes"][0]["postproduction"]["final_ready"])
         self.assertNotEqual(progress.episode_progress(state, episode)["percent"], 100)
-        episode["postproduction"]["final_ready"] = True
-        self.assertTrue(dashboard.public_state(state)["episodes"][0]["postproduction"]["final_ready"])
+        episode["postproduction"].update(final_ready=True, status="awaiting_final_approval",
+            final_file=episode["file"], final_version=episode["version"], final_sha256=episode["sha256"])
+        post = dashboard.public_state(state)["episodes"][0]["postproduction"]
+        self.assertTrue(post["final_ready"])
+        self.assertEqual((post["final_file"], post["final_version"], post["final_sha256"]),
+                         (episode["file"], episode["version"], episode["sha256"]))
         self.assertEqual(progress.episode_progress(state, episode)["percent"], 100)
+
+    def test_completed_legacy_postproduction_exposes_existing_final_without_mutation(self):
+        state = synthetic_state()
+        episode = state["episodes"][0]
+        episode.update(status="awaiting_review", version=1, file="exports/E1-v1.mp4", sha256="c" * 64,
+                       subtitles_burned=True,
+                       render_manifest={"subtitles": [{"start": 0.5, "end": 2, "text": "合成对白"}]})
+        episode["postproduction"].update(status="awaiting_final_approval", final_ready=True,
+            final_file=episode["file"], final_version=1, final_sha256=episode["sha256"])
+        before = copy.deepcopy(state)
+        exposed = dashboard.public_state(state)["episodes"][0]
+        self.assertTrue(exposed["postproduction"]["final_ready"])
+        self.assertEqual(exposed["postproduction"]["final_file"], "exports/E1-v1.mp4")
+        self.assertTrue(exposed["has_subtitles"])
+        self.assertTrue(exposed["subtitles_burned"])
+        self.assertEqual(state, before)
+        episode["status"] = "approved"
+        self.assertTrue(dashboard.public_state(state)["episodes"][0]["postproduction"]["final_ready"])
+
+    def test_stale_or_unbound_final_preview_is_not_exposed(self):
+        state = synthetic_state()
+        episode = state["episodes"][0]
+        episode.update(status="awaiting_review", version=2, file="exports/E1-v2.mp4", sha256="c" * 64)
+        episode["postproduction"].update(status="awaiting_final_approval", final_ready=True,
+            final_file=episode["file"], final_version=2, final_sha256=episode["sha256"])
+        for change in ({"final_file": "exports/E1-v1.mp4"}, {"final_sha256": "d" * 64},
+                       {"final_version": 1}, {"final_version": True}, {"final_ready": False},
+                       {"status": "rendering"}, {"status": "error"}, {"final_file": None}):
+            with self.subTest(change=change):
+                candidate = copy.deepcopy(state)
+                candidate["episodes"][0]["postproduction"].update(change)
+                post = dashboard.public_state(candidate)["episodes"][0]["postproduction"]
+                self.assertFalse(post["final_ready"])
+                self.assertTrue({"final_file", "final_version", "final_sha256"}.isdisjoint(post))
+        for change in ({"status": "postproduction"}, {"version": 3}, {"sha256": "d" * 64}):
+            with self.subTest(episode_change=change):
+                candidate = copy.deepcopy(state)
+                candidate["episodes"][0].update(change)
+                self.assertFalse(dashboard.public_state(candidate)["episodes"][0]["postproduction"]["final_ready"])
+        episode["shots"][0]["status"] = "review_required"
+        self.assertFalse(dashboard.public_state(state)["episodes"][0]["postproduction"]["final_ready"])
+
+    def test_final_preview_rejects_invalid_even_matching_media_identity(self):
+        for file, version, sha in (("/private/final.mp4", 1, "c" * 64),
+                                  ("exports/../final.mp4", 1, "c" * 64),
+                                  ("exports/final.txt", 1, "c" * 64),
+                                  ("exports/final.mp4", True, "c" * 64),
+                                  ("exports/final.mp4", 1, "invalid")):
+            with self.subTest(file=file, version=version, sha=sha):
+                state = synthetic_state()
+                episode = state["episodes"][0]
+                episode.update(status="awaiting_review", file=file, version=version, sha256=sha)
+                episode["postproduction"].update(status="awaiting_final_approval", final_ready=True,
+                    final_file=file, final_version=version, final_sha256=sha)
+                post = dashboard.public_state(state)["episodes"][0]["postproduction"]
+                self.assertFalse(post["final_ready"])
+                self.assertNotIn("final_file", post)
 
     def test_unapproved_segment_locks_postproduction_and_config_is_explained(self):
         state = synthetic_state()
@@ -183,7 +244,7 @@ assert.equal(nodes.find(n=>n.tag==='button'&&n.textContent==='继续本集后期
 assert.equal(nodes.find(n=>n.tag==='button'&&n.textContent==='生成一首新音乐').disabled,true);
 const feedback=nodes.find(n=>n.tag==='textarea'&&n.dataset.feedbackFor==='post:E1:subtitles');feedback.value='合成字幕修改';
 const subtitleSection=nodes.find(n=>n.className==='postproduction-step');walk(subtitleSection).find(n=>n.tag==='button'&&n.textContent==='提交意见并重新合成').listeners.click();assert.equal(actions.at(-1)[0].action,'postproduction');assert.equal(actions.at(-1)[0].target,'subtitles');
-episode.postproduction.final_ready=true;card=episodeCard(episode,0);assert.equal(walk(card).some(n=>n.tag==='button'&&n.textContent==='通过本集，完成制作'),true);
+episode.file='exports/E1-v1.mp4';Object.assign(episode.postproduction,{final_ready:true,final_file:episode.file,final_version:1});card=episodeCard(episode,0);assert.equal(walk(card).some(n=>n.tag==='button'&&n.textContent==='通过本集，完成制作'),true);
 episode.postproduction.ready=false;const locked=postproductionPanel(episode);assert.equal(walk(locked).some(n=>n.tag==='button'),false);assert.equal(walk(locked).some(n=>n.textContent.includes('等待本集所有片段通过审批')),true);
 `,context);
 '''
