@@ -1,0 +1,24 @@
+# User projects, originals, credentials and generated media are local only.
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.env
+.env.*
+!.env.example
+auth.json
+*credentials*
+projects/
+norlan-project-*/
+norlan-demo-*/
+*.mp4
+*.mov
+*.wav
+*.mp3
+project.json
+.state.lock
+.run.lock
+*.log

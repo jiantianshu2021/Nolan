@@ -1,0 +1,39 @@
+{
+  "brain": {
+    "provider": "codex",
+    "timeout": 600,
+    "max_input_chars": 200000
+  },
+  "ark": {
+    "image_model": "",
+    "video_model": "",
+    "image_size": "2K",
+    "timeout": 120
+  },
+  "caps": {
+    "image": 0,
+    "video_second": 0,
+    "llm": 0
+  },
+  "max_attempts": 3,
+  "max_llm_calls": 80,
+  "batch_size": 3,
+  "poll_seconds": 10,
+  "max_poll_seconds": 1800,
+  "creative_brief": "",
+  "require_voice_reference": true,
+  "music": {
+    "mode": "none",
+    "action": "GenBGMForTime",
+    "call_cap": 0,
+    "timeout": 90
+  },
+  "subtitles": {
+    "mode": "none",
+    "call_cap": 0,
+    "model": "whisper-1",
+    "api_key_env": "OPENAI_API_KEY",
+    "language": "zh",
+    "timeout": 120
+  }
+}

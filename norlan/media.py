@@ -1,0 +1,397 @@
+"""Local, deterministic media operations. No model or network calls are made here.
+
+Every media argument is a local file, subprocesses use argv (never a shell), and
+completed outputs replace their destinations only after successful encoding.
+"""
+
+from __future__ import annotations
+
+import functools
+import hashlib
+import html
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+from typing import Any
+
+
+class MediaError(RuntimeError):
+    """A local dependency, input, or media operation failed."""
+
+
+# FFmpeg 7.1 loudnorm can emit NaN samples for completely silent input. Keep
+# silence exactly silent after normalization and before sidechain/encoding.
+_LOUDNORM = (
+    "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,"
+    "aeval=exprs='if(isnan(val(0))+isinf(val(0)),0,val(0))|"
+    "if(isnan(val(1))+isinf(val(1)),0,val(1))'"
+)
+
+
+def _run(args: list[str], *, cwd: Path | None = None, timeout: int = 600) -> str:
+    try:
+        result = subprocess.run(
+            args, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL, check=False,
+        )
+    except FileNotFoundError as exc:
+        raise MediaError(f"缺少本地工具：{args[0]}。请安装 FFmpeg（包含 ffprobe）。") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise MediaError(f"本地媒体处理超时（{timeout} 秒）；原素材未改变。") from exc
+    if result.returncode:
+        raise MediaError(f"{args[0]} 处理失败：{result.stderr.strip()[-2400:]}")
+    return result.stdout
+
+
+def _ffmpeg(args: list[str], *, cwd: Path | None = None) -> None:
+    _run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", *args], cwd=cwd)
+
+
+def _local(path: Path) -> Path:
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise MediaError(f"本地媒体文件不存在：{path}")
+    return path
+
+
+def _destination(path: Path) -> Path:
+    path = Path(path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def probe(path: Path) -> dict:
+    """Describe actual local streams, including audio-only files.
+
+    ``duration`` is video duration when present, otherwise container duration;
+    this avoids extending a picture because a provider leaves trailing audio.
+    """
+    path = _local(path)
+    data = json.loads(_run([
+        "ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe",
+        "-show_format", "-show_streams", "-of", "json", str(path),
+    ], timeout=60))
+    streams = data.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"
+                  and not s.get("disposition", {}).get("attached_pic")), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    format_duration = _number(data.get("format", {}).get("duration"))
+    video_duration = _number((video or {}).get("duration"))
+    duration = video_duration or format_duration
+    return {
+        "path": str(path), "duration": duration, "format_duration": format_duration,
+        "width": int((video or {}).get("width", 0)),
+        "height": int((video or {}).get("height", 0)),
+        "has_video": video is not None, "has_audio": audio is not None,
+        "video_codec": (video or {}).get("codec_name"),
+        "audio_codec": (audio or {}).get("codec_name"),
+        "sample_rate": int((audio or {}).get("sample_rate", 0)),
+        "channels": int((audio or {}).get("channels", 0)),
+        "frame_rate": (video or {}).get("avg_frame_rate"),
+        "size": path.stat().st_size,
+    }
+
+
+@functools.lru_cache(maxsize=1)
+def _filters() -> str:
+    return _run(["ffmpeg", "-hide_banner", "-filters"], timeout=30)
+
+
+def _has_filter(name: str) -> bool:
+    return any(len(parts := line.split()) > 1 and parts[1] == name
+               for line in _filters().splitlines())
+
+
+def _font_path() -> Path | None:
+    # Prefer CJK fonts when present. No font is downloaded at runtime.
+    candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    return next((Path(p) for p in candidates if Path(p).is_file()), None)
+
+
+def _demo_drawtext(directory: Path, label: str) -> str:
+    if not _has_filter("drawtext"):
+        raise MediaError("演示素材需要带 drawtext 的 FFmpeg，以明确标记占位画面。")
+    # Text is read as data; expansion=none prevents %{...} interpretation.
+    text = "NORLAN DEMO / SYNTHETIC PLACEHOLDER\n" + str(label)[:500]
+    (directory / "label.txt").write_text(text, encoding="utf-8")
+    font = _font_path()
+    if font:
+        shutil.copyfile(font, directory / "font.dat")
+    font_option = "fontfile=font.dat:" if font else ""
+    return (f"drawtext={font_option}textfile=label.txt:expansion=none:"
+            "fontsize=24:fontcolor=white:line_spacing=10:x=24:y=28:"
+            "box=1:boxcolor=black@0.65:boxborderw=12")
+
+
+def synthetic_asset(path: Path, label: str, color: str = "#34495e") -> Path:
+    """Make an obviously labelled placeholder image, never a character candidate."""
+    path = _destination(path)
+    colors = {"blue", "red", "green", "black", "white", "gray", "purple", "orange", "navy", "teal"}
+    if color not in colors and not re.fullmatch(r"#?[0-9a-fA-F]{6}", color):
+        raise MediaError("演示颜色必须为六位十六进制值或常用颜色名。")
+    if re.fullmatch(r"[0-9a-fA-F]{6}", color):
+        color = "#" + color
+    with tempfile.TemporaryDirectory(prefix=".norlan-asset-", dir=path.parent) as raw:
+        temporary = Path(raw)
+        _ffmpeg([
+            "-f", "lavfi", "-i", f"color=c={color}:s=960x540:r=1",
+            "-vf", _demo_drawtext(temporary, label), "-frames:v", "1",
+            "-update", "1", "-c:v", "png", str(temporary / "image.png"),
+        ], cwd=temporary)
+        os.replace(temporary / "image.png", path)
+    return path
+
+
+def synthetic_clip(path: Path, label: str, duration: float, index: int = 0) -> Path:
+    """Create an explicitly synthetic animated clip with a quiet test tone."""
+    duration = _number(duration)
+    if not 0.04 <= duration <= 120:
+        raise MediaError("演示镜头时长必须在 0.04 至 120 秒之间。")
+    path = _destination(path)
+    palette = ["#284b63", "#3c6e71", "#6b3e56", "#68502d"]
+    color = palette[int(index) % len(palette)]
+    frequency = 220 + int(index) % 12 * 30
+    with tempfile.TemporaryDirectory(prefix=".norlan-clip-", dir=path.parent) as raw:
+        temporary = Path(raw)
+        text_filter = _demo_drawtext(temporary, label + "\nTEST TONE / NO DIALOGUE")
+        _ffmpeg([
+            "-f", "lavfi", "-i", f"color=c={color}:s=960x540:r=30:d={duration:.6f}",
+            "-f", "lavfi", "-i", f"sine=frequency={frequency}:sample_rate=48000:duration={duration:.6f}",
+            "-vf", "hue=h=5*sin(t),drawgrid=w=80:h=60:t=1:c=white@0.08," + text_filter,
+            "-af", "volume=0.2,aformat=channel_layouts=stereo",
+            "-map", "0:v:0", "-map", "1:a:0", "-t", f"{duration:.6f}",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", str(temporary / "clip.mp4"),
+        ], cwd=temporary)
+        os.replace(temporary / "clip.mp4", path)
+    return path
+
+
+def extract_evidence(video: Path, outdir: Path) -> dict:
+    """Extract three sampled frames and the audio; this is evidence, not a review."""
+    video = _local(video)
+    metadata = probe(video)
+    if not metadata["has_video"] or metadata["duration"] <= 0:
+        raise MediaError("抽帧需要具有有效时长的视频。")
+    outdir = Path(outdir).expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    duration = metadata["duration"]
+    # Stay a little inside the stream: seeking exactly to duration often gives no frame.
+    times = [0.0, duration / 2, max(0.0, duration - min(0.10, duration / 4))]
+    frames: list[str] = []
+    for name, instant in zip(("first", "middle", "tail"), times):
+        target = outdir / f"{name}.png"
+        _ffmpeg([
+            "-protocol_whitelist", "file,pipe", "-i", str(video), "-ss", f"{instant:.6f}",
+            "-frames:v", "1", "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease",
+            "-update", "1", str(target),
+        ])
+        if not target.is_file():
+            raise MediaError(f"未能提取 {name} 帧；不能把缺失证据当作通过。")
+        frames.append(str(target))
+    audio_path: str | None = None
+    if metadata["has_audio"]:
+        audio = outdir / "audio.wav"
+        _ffmpeg([
+            "-protocol_whitelist", "file,pipe", "-i", str(video),
+            "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "24000",
+            "-c:a", "pcm_s16le", str(audio),
+        ])
+        audio_path = str(audio)
+    return {
+        "frames": frames, "tail_frame": frames[-1], "audio": audio_path,
+        "metadata": metadata, "sha256": _sha256(video), "sample_times": times,
+        "sampling_note": "仅抽取首、中、尾三个画面；尾帧为片尾附近采样。抽帧不能证明完整动作、口型或声音连续性；音轨须另行听审。",
+    }
+
+
+def _srt_time(seconds: float) -> str:
+    millis = round(seconds * 1000)
+    hours, millis = divmod(millis, 3600000)
+    minutes, millis = divmod(millis, 60000)
+    seconds, millis = divmod(millis, 1000)
+    return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
+
+
+def _write_subtitles(entries: list[dict], target: Path, duration: float) -> None:
+    cues = []
+    for entry in entries:
+        start = _number(entry.get("start"), -1)
+        end = _number(entry.get("end"), -1)
+        if start < 0 or end <= start or end > duration + 0.05:
+            raise MediaError("字幕必须提供有效的全片时间戳，且不能超出实测画面时长。")
+        text = str(entry.get("text", "")).replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "").strip()
+        if not text:
+            raise MediaError("字幕文本不能为空。")
+        # Blank lines delimit SRT entries; literal markup must not become styling.
+        text = html.escape(text, quote=False)
+        text = re.sub(r"\n\s*\n", "\n", text)
+        cues.append((start, end, text))
+    cues.sort(key=lambda cue: (cue[0], cue[1]))
+    target.write_text("".join(
+        f"{number}\n{_srt_time(start)} --> {_srt_time(end)}\n{text}\n\n"
+        for number, (start, end, text) in enumerate(cues, 1)
+    ), encoding="utf-8")
+
+
+def compose(
+    clips: list[Path], output: Path, subtitles: list[dict] | None = None,
+    music: Path | None = None, *, burn_subtitles: bool = True,
+) -> dict:
+    """Normalize and join clips in order, preserving sound and filling silence.
+
+    Music is a single supplied local cue, padded with silence when shorter than
+    the episode (never an arbitrary loop). It fades in/out and is ducked by the
+    existing soundtrack. If that soundtrack contains music, it cannot isolate
+    dialogue; the result requires a human listening pass. Global subtitle times
+    must already have been aligned to speech; this function does no recognition.
+    """
+    if not clips:
+        raise MediaError("至少需要一个已生成镜头才能合成。")
+    paths = [_local(path) for path in clips]
+    output = _destination(output)
+    if output in paths:
+        raise MediaError("合成输出不能覆盖原始镜头。")
+    music_path = _local(music) if music is not None else None
+    if music_path == output:
+        raise MediaError("合成输出不能覆盖配乐原件。")
+    metadata = [probe(path) for path in paths]
+    if any(not item["has_video"] or item["duration"] <= 0 for item in metadata):
+        raise MediaError("每个镜头都必须包含有效的视频流和时长。")
+    if music_path is not None and not probe(music_path)["has_audio"]:
+        raise MediaError("配乐文件不包含音频流。")
+    first = metadata[0]
+    factor = min(1.0, 1280 / max(first["width"], first["height"]))
+    width = max(2, int(first["width"] * factor) // 2 * 2)
+    height = max(2, int(first["height"] * factor) // 2 * 2)
+    timeline: list[dict] = []
+    srt_output: Path | None = output.with_suffix(".srt") if subtitles else None
+    burned = bool(subtitles and burn_subtitles and _has_filter("subtitles") and _font_path())
+    warnings: list[str] = []
+    if subtitles and burn_subtitles and not burned:
+        warnings.append("未检测到字幕滤镜或字体；已保留 SRT，视频未烧录字幕。")
+    if music_path is None:
+        warnings.append("没有导入配乐；保留镜头原声，静音镜头填充静音。")
+    elif any(item["has_audio"] for item in metadata):
+        warnings.append("配乐按镜头原生混合音轨压低；无法自动分离其中已有的音乐与对白。")
+    with tempfile.TemporaryDirectory(prefix=".norlan-compose-", dir=output.parent) as raw:
+        temporary = Path(raw)
+        normalized: list[Path] = []
+        cursor = 0.0
+        for index, (path, item) in enumerate(zip(paths, metadata)):
+            # Frame rounding is explicit and recorded; at most half a 30 fps frame.
+            duration = max(1, round(item["duration"] * 30)) / 30
+            target = temporary / f"clip-{index:04d}.mp4"
+            args = ["-protocol_whitelist", "file,pipe", "-i", str(path)]
+            if not item["has_audio"]:
+                args += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+            audio_input = "0:a:0" if item["has_audio"] else "1:a:0"
+            video_filter = (
+                f"fps=30,scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+                f"tpad=stop_mode=clone:stop_duration=0.1,trim=duration={duration:.9f},setpts=PTS-STARTPTS"
+            )
+            _ffmpeg([
+                *args, "-map", "0:v:0", "-map", audio_input, "-vf", video_filter,
+                "-af", f"aresample=48000,aformat=channel_layouts=stereo,apad,atrim=duration={duration:.9f},asetpts=PTS-STARTPTS",
+                "-t", f"{duration:.9f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-r", "30", "-fps_mode", "cfr",
+                "-c:a", "aac", "-b:a", "192k", str(target),
+            ])
+            actual = probe(target)["duration"]
+            timeline.append({
+                "index": index, "source": str(path), "source_sha256": _sha256(path),
+                "start": round(cursor, 6), "end": round(cursor + actual, 6),
+                "duration": actual, "source_duration": item["duration"],
+                "source_has_audio": item["has_audio"],
+            })
+            cursor += actual
+            normalized.append(target)
+        duration = cursor
+        args: list[str] = []
+        graph: list[str] = []
+        inputs = ""
+        for index, (target, segment) in enumerate(zip(normalized, timeline)):
+            args += ["-i", str(target)]
+            graph += [
+                f"[{index}:v:0]setpts=PTS-STARTPTS[v{index}]",
+                f"[{index}:a:0]atrim=duration={segment['duration']:.9f},asetpts=PTS-STARTPTS[a{index}]",
+            ]
+            inputs += f"[v{index}][a{index}]"
+        graph.append(f"{inputs}concat=n={len(normalized)}:v=1:a=1[video][native]")
+        graph.append(f"[native]{_LOUDNORM}[norm]")
+        if music_path:
+            args += ["-protocol_whitelist", "file,pipe", "-i", str(music_path)]
+            fade = min(0.6, duration / 4)
+            graph += [
+                "[norm]asplit=2[voice][sidechain]",
+                f"[{len(normalized)}:a:0]aresample=48000,aformat=channel_layouts=stereo,"
+                f"apad,atrim=duration={duration:.9f},asetpts=PTS-STARTPTS,volume=0.18,"
+                f"afade=t=in:st=0:d={fade:.6f},afade=t=out:st={duration-fade:.6f}:d={fade:.6f}[music]",
+                "[music][sidechain]sidechaincompress=threshold=0.03:ratio=8:attack=15:release=300[ducked]",
+                "[voice][ducked]amix=inputs=2:duration=first:normalize=0," + _LOUDNORM + "[audio]",
+            ]
+        else:
+            graph.append("[norm]anull[audio]")
+        if subtitles:
+            _write_subtitles(subtitles, temporary / "captions.srt", duration)
+        if burned:
+            font = _font_path()
+            if font:
+                shutil.copyfile(font, temporary / font.name)
+            # Fixed relative filenames avoid ffmpeg filter escaping of user paths.
+            graph.append("[video]subtitles=filename=captions.srt:fontsdir=.[picture]")
+        else:
+            graph.append("[video]null[picture]")
+        _ffmpeg([
+            *args, "-filter_complex", ";".join(graph), "-map", "[picture]", "-map", "[audio]",
+            "-t", f"{duration:.9f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p", "-r", "30", "-fps_mode", "cfr",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-ac", "2", "-movflags", "+faststart", str(temporary / "episode.mp4"),
+        ], cwd=temporary)
+        result_metadata = probe(temporary / "episode.mp4")
+        if not result_metadata["has_video"] or not result_metadata["has_audio"]:
+            raise MediaError("合成结果缺少预期的视频或音频流。")
+        os.replace(temporary / "episode.mp4", output)
+        if srt_output:
+            os.replace(temporary / "captions.srt", srt_output)
+    return {
+        "output": str(output), "duration": result_metadata["duration"],
+        "subtitles": str(srt_output) if srt_output else None,
+        "burned_subtitles": burned, "sha256": _sha256(output), "timeline": timeline,
+        "width": width, "height": height, "has_audio": True,
+        "music_present": music_path is not None,
+        "music_source": str(music_path) if music_path else None,
+        "warnings": warnings, "frame_rate": 30,
+        "audio_note": "单次响度归一化目标为 -16 LUFS、-1.5 dBTP；最终听感、台词清晰度及声线一致性须听审。",
+        "subtitle_note": "字幕时间戳来自调用方；本模块不识别语音，也不证明字幕与台词一致。" if subtitles else "无字幕。",
+    }

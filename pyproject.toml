@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "norlan-agent"
+version = "0.1.0"
+description = "A local, supervised AI animation production agent"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+norlan = "norlan.cli:main"
+
+[tool.setuptools]
+packages = ["norlan"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+norlan = ["dashboard.html"]
