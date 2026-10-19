@@ -27,6 +27,18 @@ class ToolError(ValueError):
     """An intentionally public, credential-free diagnostic."""
 
 
+class ArgumentValidationError(ToolError):
+    """Schema-derived diagnostics never include submitted values or unknown keys."""
+
+    def __init__(self, code, path, message, hint):
+        self.code, self.path, self.hint = code, path, hint
+        super().__init__(message)
+
+    def diagnostic(self):
+        return {"category": "invalid_arguments", "code": self.code, "path": self.path,
+                "message": str(self), "hint": self.hint}
+
+
 def _object(properties, required=None):
     return {"type": "object", "properties": properties,
             "required": list(properties) if required is None else required,
@@ -40,11 +52,13 @@ PATH = {"type": "string", "minLength": 1, "maxLength": 4096,
 IDENTIFIER = {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"}
 VERSION = {"type": "integer", "minimum": 0}
 ASSET = _object({"id": IDENTIFIER, "kind": {"type": "string", "enum": ["character", "location", "prop", "voice"]},
-                 "name": NONEMPTY, "prompt": NONEMPTY, "character_id": TEXT},
+                 "name": NONEMPTY, "prompt": NONEMPTY, "character_id": {
+                     **TEXT, "description": "kind=voice 时必填，指向已定义的 character 资产 ID；其他类型省略或填空字符串，角色不能填自身 ID。画外声音也需绑定声源角色，并在提示词说明不入画。"}},
                 ["id", "kind", "name", "prompt"])
 SHOT = _object({"id": IDENTIFIER, "duration": {"type": "integer", "minimum": 4, "maximum": 15},
                 "prompt": NONEMPTY, "dialogue": TEXT,
-                "asset_ids": {"type": "array", "items": IDENTIFIER, "minItems": 1, "maxItems": 200},
+                "asset_ids": {"type": "array", "items": IDENTIFIER, "minItems": 1, "maxItems": 200,
+                              "description": "只引用已定义资产且不重复。引用 voice 时必须同时引用其 character_id 对应角色；画外声也须配对，并在 prompt 中明确声源角色不入画。"},
                 "scene_id": IDENTIFIER, "continuity_notes": TEXT},
                ["id", "duration", "prompt", "asset_ids", "scene_id"])
 EPISODE = _object({"id": IDENTIFIER, "title": NONEMPTY, "summary": TEXT, "music_prompt": TEXT,
@@ -74,7 +88,7 @@ TOOLS = [
           {"project": PATH, "novel_text": {"type": "string", "minLength": 1, "maxLength": MAX_NOVEL_BYTES},
            "source_path": PATH, "title": {"type": "string", "minLength": 1, "maxLength": 300},
            "brief": TEXT, "mode": {"type": "string", "enum": ["live", "demo"], "default": "live"}}, ["project"]),
-    _tool("save_plan", "保存 GPT 编写的候选分集/资产/分镜规划并等待人工审批。不能写 approved、file、settings 或预算。", {"project": PATH, "plan": PLAN}),
+    _tool("save_plan", "保存候选分集/资产/分镜规划并等待人工审批。voice 必须绑定已定义角色，非 voice 的 character_id 省略或为空；镜头引用声音须同时引用其角色，画外声在 prompt 标明不入画。校验失败返回字段路径和修复建议，不修改项目。不能写 approved、file、settings 或预算。", {"project": PATH, "plan": PLAN}),
     _tool("run_production", "后台推进项目到下一审批、预算或配置关卡，立即返回。同项目不会重复启动。请先说明用户要求的生成工作；不自动批准、不增加预算。", {"project": PATH}),
     _tool("pause_production", "请求暂停明确项目；已提交供应商的任务可能继续，保留任务记录以便恢复。", {"project": PATH}),
     _tool("request_revision", "按用户明确意见对当前版本申请返工，自动使依赖结果失效。必须先查状态取得版本；不批准或自动启动。",
@@ -90,30 +104,34 @@ TOOLS = [
 TOOL_MAP = {item["name"]: item for item in TOOLS}
 
 
-def _validate(value, schema):
+def _validate(value, schema, path="arguments"):
     kind = schema["type"]
     matches = {"object": isinstance(value, dict), "array": isinstance(value, list),
                "string": isinstance(value, str), "integer": isinstance(value, int) and not isinstance(value, bool)}
     if not matches.get(kind, False):
-        raise ToolError("工具参数类型不正确；请遵循工具的 inputSchema。")
+        raise ArgumentValidationError("type_invalid", path, "工具参数类型不正确。", f"此字段必须使用 {kind} 类型；请遵循 inputSchema。")
     if "enum" in schema and value not in schema["enum"]:
-        raise ToolError("工具参数不在允许范围内。")
+        raise ArgumentValidationError("enum_invalid", path, "工具参数不在允许范围内。", "请使用 inputSchema 中 enum 列出的值。")
     if kind == "object":
-        if set(value) - set(schema["properties"]) or set(schema["required"]) - set(value):
-            raise ToolError("工具参数包含未知字段或缺少必填字段。")
-        for key, item in value.items():
-            _validate(item, schema["properties"][key])
+        if set(value) - set(schema["properties"]):
+            raise ArgumentValidationError("unknown_field", path, "工具参数包含未知字段。", "删除 inputSchema 未声明的字段；不接受状态、审批、文件或预算注入。")
+        for key in schema["required"]:
+            if key not in value:
+                raise ArgumentValidationError("field_required", path + "." + key, "工具参数缺少必填字段。", "按 inputSchema 补充此字段。")
+        for key, child_schema in schema["properties"].items():
+            if key in value:
+                _validate(value[key], child_schema, path + "." + key)
     elif kind == "array":
         if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", 10000):
-            raise ToolError("工具参数列表长度不正确。")
-        for item in value:
-            _validate(item, schema["items"])
+            raise ArgumentValidationError("list_length_invalid", path, "工具参数列表长度不正确。", "请遵循 inputSchema 的 minItems 和 maxItems 限制。")
+        for index, item in enumerate(value):
+            _validate(item, schema["items"], f"{path}[{index}]")
     elif kind == "string":
         if (not schema.get("minLength", 0) <= len(value) <= schema.get("maxLength", 100000)
                 or "\x00" in value or ("pattern" in schema and not re.fullmatch(schema["pattern"], value))):
-            raise ToolError("工具文本长度、路径或 ID 不合法。")
+            raise ArgumentValidationError("string_invalid", path, "工具文本长度、路径或 ID 不合法。", "请遵循 inputSchema 的长度和 pattern 限制，且不能包含空字符。")
     elif kind == "integer" and (value < schema.get("minimum", value) or value > schema.get("maximum", value)):
-        raise ToolError("工具参数数值超出允许范围。")
+        raise ArgumentValidationError("number_out_of_range", path, "工具参数数值超出允许范围。", "请遵循 inputSchema 的 minimum 和 maximum 限制。")
 
 
 def _absolute(value):
@@ -403,6 +421,8 @@ class MCPServer:
             try:
                 value = self.call_tool(params["name"], params.get("arguments", {}))
                 result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, allow_nan=False)}], "isError": False}
+            except (ArgumentValidationError, core.PlanValidationError) as exc:
+                result = {"content": [{"type": "text", "text": json.dumps(exc.diagnostic(), ensure_ascii=False)}], "isError": True}
             except ToolError as exc:
                 result = {"content": [{"type": "text", "text": str(exc)}], "isError": True}
             except core.GateError as exc:

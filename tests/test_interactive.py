@@ -83,6 +83,10 @@ class InteractiveTests(unittest.TestCase):
         self.assertTrue(config["features"]["skip_host_skill_discovery"])
         self.assertNotIn("approve", config["mcp_servers"]["norlan"]["enabled_tools"])
         self.assertNotIn("budget", config["mcp_servers"]["norlan"]["enabled_tools"])
+        mcp_args = config["mcp_servers"]["norlan"]["args"]
+        production_workspace = Path(mcp_args[mcp_args.index("--workspace") + 1])
+        self.assertIn(str(production_workspace / "projects"), config["developer_instructions"])
+        self.assertNotEqual(production_workspace, Path(argv[argv.index("--cd") + 1]))
 
     def test_api_requires_explicit_model_and_never_links_subscription(self):
         with self.assertRaises(BrainError):

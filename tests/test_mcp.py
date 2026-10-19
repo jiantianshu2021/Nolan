@@ -150,6 +150,103 @@ class MCPTests(unittest.TestCase):
         self.assertFalse(state["budget"]["approved"])
         self.assertEqual(core.load_project(self.root)["jobs"], {})
 
+    def test_plan_voice_errors_are_actionable_and_do_not_change_project(self):
+        self.create()
+        before = (self.root / "project.json").read_bytes()
+        plan = pipeline.demo_plan()
+        plan["assets"].append({"id": "voice", "kind": "voice", "name": "画外声音", "prompt": "仅画外呼声"})
+        result = self.call("save_plan", project=str(self.root), plan=plan)
+        self.assertTrue(result["isError"])
+        error = json.loads(result["content"][0]["text"])
+        self.assertEqual(error["category"], "invalid_plan")
+        self.assertEqual(error["code"], "voice_character_required")
+        self.assertEqual(error["path"], "plan.assets[2].character_id")
+        self.assertIn("character", error["hint"])
+
+        plan["assets"][-1]["character_id"] = "hero"
+        plan["assets"][0]["character_id"] = "hero"
+        result = self.call("save_plan", project=str(self.root), plan=plan)
+        self.assertTrue(result["isError"])
+        error = json.loads(result["content"][0]["text"])
+        self.assertEqual(error["code"], "nonvoice_character_forbidden")
+        self.assertEqual(error["path"], "plan.assets[0].character_id")
+
+        del plan["assets"][0]["character_id"]
+        shot = plan["episodes"][0]["shots"][0]
+        shot["asset_ids"] = ["station", "voice"]
+        result = self.call("save_plan", project=str(self.root), plan=plan)
+        self.assertTrue(result["isError"])
+        error = json.loads(result["content"][0]["text"])
+        self.assertEqual(error["code"], "voice_character_not_referenced")
+        self.assertEqual(error["path"], "plan.episodes[0].shots[0].asset_ids[1]")
+        self.assertIn("画外", error["hint"])
+        self.assertEqual((self.root / "project.json").read_bytes(), before)
+        self.assertEqual(list((self.root / "plans").iterdir()), [])
+
+        shot["asset_ids"].append("hero")
+        shot["prompt"] += "；hero 仅为画外声源，不出现在画面。"
+        state = self.value(self.call("save_plan", project=str(self.root), plan=plan))
+        self.assertEqual(state["plan"]["status"], "candidate")
+        self.assertEqual(state["plan"]["version"], 1)
+        self.assertFalse(state["budget"]["approved"])
+        self.assertEqual(core.load_project(self.root)["jobs"], {})
+
+    def test_plan_validation_never_echoes_submitted_values(self):
+        self.create()
+        marker = "sensitive-value-must-not-be-echoed"
+        cases = []
+        voice_plan = pipeline.demo_plan()
+        voice_plan["assets"].append({"id": "voice", "kind": "voice", "name": marker,
+                                     "prompt": marker, "character_id": marker})
+        cases.append((voice_plan, "voice_character_required", "plan.assets[2].character_id"))
+        refs_plan = pipeline.demo_plan()
+        refs_plan["episodes"][0]["shots"][0]["asset_ids"] = [marker]
+        cases.append((refs_plan, "asset_references_invalid", "plan.episodes[0].shots[0].asset_ids"))
+        for plan, code, path in cases:
+            with self.subTest(code=code):
+                result = self.call("save_plan", project=str(self.root), plan=plan)
+                self.assertTrue(result["isError"])
+                text = result["content"][0]["text"]
+                error = json.loads(text)
+                self.assertEqual(error["code"], code)
+                self.assertEqual(error["path"], path)
+                self.assertNotIn(marker, text)
+
+    def test_schema_errors_identify_known_paths_without_echoing_unknown_fields(self):
+        self.create()
+        before = (self.root / "project.json").read_bytes()
+        cases = []
+        missing = pipeline.demo_plan()
+        del missing["episodes"][0]["shots"][0]["scene_id"]
+        cases.append((missing, "field_required", "arguments.plan.episodes[0].shots[0].scene_id"))
+        invalid_type = pipeline.demo_plan()
+        invalid_type["episodes"][0]["shots"][0]["duration"] = True
+        cases.append((invalid_type, "type_invalid", "arguments.plan.episodes[0].shots[0].duration"))
+        unknown = pipeline.demo_plan()
+        unknown["assets"][0]["sensitive-unknown-key"] = "sensitive-unknown-value"
+        cases.append((unknown, "unknown_field", "arguments.plan.assets[0]"))
+        for plan, code, path in cases:
+            with self.subTest(code=code):
+                result = self.call("save_plan", project=str(self.root), plan=plan)
+                self.assertTrue(result["isError"])
+                text = result["content"][0]["text"]
+                error = json.loads(text)
+                self.assertEqual(error["category"], "invalid_arguments")
+                self.assertEqual(error["code"], code)
+                self.assertEqual(error["path"], path)
+                self.assertNotIn("sensitive-unknown", text)
+        self.assertEqual((self.root / "project.json").read_bytes(), before)
+
+    def test_unknown_plan_exception_stays_private(self):
+        self.create()
+        before = (self.root / "project.json").read_bytes()
+        with patch.object(core, "install_plan", side_effect=ValueError("private-provider-response-and-credential")):
+            result = self.call("save_plan", project=str(self.root), plan=pipeline.demo_plan())
+        self.assertTrue(result["isError"])
+        self.assertNotIn("private-provider-response-and-credential", str(result))
+        self.assertIn("原始异常未传给模型", result["content"][0]["text"])
+        self.assertEqual((self.root / "project.json").read_bytes(), before)
+
     def test_new_project_paths_are_confined_and_symlinks_rejected(self):
         for root in ("relative", str(self.workspace / "elsewhere"), str(self.server.projects), str(self.server.projects / "nested/story")):
             self.assertTrue(self.call("create_project", project=root, novel_text="正文")["isError"])

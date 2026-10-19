@@ -24,6 +24,41 @@ class GateError(ValueError):
     """A resumable production gate, not permission to skip it."""
 
 
+_PLAN_ERRORS = {
+    "title_required": ("规划缺少标题。", "填写非空字符串 title。"),
+    "ratio_invalid": ("不支持的画面比例。", "ratio 使用 16:9、9:16、1:1、4:3、3:4 或 21:9。"),
+    "assets_required": ("规划必须包含资产。", "assets 使用非空资产列表。"),
+    "episodes_required": ("规划必须包含分集。", "episodes 使用非空分集列表。"),
+    "too_many_items": ("一次规划的条目过多。", "每次最多 200 个资产、100 集，每集最多 100 个镜头；请拆分规划。"),
+    "item_type": ("规划条目必须为对象。", "使用符合工具 schema 的对象。"),
+    "id_invalid": ("规划 ID 不合法或重复。", "ID 必须全局唯一，使用 1–64 位字母、数字、下划线或连字符，并以字母或数字开头。"),
+    "asset_kind_invalid": ("资产类型不合法。", "kind 使用 character、location、prop 或 voice。"),
+    "asset_text_required": ("资产缺少名称或生成说明。", "name 和 prompt 均须填写非空字符串。"),
+    "voice_character_required": ("声音资产未绑定有效角色。", "voice 的 character_id 必须指向已定义的 character 资产。画外声音也须定义声源角色，并在提示词中说明不入画。"),
+    "nonvoice_character_forbidden": ("非声音资产不能绑定 character_id。", "仅 voice 填写 character_id；其他资产省略此字段或填空字符串，角色自身也不例外。"),
+    "episode_title_required": ("每集必须包含标题。", "填写非空字符串 title。"),
+    "shots_required": ("每集必须包含分镜。", "shots 使用非空分镜列表。"),
+    "duration_invalid": ("单镜时长必须为 4–15 秒整数。", "duration 填写 4 至 15 的整数秒数。"),
+    "shot_prompt_required": ("分镜缺少提示词。", "prompt 填写非空字符串。"),
+    "asset_references_invalid": ("分镜引用的资产不存在、重复或格式不正确。", "asset_ids 使用非空列表，只引用 assets 中已定义的 ID，且不能重复。"),
+    "scene_required": ("分镜缺少 scene_id。", "填写 scene_id，以维护空间与剪辑连续性。"),
+    "voice_character_not_referenced": ("镜头引用声音时缺少其绑定角色。", "在本镜 asset_ids 中加入该 voice 的 character_id。若声音来自画外，在 prompt 中明确该角色仅作为声源、不出现在画面中。"),
+}
+
+
+class PlanValidationError(ValueError):
+    """Public planning diagnostics contain fixed text and schema/index paths only."""
+
+    def __init__(self, code, path):
+        message, hint = _PLAN_ERRORS[code]
+        self.code, self.path, self.hint = code, path, hint
+        super().__init__(message)
+
+    def diagnostic(self):
+        return {"category": "invalid_plan", "code": self.code, "path": self.path,
+                "message": str(self), "hint": self.hint}
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -143,60 +178,75 @@ def create_project(root, novel: str, mode="demo", title="Norlan 漫剧"):
 
 
 def validate_plan(plan):
-    if not isinstance(plan, dict) or not str(plan.get("title", "")).strip():
-        raise ValueError("规划缺少标题")
-    if plan.get("ratio", "16:9") not in {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"}:
-        raise ValueError("不支持的画面比例")
+    if not isinstance(plan, dict) or not isinstance(plan.get("title"), str) or not plan["title"].strip():
+        raise PlanValidationError("title_required", "plan.title")
+    ratio = plan.get("ratio", "16:9")
+    if not isinstance(ratio, str) or ratio not in {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"}:
+        raise PlanValidationError("ratio_invalid", "plan.ratio")
     assets, episodes = plan.get("assets"), plan.get("episodes")
-    if not isinstance(assets, list) or not assets or not isinstance(episodes, list) or not episodes:
-        raise ValueError("规划必须包含资产和分集")
-    if len(episodes) > 100 or len(assets) > 200:
-        raise ValueError("一次规划过大，请拆分小说")
+    if not isinstance(assets, list) or not assets:
+        raise PlanValidationError("assets_required", "plan.assets")
+    if not isinstance(episodes, list) or not episodes:
+        raise PlanValidationError("episodes_required", "plan.episodes")
+    if len(assets) > 200:
+        raise PlanValidationError("too_many_items", "plan.assets")
+    if len(episodes) > 100:
+        raise PlanValidationError("too_many_items", "plan.episodes")
     ids = set()
-    def identifier(item):
+    def identifier(item, path):
         if not isinstance(item, dict):
-            raise ValueError("规划条目必须为对象")
+            raise PlanValidationError("item_type", path)
         value = item.get("id", "")
         if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value) or value in ids:
-            raise ValueError("规划 ID 不合法或重复")
+            raise PlanValidationError("id_invalid", path + ".id")
         ids.add(value)
-    for asset in assets:
-        identifier(asset)
-        if asset.get("kind") not in {"character", "location", "prop", "voice"}:
-            raise ValueError("资产类型不合法")
-        if not asset.get("name") or not asset.get("prompt"):
-            raise ValueError("资产必须包含名称和生成说明")
+    for index, asset in enumerate(assets):
+        path = f"plan.assets[{index}]"
+        identifier(asset, path)
+        if not isinstance(asset.get("kind"), str) or asset["kind"] not in {"character", "location", "prop", "voice"}:
+            raise PlanValidationError("asset_kind_invalid", path + ".kind")
+        for field in ("name", "prompt"):
+            if not isinstance(asset.get(field), str) or not asset[field].strip():
+                raise PlanValidationError("asset_text_required", path + "." + field)
     asset_ids = {a["id"] for a in assets}
     character_ids = {a["id"] for a in assets if a["kind"] == "character"}
     voices = {}
-    for asset in assets:
+    for index, asset in enumerate(assets):
+        path = f"plan.assets[{index}].character_id"
         if asset["kind"] == "voice":
             character_id = asset.get("character_id")
             if not isinstance(character_id, str) or character_id not in character_ids:
-                raise ValueError("声音资产必须通过 character_id 绑定一个角色资产")
+                raise PlanValidationError("voice_character_required", path)
             voices[asset["id"]] = character_id
-        elif asset.get("character_id", ""):
-            raise ValueError("非声音资产的 character_id 必须为空")
-    for ep in episodes:
-        identifier(ep)
-        if not ep.get("title") or not isinstance(ep.get("shots"), list) or not ep["shots"]:
-            raise ValueError("每集必须包含标题和分镜")
+        elif asset.get("character_id", "") != "":
+            raise PlanValidationError("nonvoice_character_forbidden", path)
+    for ep_index, ep in enumerate(episodes):
+        ep_path = f"plan.episodes[{ep_index}]"
+        identifier(ep, ep_path)
+        if not isinstance(ep.get("title"), str) or not ep["title"].strip():
+            raise PlanValidationError("episode_title_required", ep_path + ".title")
+        if not isinstance(ep.get("shots"), list) or not ep["shots"]:
+            raise PlanValidationError("shots_required", ep_path + ".shots")
         if len(ep["shots"]) > 100:
-            raise ValueError("单集镜头过多，请拆分")
-        for shot in ep["shots"]:
-            identifier(shot)
+            raise PlanValidationError("too_many_items", ep_path + ".shots")
+        for shot_index, shot in enumerate(ep["shots"]):
+            path = f"{ep_path}.shots[{shot_index}]"
+            identifier(shot, path)
             d = shot.get("duration")
             if isinstance(d, bool) or not isinstance(d, (int, float)) or not math.isfinite(d) or not 4 <= d <= 15 or int(d) != d:
-                raise ValueError("单镜时长必须为 4–15 秒整数")
+                raise PlanValidationError("duration_invalid", path + ".duration")
+            if not isinstance(shot.get("prompt"), str) or not shot["prompt"].strip():
+                raise PlanValidationError("shot_prompt_required", path + ".prompt")
             refs = shot.get("asset_ids")
-            if (not shot.get("prompt") or not isinstance(refs, list) or not refs
+            if (not isinstance(refs, list) or not refs
                     or not all(isinstance(ref, str) for ref in refs)
                     or len(set(refs)) != len(refs) or not set(refs) <= asset_ids):
-                raise ValueError("每镜必须引用存在的资产并包含提示词")
-            if not shot.get("scene_id"):
-                raise ValueError("每镜必须包含 scene_id 以维护空间与剪辑连续性")
-            if any(voices[ref] not in refs for ref in refs if ref in voices):
-                raise ValueError("镜头引用声音时，必须同时引用该声音绑定的角色")
+                raise PlanValidationError("asset_references_invalid", path + ".asset_ids")
+            if not isinstance(shot.get("scene_id"), str) or not shot["scene_id"].strip():
+                raise PlanValidationError("scene_required", path + ".scene_id")
+            for ref_index, ref in enumerate(refs):
+                if ref in voices and voices[ref] not in refs:
+                    raise PlanValidationError("voice_character_not_referenced", f"{path}.asset_ids[{ref_index}]")
     return plan
 
 
