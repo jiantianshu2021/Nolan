@@ -19,6 +19,7 @@ HELP = """你可以直接用中文：
   看一下人物 / hero 通过 / hero 的衣服改成白色
   播放第一集 / E001 通过 / E001 的 E001-S001 需要返工，理由是……
   E001 字幕 把“你好”改成“您好”（仅校正字幕，保留视频）
+  E001 请重新对齐字幕，前五条出现太早（本集后期按实际人声重对齐）
   总预算设为 30 元
 演示模式不调用 GPT：用 ID（如 hero、E001）明确指定对象。
 退出：/quit。退出会暂停新的提交，已提交的任务可能仍在供应商执行。
@@ -151,6 +152,9 @@ def quick_command(message, ctx):
             match = re.fullmatch(re.escape(item["id"]) + r"\s+字幕\s*[:：]?\s*(.+)", original, re.I)
             if match:
                 return _blank("captions", kind="episode", id=item["id"], feedback=match[1])
+            match = re.fullmatch(re.escape(item["id"]) + r"\s+((?:请(?:帮我)?|帮我)?\s*(?:重新)?(?:对齐|识别|转录|校对)\s*字幕(?:[，,：:\s].*)?)", original, re.I)
+            if match:
+                return _blank("captions", kind="episode", id=item["id"], feedback=match[1])
         match = re.fullmatch(re.escape(item["id"]) + r"\s+(?:返工|修改)\s*[:：]?\s*(.+)", original, re.I)
         if match:
             return _blank("reject", kind=item["kind"], id=item["id"], feedback=match.group(1))
@@ -167,8 +171,21 @@ def execute_intent(root, message, intent, seen):
         # Quoted replacement text is valid here; questions/hypotheticals still
         # cannot authorize changing a completed episode's subtitle track.
         command_text = _without_quoted_content(message)
-        if "字幕" not in message or _is_question_or_hypothesis(command_text) or re.search(r"(?:不要|不用|别)\s*(?:改|修|校|替换)", command_text) or not re.search(r"改|修正|校正|更正|替换", command_text):
-            raise ValueError("请明确给出字幕更正，例如：E001 字幕 把你好改成您好")
+        caption_actions = r"(?:修改|改|修正|校正|更正|替换|校对|对齐|识别|转录)"
+        negation_pattern = (
+            r"(?:不要|不用|不必|无需|别|不需要|不想|不能|不可以|暂缓|稍后|等等|先等|不)"
+            r"\s*(?:(?:再|去|先|给我|帮我|对|把|本集|这集|字幕|重新)\s*)*" + caption_actions
+        )
+        actionable_text, negated = command_text, False
+        for match in reversed(list(re.finditer(negation_pattern, command_text))):
+            # "不改视频/文字，只重新对齐字幕" is an explicit timing edit.
+            # The negated verb itself must never count as that authorization.
+            if re.match(r"\s*(?:原有|原始|已有)?(?:视频|人声|配音|声音|文字|字词)", command_text[match.end():]):
+                actionable_text = actionable_text[:match.start()] + actionable_text[match.end():]
+            else:
+                negated = True
+        if "字幕" not in message or _is_question_or_hypothesis(command_text) or negated or not re.search(caption_actions, actionable_text):
+            raise ValueError("请明确给出字幕更正，例如：E001 字幕 把你好改成您好，或 E001 请重新对齐字幕")
         return core.request_caption_fix(root, intent["id"], item["version"], intent["feedback"])
     if action in {"approve", "reject"}:
         item = _bound_item(intent, seen, message)

@@ -88,6 +88,7 @@ def request(root, eid, version, target, feedback):
             _retire(ep)
             pp = ep["postproduction"]
             pp["revision"] = pp.get("revision", 0) + 1
+            pp["revision_target"] = target
             if target in {"subtitles", "all"}:
                 pp["subtitle_feedback"] = feedback.strip()
                 pp["subtitle_feedback_source"] = copy.deepcopy(pp.get("subtitles", {}).get("segments"))
@@ -163,12 +164,18 @@ def request_generation(root, eid, version):
     return core.load_project(root)
 
 
-def _caption_context(state, ep, feedback):
+def _caption_context(state, ep, feedback, previous=None):
     # Current episode only. No novel, history, reviews, images or previous prompts.
     used = {aid for sh in ep["shots"] for aid in sh.get("asset_ids", [])}
     names = [a.get("name", "")[:30] for a in state["assets"] if a["id"] in used and a.get("kind") in {"character", "voice"}][:30]
-    dialogue = "\n".join(sh.get("dialogue", "") for sh in ep["shots"])
-    return {"names": names, "planned_dialogue_reference_only": dialogue[:4500], "feedback": feedback[:2000]}
+    dialogue = "\n".join(sh.get("dialogue") or "" for sh in ep["shots"])
+    context = {"names": names, "planned_dialogue_reference_only": dialogue[:3000], "feedback": feedback[:1500]}
+    if feedback and isinstance(previous, list):
+        # Prior corrections can inform spelling, never timing, cue count or order.
+        text = "\n".join(s.get("text", "") for s in previous if isinstance(s, dict))[:2000]
+        if text:
+            context["previous_corrected_text_reference_only"] = text
+    return context
 
 
 def _captions(root, ep, dry, brain_call, gate):
@@ -181,45 +188,64 @@ def _captions(root, ep, dry, brain_call, gate):
         _wait(root, ep["id"], "configuration_required", missing_configuration=["字幕校对要求ChatGPT订阅连接；请在终端运行 nolan setup 选择订阅。"])
         return None
     try:
-        transcriber = LocalTranscriber(config, cache_dir=Path(root) / "cache" / "local-asr")
+        transcriber = LocalTranscriber(config, cache_dir=Path(root) / "cache" / "local-asr",
+                                      cancel_check=lambda: core.load_project(root)["paused"])
         transcriber.check_ready()
     except Exception as exc:
         _wait(root, ep["id"], "configuration_required", missing_configuration=[str(exc)])
         return None
     pp = _episode(root, ep["id"]).get("postproduction", {})
-    context = _caption_context(state, ep, pp.get("subtitle_feedback", ""))
+    context = _caption_context(state, ep, pp.get("subtitle_feedback", ""), pp.get("subtitle_feedback_source"))
     evidence = media.extract_evidence(dry, Path(root) / "evidence" / ("post-audio-" + pp["source_key"][:16]))
     if not evidence.get("audio"):
         raise core.GateError("锁定粗剪没有音轨，无法识别实际对白；原视频已保留")
     audio = Path(evidence["audio"])
     _save(root, ep["id"], status="recognizing")
     raw = transcriber.transcribe(audio)
-    if not raw and any(sh.get("dialogue", "").strip() for sh in ep["shots"]):
+    if not raw and any((sh.get("dialogue") or "").strip() for sh in ep["shots"]):
         raise core.GateError("本集计划含对白，但本地识别结果为空；请检查原声音轨或本地模型。不会把剧本冒充字幕。")
-    base = pp.get("subtitle_feedback_source") if pp.get("subtitle_feedback") else None
-    base = base if isinstance(base, list) else raw
-    key = _hash({"source": pp["source_key"], "raw": raw, "base": base, "context": context, "policy": 1})
+    # Only current audio-derived timings are authoritative. A rework must never
+    # feed stale subtitle_feedback_source timestamps back into text proofreading.
+    key = _hash({"source": pp["source_key"], "raw": raw, "context": context, "policy": 2})
     # Registered results are immutable and safe to reuse on restarts.
     current = _episode(root, ep["id"]).get("postproduction", {})
     if current.get("subtitle_key") == key and current.get("subtitles", {}).get("status") == "ready":
         return current["subtitles"]["segments"]
     _save(root, ep["id"], status="proofreading", subtitles={"status": "proofreading", "engine": "whisper.cpp + GPT订阅校对", "segments": raw})
     corrected = []
-    for offset in range(0, len(base), 60):
+    for offset in range(0, len(raw), 60):
         gate(root)
-        batch = base[offset:offset + 60]
+        batch = raw[offset:offset + 60]
         corrected.extend(brain_call(root, "proofread_subtitles", batch, context,
-            _cache_key=_hash({"method": "proofread_subtitles", "batch": batch, "context": context, "policy": 1})))
+            _cache_key=_hash({"method": "proofread_subtitles", "batch": batch, "context": context, "policy": 2})))
     _save(root, ep["id"], subtitle_key=key, subtitles={"status": "ready", "engine": "whisper.cpp + GPT订阅校对",
         "segments": corrected, "raw_segments": raw, "audio_sha256": core.digest(audio),
         "asr_metadata": transcriber.last_metadata,
-        "note": "识别实际音频；GPT仅校对文字，未听音频。最终请审听整集。"})
+        "note": "按实际人声位置识别并对齐；GPT仅校对文字，未听音频。最终请审听整集。"})
     return corrected
 
 
 def _music(root, ep, duration, captions, brain_call, gate, soundtrack):
     from . import music_library as library_api
     state = gate(root)
+    pp = _episode(root, ep["id"]).get("postproduction", {})
+    music = pp.get("music", {})
+    # A subtitle-only request keeps the existing approved arrangement, including
+    # when unrelated new tracks await audition. Validate its exact source bytes
+    # before any catalog scan or candidate gate can replace the current record.
+    if (pp.get("revision_target") == "subtitles" and pp.get("music_key")
+            and music.get("status") == "ready"):
+        try:
+            bed = core.safe_path(root, music["file"])
+            validated = library_api.validate_cue_plan(
+                {"summary": music["summary"], "cues": music["cues"]},
+                state["music_library"], duration, project=root)
+            if (core.digest(bed) != music["sha256"] or abs(music["duration"] - duration) > 0.05
+                    or validated["fingerprint"] != music["fingerprint"]):
+                raise ValueError("changed music")
+            return bed
+        except (ValueError, OSError, KeyError, TypeError):
+            raise core.GateError("原配乐文件或编排校验失败，字幕已保留；请检查原文件或明确提交配乐调整，不会自动重新编配音乐。") from None
     if state["settings"].get("music", {}).get("mode") == "library":
         from .music_folder import scan_folder_locked
         scan_folder_locked(root)
@@ -292,8 +318,10 @@ def _music(root, ep, duration, captions, brain_call, gate, soundtrack):
     if pp.get("music_key") == key and music.get("status") == "ready":
         try:
             bed = core.safe_path(root, music["file"])
-            if core.digest(bed) == music["sha256"]:
-                library_api.validate_cue_plan({"summary": music["summary"], "cues": music["cues"]}, library, duration, project=root)
+            if core.digest(bed) == music["sha256"] and abs(music["duration"] - duration) <= 0.05:
+                validated = library_api.validate_cue_plan({"summary": music["summary"], "cues": music["cues"]}, library, duration, project=root)
+                if validated["fingerprint"] != music["fingerprint"]:
+                    raise ValueError("配乐编排已变化")
                 return bed
         except (ValueError, OSError, KeyError):
             pass

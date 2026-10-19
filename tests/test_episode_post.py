@@ -203,6 +203,63 @@ class EpisodePostTests(unittest.TestCase):
         self.assertEqual(self.calls("arrange_music")[-1].args[2]["feedback"], "背景再轻一点")
         self.assertEqual(updated["status"], "awaiting_review")
 
+    def test_timing_revision_uses_new_audio_windows_not_old_cues_and_keeps_music(self):
+        self.import_music(approve=True)
+        self.assertTrue(self.finish())
+        original = self.episode()
+        original_shots = self.shots()
+        # Synthetic ASR changes both the number and positions of cues. This
+        # models real re-alignment, not a single fixed offset or text-only edit.
+        aligned = [{"start": 0.31, "end": 0.62, "text": "张三说话"},
+                   {"start": 1.21, "end": 1.43, "text": "合成字幕"},
+                   {"start": 1.52, "end": 1.94, "text": "样例"}]
+        self.asr.transcribe.return_value = copy.deepcopy(aligned)
+        # A folder scan may add unrelated candidates; this must not erase or
+        # replan the already approved music during a subtitle-only request.
+        candidate = music_library.import_track(self.root, self.fixture / "synthetic-music.wav",
+                                               "无关试听候选", track_id="unrelated-candidate")
+        candidate["file"] = str(Path(candidate["file"]).relative_to(self.root))
+        with core.transaction(self.root) as state:
+            state["music_library"]["tracks"].append(candidate)
+        episode_post.request(self.root, original["id"], original["version"], "subtitles",
+                             "前五条出现太早，请按实际人声重新对齐")
+        self.assertTrue(self.finish())
+        updated = self.episode()
+        call = self.calls("proofread_subtitles")[-1]
+        self.assertEqual(call.args[2], aligned, "old feedback timestamps must not override current audio")
+        context = call.args[3]
+        self.assertIn("张山说话", context["previous_corrected_text_reference_only"])
+        self.assertIsInstance(context["previous_corrected_text_reference_only"], str)
+        self.assertNotIn("subtitle_feedback_source", context)
+        self.assertNotIn("整部小说哨兵", json.dumps(context, ensure_ascii=False))
+        result = updated["postproduction"]["subtitles"]["segments"]
+        self.assertEqual([(s["start"], s["end"]) for s in result],
+                         [(s["start"], s["end"]) for s in aligned])
+        self.assertEqual(updated["render_manifest"]["subtitles"], result)
+        self.assertEqual(updated["postproduction"]["music_key"], original["postproduction"]["music_key"])
+        self.assertEqual(updated["postproduction"]["music"]["sha256"], original["postproduction"]["music"]["sha256"])
+        self.assertEqual(len(self.calls("arrange_music")), 1)
+        self.assertEqual(self.shots(), original_shots)
+        self.assertNotEqual(updated["file"], original["file"])
+        self.assertEqual(updated["status"], "awaiting_review")
+        self.assertTrue(core.safe_path(self.root, original["file"]).is_file())
+        episode_post.check_final(self.root, core.load_project(self.root), updated)
+        self.soundtrack.assert_not_called()
+
+    def test_subtitle_only_revision_does_not_rearrange_invalid_music(self):
+        self.import_music(approve=True)
+        self.assertTrue(self.finish())
+        original = self.episode()
+        bed = core.safe_path(self.root, original["postproduction"]["music"]["file"])
+        bed.write_bytes(bed.read_bytes() + b"changed synthetic bed")
+        episode_post.request(self.root, original["id"], original["version"], "subtitles", "重新对齐字幕")
+        with self.assertRaisesRegex(core.GateError, "不会自动重新编配"):
+            self.finish()
+        self.assertEqual(len(self.calls("arrange_music")), 1)
+        self.assertFalse(self.episode()["postproduction"]["final_ready"])
+        self.assertEqual(self.episode()["postproduction"]["subtitles"]["status"], "ready")
+        self.soundtrack.assert_not_called()
+
     def test_restart_during_music_wait_reuses_proofreading_and_source(self):
         self.assertFalse(self.finish())
         first = self.episode()["postproduction"]

@@ -80,6 +80,19 @@ assert.equal(card.querySelector('.episode-video-rework').tag,'details');
 assert.equal(Boolean(card.querySelector('.episode-video-rework').open),false,'video rework is a separate collapsed action');
 ''')
 
+    def test_subtitle_feedback_includes_audio_realignment_and_keeps_human_final_review(self):
+        self.run_dom(r'''
+const card=episodeCard(episode,0),preview=card.querySelector('.postproduction-final-preview');
+const subtitleFeedback=preview.querySelector('.postproduction-feedback'),feedback=subtitleFeedback.querySelector('textarea');
+assert.ok(feedback.placeholder.includes('前五条字幕出现太早'));
+assert.ok(walk(subtitleFeedback).some(node=>node.textContent.includes('按实际人声重新识别并对齐字幕')));
+assert.ok(walk(subtitleFeedback).some(node=>node.textContent.includes('保留已有视频、音乐和片段审批')));
+feedback.value='前五条字幕比人声提前，尤其第一条，请按实际声音重新对齐。';
+subtitleFeedback.querySelector('button').listeners.click();
+assert.deepEqual(JSON.parse(JSON.stringify(actions.at(-1)[0])),{action:'postproduction',id:'E1',version:4,target:'subtitles',feedback:feedback.value});
+assert.equal(actions.some(action=>action[0].action==='approve'),false);
+''')
+
     def test_rework_and_inconsistent_final_never_present_old_video_as_current(self):
         self.run_dom(r'''
 for(const update of [{final_ready:false},{ready:false},{final_file:'exports/E1-v3.mp4'},{final_version:3},{final_file:null}]){

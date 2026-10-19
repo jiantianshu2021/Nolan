@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import wave
 from unittest.mock import patch
 
 from norlan.local_transcription import LocalTranscriber, _cpp_segments
@@ -21,7 +22,10 @@ class LocalTranscriptionTests(unittest.TestCase):
         self.model.write_bytes(b"synthetic model")
         self.executable = self.root / "synthetic whisper-cli"
         self.executable.write_bytes(b"synthetic executable")
-        self.config = {"mode": "local", "model_path": str(self.model), "language": "zh"}
+        self.vad_model = self.root / "vad.bin"
+        self.vad_model.write_bytes(b"synthetic VAD model")
+        self.config = {"mode": "local", "model_path": str(self.model), "language": "zh",
+                       "vad_model_path": str(self.vad_model)}
         self.result = {"transcription": [{"offsets": {"from": 200, "to": 2100}, "text": " 实际对白 "}]}
         self.which = patch("norlan.local_transcription.shutil.which", return_value=str(self.executable))
         self.which.start()
@@ -35,16 +39,22 @@ class LocalTranscriptionTests(unittest.TestCase):
         if "-of" in args:
             output = Path(args[args.index("-of") + 1]).with_suffix(".json")
             output.write_text(json.dumps(self.result), encoding="utf-8")
+        elif "-vm" in args:
+            return subprocess.CompletedProcess(args, 0, stdout="Detected 1 speech segments:\nSpeech segment 0: start = 0.00, end = 600.00\n")
         else:
-            Path(args[-1]).write_bytes(b"synthetic normalized PCM")
+            with wave.open(str(args[-1]), "wb") as audio:
+                audio.setnchannels(1); audio.setsampwidth(2); audio.setframerate(16000)
+                audio.writeframes(b"\x00\x00" * 96000)
         return subprocess.CompletedProcess(args, 0)
 
     def test_millisecond_timestamps_actual_audio_and_safe_argv(self):
         with patch("norlan.local_transcription.subprocess.run", side_effect=self.run_fixture) as run:
             result = self.transcriber.transcribe(self.audio)
         self.assertEqual(result, [{"start": 0.2, "end": 2.1, "text": "实际对白"}])
-        self.assertEqual(run.call_count, 2)
-        ffmpeg, asr = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(run.call_count, 3)
+        ffmpeg, vad, asr = [call.args[0] for call in run.call_args_list]
+        self.assertIn("-vm", vad)
+        self.assertIn(str(self.vad_model.resolve()), vad)
         self.assertIn(str(self.audio.resolve()), ffmpeg)
         self.assertIn("16000", ffmpeg)
         self.assertIn("pcm_s16le", ffmpeg)
@@ -60,18 +70,18 @@ class LocalTranscriptionTests(unittest.TestCase):
             first = self.transcriber.transcribe(self.audio)
             first_key = self.transcriber.last_metadata["cache_key"]
             self.assertEqual(self.transcriber.transcribe(self.audio), first)
-            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_count, 3)
             self.assertTrue(self.transcriber.last_metadata["cache_hit"])
             self.audio.write_bytes(b"new synthetic audio")
             self.transcriber.transcribe(self.audio)
-            self.assertEqual(run.call_count, 4)
+            self.assertEqual(run.call_count, 6)
             self.assertNotEqual(first_key, self.transcriber.last_metadata["cache_key"])
             self.model.write_bytes(b"new synthetic model")
             self.transcriber.transcribe(self.audio)
-            self.assertEqual(run.call_count, 6)
+            self.assertEqual(run.call_count, 9)
             self.executable.write_bytes(b"new synthetic executable")
             self.transcriber.transcribe(self.audio)
-            self.assertEqual(run.call_count, 8)
+            self.assertEqual(run.call_count, 12)
 
     def test_cache_can_be_reused_after_source_renamed_without_rerunning(self):
         with patch("norlan.local_transcription.subprocess.run", side_effect=self.run_fixture) as run:
@@ -79,7 +89,7 @@ class LocalTranscriptionTests(unittest.TestCase):
             other = self.root / "renamed.wav"
             other.write_bytes(self.audio.read_bytes())
             self.assertEqual(self.transcriber.transcribe(other), original)
-            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_count, 3)
 
     def test_corrupt_cache_is_recomputed_not_used(self):
         with patch("norlan.local_transcription.subprocess.run", side_effect=self.run_fixture) as run:
@@ -87,7 +97,7 @@ class LocalTranscriptionTests(unittest.TestCase):
             cached = next((self.root / "cache").glob("*.json"))
             cached.write_text("{broken", encoding="utf-8")
             self.transcriber.transcribe(self.audio)
-            self.assertEqual(run.call_count, 4)
+            self.assertEqual(run.call_count, 6)
             self.assertFalse(self.transcriber.last_metadata["cache_hit"])
 
     def test_silence_can_return_no_segments_without_script_substitution(self):
@@ -156,7 +166,8 @@ class LocalTranscriptionTests(unittest.TestCase):
     def test_configuration_validation(self):
         for config in ({"mode": "openai"}, {"backend": "api"}, {"language": "Chinese"},
                        {"timeout": True}, {"timeout": float("nan")}, {"threads": True},
-                       {"threads": 99}, {"executable": ""}, {"model_path": "\x00"}):
+                       {"threads": 99}, {"executable": ""}, {"model_path": "\x00"},
+                       {"vad_executable": ""}, {"vad_model_path": "\x00"}):
             with self.subTest(config=config):
                 with self.assertRaises(ProviderError):
                     LocalTranscriber({**self.config, **config})

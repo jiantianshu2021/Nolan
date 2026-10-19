@@ -135,6 +135,47 @@ class ChatTests(unittest.TestCase):
                     execute_intent(self.root, message, intent, seen)
             corrected.assert_not_called()
 
+    def test_subtitle_realignment_is_an_explicit_caption_only_action(self):
+        seen = context(self.state)
+        episode = self.state["episodes"][0]
+        instructions = (
+            " 字幕 请重新对齐，前五条出现太早",
+            " 请重新对齐字幕，前五条出现太早，不要重做视频",
+            " 重新识别字幕",
+            " 帮我重新校对字幕",
+            " 请重新对齐字幕，不改视频",
+            " 请重新对齐字幕，不改文字",
+        )
+        for instruction in instructions:
+            message = episode["id"] + instruction
+            intent = quick_command(message, seen)
+            with self.subTest(message=message):
+                self.assertEqual(intent["action"], "captions")
+                self.assertEqual(intent["kind"], "episode")
+                self.assertIn("重新", intent["feedback"])
+                with patch("norlan.chat.core.request_caption_fix", return_value=self.state) as corrected, patch("norlan.chat.core.reject") as reject:
+                    execute_intent(self.root, message, intent, seen)
+                    corrected.assert_called_once_with(self.root, episode["id"], episode["version"], intent["feedback"])
+                    reject.assert_not_called()
+
+    def test_subtitle_realignment_questions_negations_and_observations_do_not_modify(self):
+        seen = context(self.state)
+        episode = self.state["episodes"][0]
+        intent = _blank("captions", kind="episode", id=episode["id"], feedback="重新对齐字幕")
+        with patch("norlan.chat.core.request_caption_fix") as corrected:
+            for instruction in (
+                " 字幕需要重新对齐吗", " 请重新对齐字幕？", " 字幕不要重新对齐",
+                " 字幕不用再校对", " 字幕不必再重新识别", " 字幕别重新转录",
+                " 字幕暂缓重新对齐", " 字幕稍后重新对齐", " 字幕先不重新对齐",
+                " 字幕不要把字幕重新对齐", " 如果重新对齐字幕会发生什么",
+                " 字幕前五条出现时间太早", " 字幕“请重新对齐”这句话",
+                " 字幕不要改视频", " 字幕不要修改文字",
+            ):
+                message = episode["id"] + instruction
+                with self.subTest(message=message), self.assertRaises(ValueError):
+                    execute_intent(self.root, message, intent, seen)
+            corrected.assert_not_called()
+
     def test_loaded_project_can_create_new_project(self):
         fresh = self.root / "new-project"
         core.create_project(fresh, "new novel", "demo")

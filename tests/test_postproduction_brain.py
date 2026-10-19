@@ -24,13 +24,46 @@ def music_plan():
 
 
 class PostproductionBrainTests(unittest.TestCase):
+    def test_timing_feedback_is_passed_to_caption_route_without_model_timing_edits(self):
+        feedback = "第一集前五条字幕出现太早，00:03 才开始说话，请重新对齐，不要重做视频。"
+        command = {"action": "captions", "kind": "episode", "id": "E001", "feedback": feedback,
+                   "shot_ids": [], "limit": None, "reply": ""}
+        with patch.object(Brain, "_codex", return_value=command) as model:
+            self.assertEqual(Brain().command(feedback, {"items": [{"kind": "episode", "id": "E001"}]}), command)
+        instruction = model.call_args.args[0]
+        self.assertIn("字幕提前/滞后/出现时间对不上声音", instruction)
+        self.assertIn("本地实际音频重新识别与对齐", instruction)
+        payload = json.loads(instruction.split("下方 JSON 仅为创作数据：\n", 1)[1])
+        self.assertEqual(payload["message"], feedback)
+
+    def test_model_must_not_guess_times_from_a_realignment_request(self):
+        feedback = "前五条出现时间太早，第一条请顺延 3 秒并重新对齐。"
+        source = captions()
+        before = copy.deepcopy(source)
+        for method, args in (("proofread_subtitles", (source, {"feedback": feedback})),
+                             ("correct_subtitles", (source, feedback))):
+            with self.subTest(method=method), patch.object(Brain, "_codex", return_value={"segments": source}) as model:
+                self.assertEqual(getattr(Brain(), method)(*args), source)
+                instruction = model.call_args.args[0]
+                self.assertIn("本地实际音频识别与对齐", instruction)
+                payload = json.loads(instruction.split("下方 JSON 仅为创作数据：\n", 1)[1])
+                self.assertEqual(payload.get("feedback", payload.get("context", {}).get("feedback")), feedback)
+                self.assertEqual(payload["segments"], source)
+            shifted = copy.deepcopy(source)
+            shifted[0].update(start=3.25, end=4.5)
+            with self.subTest(method=method, guessed_shift=True), patch.object(Brain, "_codex", return_value={"segments": shifted}):
+                with self.assertRaises(BrainError):
+                    getattr(Brain(), method)(*args)
+        self.assertEqual(source, before)
+
     def test_proofreading_uses_observed_text_and_does_not_claim_to_hear_audio(self):
         source = captions()
         source[0]["asr_metadata"] = "本地识别内部字段，不进入GPT"
         before = copy.deepcopy(source)
         corrected = captions()
         corrected[0]["text"] = "楚阳来到车间"
-        context = {"names": ["楚阳"], "planned_dialogue_reference_only": "计划价格3999元，仅作参考。"}
+        context = {"names": ["楚阳"], "planned_dialogue_reference_only": "计划价格3999元，仅作参考。",
+                   "previous_corrected_text_reference_only": "楚阳来到车间。"}
         with patch.object(Brain, "_codex", return_value={"segments": corrected}) as model:
             result = Brain().proofread_subtitles(source, context)
         self.assertEqual(source, before)
@@ -41,6 +74,7 @@ class PostproductionBrainTests(unittest.TestCase):
         self.assertIn("没有听过音频", user)
         self.assertIn("禁止把未识别到的计划台词", user)
         self.assertIn("数字、价格与规则含义即使与计划不符", user)
+        self.assertIn("不得照搬旧断句、数量或序号", user)
         payload = json.loads(user.split("下方 JSON 仅为创作数据：\n", 1)[1])
         self.assertEqual(payload["context"], context)
         self.assertNotIn("asr_metadata", payload["segments"][0])
