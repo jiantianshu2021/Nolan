@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 from . import __version__, core
+from .providers import ProviderError
 
 
 def remember(root):
@@ -117,8 +118,13 @@ def doctor():
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="norlan", description="Norlan · 在终端对话，逐集监督 AI 漫剧制作")
     parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument("--resume", action="store_true", help="继续最近一次 Norlan GPT 对话")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("doctor", help="检查本地工具与账户配置，不显示密钥")
+    sub.add_parser("connection", help="查看 GPT 订阅/API 连接选择")
+    setup_parser = sub.add_parser("setup", help="选择 ChatGPT 订阅或 OpenAI API 连接")
+    setup_parser.add_argument("--provider", choices=["chatgpt", "openai"])
+    setup_parser.add_argument("--model", help="明确指定模型 ID；API 模式必填")
     for cmd in ("new", "demo"):
         p = sub.add_parser(cmd)
         p.add_argument("project", type=Path)
@@ -126,9 +132,11 @@ def main(argv=None):
             p.add_argument("--novel", required=True, type=Path)
             p.add_argument("--mode", choices=["demo", "live"], default="live")
         p.add_argument("--brief", default="")
-    for cmd in ("chat", "studio", "run", "status", "pause", "resume"):
+    for cmd in ("chat", "console", "studio", "run", "status", "pause", "resume"):
         p = sub.add_parser(cmd)
-        p.add_argument("project", type=Path, nargs="?" if cmd == "chat" else None)
+        p.add_argument("project", type=Path, nargs="?" if cmd in {"chat", "console"} else None)
+        if cmd == "chat":
+            p.add_argument("--resume", action="store_true", dest="chat_resume", help="继续最近一次 GPT 对话")
         if cmd == "studio":
             p.add_argument("--port", type=int, default=8765)
             p.add_argument("--no-open", action="store_true")
@@ -165,12 +173,25 @@ def main(argv=None):
     p.add_argument("--correction", required=True)
     args = parser.parse_args(argv)
     try:
+        if args.resume and args.command not in {None, "chat"}:
+            raise ValueError("--resume 用于恢复 GPT 对话；使用 norlan --resume 或 norlan chat --resume。")
+        if args.command == "setup":
+            from .connection import setup
+            return setup(args.provider, args.model)
+        if args.command == "connection":
+            from .connection import describe_connection
+            print(describe_connection())
+            return 0
+        if args.command in (None, "chat"):
+            from .interactive import launch
+            return launch(getattr(args, "project", None),
+                          resume=args.resume or getattr(args, "chat_resume", False))
+        if args.command == "console":
+            from .chat import chat
+            return chat(args.project or last_project())
         from . import pipeline
         if args.command == "doctor":
             return doctor()
-        if args.command in (None, "chat"):
-            from .chat import chat
-            return chat(getattr(args, "project", None) or last_project())
         root = args.project.expanduser().resolve()
         if args.command in {"new", "demo"}:
             mode = "demo" if args.command == "demo" else args.mode
@@ -180,7 +201,8 @@ def main(argv=None):
                 core.configure(root, {"creative_brief": args.brief})
             remember(root)
             print(summary(pipeline.run(root)))
-            print(f"\n进入对话：norlan chat {root}")
+            entry = "console" if mode == "demo" else "chat"
+            print(f"\n进入{'演示控制台' if mode == 'demo' else 'GPT 对话'}：norlan {entry} {root}")
             return 0
         if args.command == "studio":
             from .dashboard import serve
@@ -217,7 +239,7 @@ def main(argv=None):
         else:
             print(summary(state))
         return 1 if state["status"] == "blocked" else 0
-    except (ValueError, OSError, KeyError) as exc:
+    except (ValueError, OSError, KeyError, ProviderError) as exc:
         print("Norlan：" + str(exc), file=sys.stderr)
         return 2
     except KeyboardInterrupt:

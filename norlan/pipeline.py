@@ -45,14 +45,19 @@ def _gate(root):
 
 def _brain(root, method, *args, **kwargs):
     from .brain import Brain
+    from .connection import production_brain_config
     s = _gate(root)
     if s["mode"] == "demo":
         raise core.GateError("演示项目不调用在线模型；请新建 live 项目进行真实制作")
+    config = production_brain_config(s["settings"]["brain"])
+    amount = s["settings"]["caps"]["llm"]
+    if (config.get("provider") == "openai" or config.get("billing") == "api") and (
+            amount <= 0 or not s["budget"]["approved"]):
+        raise core.GateError("GPT API 制作调用需要你先设置项目预算及 caps.llm 每次调用费用上限；尚未提交请求。")
     job_id = "gpt-" + uuid.uuid4().hex[:12]
-    amount = 0 if s["mode"] == "demo" else s["settings"]["caps"]["llm"]
     core.reserve(root, job_id, "llm", method, amount)
     try:
-        result = getattr(Brain(s["settings"]["brain"]), method)(*args, **kwargs)
+        result = getattr(Brain(config), method)(*args, **kwargs)
         core.update_job(root, job_id, state="completed", accounting="spent")
         return result
     except Exception:

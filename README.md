@@ -1,8 +1,8 @@
 # Norlan
 
-在 Mac mini 终端运行的 AI 漫剧制作助手。输入小说后，GPT 规划分集、资产和分镜；你批准创作方案与角色、场景、声音候选后，Norlan 逐镜生成、检查并拼成一集。**每集都交给你完整观看；你批准当前版本后，才开始下一集。**
+在 Mac mini 终端运行的 GPT 对话与 AI 漫剧制作助手。启动就能自由聊天、讨论创意、写故事和修改方案，不需要先提供小说或创建制作项目。你决定制作时，GPT 再调用 Norlan 的工具规划分集、资产和分镜。**每集都交给你完整观看；你批准当前版本后，才开始下一集。**
 
-终端对话是主要入口，本地审片页面用于观看素材和成片、批准版本、提交修改意见。视频生成使用火山引擎官方 Ark API；GPT 默认通过本机 Codex CLI 使用现有 ChatGPT 登录。即梦网页会员、现有即梦 CLI 登录与火山 API 权限互不等同。
+默认入口采用原生 Codex 对话界面，支持流式回答、多轮上下文和会话恢复，Norlan 制作能力通过专用 MCP 工具提供。本地审片页面用于观看素材和成片、批准版本、提交修改意见。视频生成使用火山引擎官方 Ark API；GPT 可选择 ChatGPT 订阅或 OpenAI API。即梦网页会员、现有即梦 CLI 登录与火山 API 权限互不等同。
 
 本项目已包含真实 API 适配器和本地模拟测试。本机 ChatGPT 登录下的真实 GPT 规划调用已经验证；视频、图片、音乐和转写服务尚未进行付费实测。演示素材带有 `NORLAN DEMO / SYNTHETIC PLACEHOLDER` 标记，只用于检验流程；实际媒体权限、费用和生成质量需要首次小额实测。
 
@@ -20,7 +20,28 @@ norlan
 
 仓库是私有的，克隆需要具有访问权限的 GitHub 登录。安装脚本将入口放在 `~/.local/bin/norlan`；若终端找不到命令，可先使用该完整路径，或把 `~/.local/bin` 加入 `PATH`。程序需要在运行制作任务时保持启动，关闭终端后可以从项目目录继续。
 
-直接输入 `norlan` 会回到上次项目，最近项目的位置记录在 `~/.config/norlan/last-project`。新会话中可输入 `/new /完整路径/novel.txt`，或“用 /完整路径/novel.txt 创建”。使用 `Ctrl+C` 中止当前工作后，已有文件与进度仍保留。
+直接输入 `norlan` 打开新的 GPT 对话，不会自动进入旧演示项目。你可以说“先聊聊我的故事，不要开始制作”，也可以贴入故事，或明确提供 TXT/MD 小说路径让它读取。对话可以持续修改创意；决定制作时，直接说“把我们刚才确定的故事创建成漫剧项目”。
+
+```bash
+norlan                    # 新的自由对话
+norlan --resume           # 恢复最近的 Norlan 对话
+norlan chat ./my-drama    # 带着指定制作项目开始对话
+norlan setup              # 选择或切换 GPT 连接方式
+norlan connection         # 查看当前连接选择
+```
+
+原生对话里的 `/new` 是新对话，不是旧控制台的导入小说命令。导入小说直接使用自然语言即可。退出后制作文件与历史仍保留；重新打开可让 Norlan 查看项目并继续。
+
+### 选择 GPT 连接
+
+运行 `norlan setup` 后选择：
+
+- **ChatGPT 订阅**：使用现有 ChatGPT 登录与账户额度，默认保留当前的订阅方式和模型选择。
+- **OpenAI API**：填写自己账户可用的模型 ID，在本机终端隐藏输入 API Key；也可从终端的 `OPENAI_API_KEY` 环境变量读取。认证由官方 Codex CLI 保存到 Norlan 的独立 API 登录目录，密钥不会写入项目或仓库。
+
+连接选择会保存，订阅和 API 的登录目录、会话各自独立；切换不会复制两边的登录凭据或静默改用另一个服务。自由对话的 API 费用由 OpenAI 账户单独计费，**不受漫剧项目预算控制**。制作流程内部的 GPT API 调用必须设置项目预算和 `caps.llm`，与媒体调用一起记账。账户级消费限制应在 API 平台设置。
+
+Norlan 的模型只可使用专用制作工具，不能替你批准资产/成片、提高预算或直接改写项目状态。需要审批时，它打开本机审片页供你操作。预算配置仍由你在终端执行 `norlan configure`。
 
 Norlan 会比较 `PATH` 中的 Codex 与 ChatGPT/Codex 桌面应用内置 CLI，自动使用其中较新的已安装版本，不替换系统安装，也不自动更换你的模型。需要固定某个 CLI 时，可设置 `NORLAN_CODEX_PATH` 或 `brain.codex_command`。
 
@@ -28,10 +49,10 @@ Norlan 会比较 `PATH` 中的 Codex 与 ChatGPT/Codex 桌面应用内置 CLI，
 
 ```bash
 norlan demo ./demo-project
-norlan chat ./demo-project
+norlan console ./demo-project
 ```
 
-演示创建两集占位分镜，保留规划、资产和逐集审批。默认配置不调用付费媒体、音乐或转写服务。可在另一个终端打开审片页面：
+演示创建两集占位分镜，保留规划、资产和逐集审批。`console` 是显式保留的旧流程控制台，演示时不调用 GPT 或付费媒体服务；`norlan` / `norlan chat` 始终是实际 GPT 对话入口。可在另一个终端打开审片页面：
 
 ```bash
 norlan studio ./demo-project
@@ -50,7 +71,7 @@ norlan chat ./my-drama
 
 小说使用 UTF-8 文本。GPT 规划包括分集、每镜时长、对白、角色和场景资产、声音参考与配乐描述。超出一次输入范围时程序会停止并提示拆分，不会静默截掉小说后半段。
 
-在对话中可以查看当前状态、继续制作、提出返工意见、暂停或恢复。明确审批也有独立命令，例如批准界面上显示的第 1 版规划：
+在 GPT 对话中可以查看当前状态、继续制作、提出返工意见、暂停或恢复。人工审批通过审片页或另一个终端进行，例如批准界面上显示的第 1 版规划：
 
 ```bash
 norlan approve ./my-drama plan plan --version 1
@@ -80,8 +101,8 @@ norlan configure ./my-drama --file ./settings.json --budget 30
 
 | 配置 | 用途 |
 | --- | --- |
-| `brain.provider: "codex"` | 使用本机 Codex 的 ChatGPT 登录与账户额度；记录调用次数，不把订阅当作无限调用。 |
-| `brain.provider: "openai"` | 使用单独计费的 OpenAI API；需 `OPENAI_API_KEY` 和明确的 `brain.model`。 |
+| `brain.provider: "codex"` | 跟随 `norlan setup` 选定的订阅/API 登录。订阅记录调用次数；API 还须设置 `caps.llm` 和项目预算。 |
+| `brain.provider: "openai"` | 可选的直接 Responses API 适配器；需 `OPENAI_API_KEY` 和明确的 `brain.model`。若当前选择订阅，程序会提示连接冲突并停止，不会静默付费。通常保留 `codex` 并用 `norlan setup` 切换即可。 |
 | `ark.image_model` / `ark.video_model` | 填写你在火山 Ark 实际开通的模型或接入点 ID，不由程序猜测。 |
 | `caps.image` | 每次图片生成的保守费用上限。 |
 | `caps.video_second` | 每秒视频生成的保守费用上限；也用于声音试片。 |
@@ -114,6 +135,8 @@ norlan configure ./my-drama --file ./settings.json --budget 30
 
 | 能力 | 当前验证范围 |
 | --- | --- |
+| 原生终端 GPT 自由对话、前文记忆、退出恢复及 MCP 工具调用 | 已使用本机 ChatGPT 订阅完成真实多轮测试，成功查询现有项目。 |
+| 订阅/API 选择、独立认证目录及计费隔离 | 已通过离线测试与本机配置验证；用户 API Key 尚未配置，API 实际推理调用待验证。 |
 | GPT 小说规划与结构化返回 | 已通过本机现有 ChatGPT 登录真实调用验证。 |
 | 审批、预算、恢复、字幕缓存与局部返工 | 使用离线响应和真实状态转换测试。 |
 | 抽帧、拼接、原声保留、字幕和混音 | 使用本机 FFmpeg 与合成素材进行实际测试。 |

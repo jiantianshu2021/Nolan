@@ -237,11 +237,12 @@ class Brain:
 
     def _codex(self, user: str, schema: dict, images: list[Path]) -> dict:
         executable = resolve_codex(self.config.get("codex_command"))
+        codex_home = str(self.config.get("codex_home") or os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
         # Keep the operator's model choice, while excluding MCPs, hooks and repo config.
         model = self.config.get("model")
         if not model:
             try:
-                conf = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "config.toml"
+                conf = Path(codex_home) / "config.toml"
                 model = tomllib.loads(conf.read_text()).get("model")
             except (OSError, ValueError):
                 pass
@@ -256,12 +257,16 @@ class Brain:
                     "--color", "never"]
             if model:
                 args += ["--model", str(model)]
+            if self.config.get("billing") in {"api", "subscription"}:
+                auth_method = "api" if self.config["billing"] == "api" else "chatgpt"
+                args += ["-c", f'forced_login_method="{auth_method}"']
             for path in images:
                 args += ["--image", str(path)]
             args += ["-"]
             allowed = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "CODEX_HOME",
                        "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"}
             env = {key: value for key, value in os.environ.items() if key in allowed}
+            env["CODEX_HOME"] = codex_home
             try:
                 done = subprocess.run(args, input=SYSTEM + "\n\n" + user, text=True,
                                       capture_output=True, cwd=temp, env=env, timeout=self.timeout, check=False)
