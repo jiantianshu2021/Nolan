@@ -113,6 +113,8 @@ def create_project(root, novel: str, mode="demo", title="Norlan 漫剧"):
     root.mkdir(parents=True, exist_ok=True)
     if (root / "project.json").exists():
         raise ValueError("项目已存在，请使用 run / studio 继续")
+    if any(root.iterdir()):
+        raise ValueError("新项目需要空目录，不能覆盖目录中已有的小说或素材")
     if not novel.strip():
         raise ValueError("小说内容不能为空")
     for folder in ("source", "media", "evidence", "exports", "plans"):

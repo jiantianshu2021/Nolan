@@ -27,6 +27,17 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(state["settings"]["caps"]["image"], 0)
         self.assertEqual(state["budget"]["limit"], 0)
 
+    def test_new_project_preserves_unrelated_existing_files(self):
+        other = self.root / "unrelated"
+        other.mkdir()
+        original = other / "source"
+        original.mkdir()
+        novel = original / "novel.txt"
+        novel.write_text("original", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            core.create_project(other, "replacement", "demo")
+        self.assertEqual(novel.read_text(encoding="utf-8"), "original")
+
     def test_budget_counts_unknown_reserved_spent_and_duplicate_updates(self):
         core.configure(self.root, limit=10)
         core.reserve(self.root, "one", "video", "E001-S001", 3)
