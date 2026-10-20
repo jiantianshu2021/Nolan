@@ -470,6 +470,8 @@ def approve(root, shot_id, candidate_id, request_hash, video_model=None):
         candidate.update(status="approved", approved_at=core.now())
         shot["prompt_approval"] = {"candidate_id": candidate["id"], "request_hash": candidate["request_hash"],
                                    "at": stamp, "decision": "generate", "video_model": selected}
+        if candidate.get("manual_prompt") is not None:
+            shot["prompt_approval"]["source"] = "human_manual_edit"
         shot["status"] = "prompt_approved"
         state.update(status="ready", last_error=None)
         core.event(state, "human_approved_prompt", id=shot_id, candidate_id=candidate["id"],
@@ -497,8 +499,16 @@ def edit_and_approve(root, shot_id, candidate_id, request_hash, prompt, video_mo
         stamp = core.now()
         archived = {**copy.deepcopy(original), "status": "superseded_by_manual_edit", "superseded_at": stamp}
         shot.setdefault("prompt_history", []).append(archived)
-        marker = {"mode": "exact_text", "source_candidate_id": candidate_id, "source_request_hash": request_hash,
-                  "source_prompt_sha256": _text_digest(original["prompt"]), "edited_prompt_sha256": _text_digest(prompt)}
+        if original.get("manual_prompt") is not None:
+            # A locally restored, never-submitted manual prompt still points
+            # to its verified automatic source, rather than nesting a manual
+            # candidate as another manual candidate's source.
+            _manual_source(shot, original["manual_prompt"], original["prompt"])
+            marker = copy.deepcopy(original["manual_prompt"])
+            marker["edited_prompt_sha256"] = _text_digest(prompt)
+        else:
+            marker = {"mode": "exact_text", "source_candidate_id": candidate_id, "source_request_hash": request_hash,
+                      "source_prompt_sha256": _text_digest(original["prompt"]), "edited_prompt_sha256": _text_digest(prompt)}
         candidate = copy.deepcopy(original)
         for key in ("timing_proposal", "timing_summary", "effective_subshots", "broadcast_proposal"):
             candidate.pop(key, None)

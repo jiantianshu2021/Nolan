@@ -216,6 +216,207 @@ def prepare_voice_references(
     return prepared, metadata
 
 
+_VIDEO_REFERENCE_POLICY = "video-transport-v1"
+_VIDEO_REFERENCE_MAX_BYTES = 3_000_000
+
+
+def _transport_image_info(path: Path) -> dict:
+    """Inspect actual pixels and animation before choosing a static encoding."""
+    data = json.loads(_run([
+        "ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-count_frames",
+        "-show_entries", "stream=codec_type,codec_name,width,height,pix_fmt,nb_frames,nb_read_frames",
+        "-of", "json", str(path),
+    ], timeout=60))
+    streams = data.get("streams", [])
+    video = next((item for item in streams if item.get("codec_type") == "video"), None)
+    if not video or any(item.get("codec_type") == "audio" for item in streams):
+        raise MediaError("图片参考不是有效的静态图片；原件未改变。")
+    count = max((_number(video.get(key)) for key in ("nb_frames", "nb_read_frames")), default=0)
+    if count != 1 or video.get("codec_name") in {"apng", "gif"} and count > 1:
+        raise MediaError("动画参考图不能静默转换为第一帧；请提供已确认的静态图片。")
+    pixel = str(video.get("pix_fmt", ""))
+    alpha = (pixel.startswith(("rgba", "argb", "bgra", "abgr", "yuva", "gbrap", "ya"))
+             or pixel == "pal8")
+    width, height = int(video.get("width", 0)), int(video.get("height", 0))
+    if width <= 0 or height <= 0:
+        raise MediaError("参考图尺寸无法核实，未提交。")
+    return {"width": width, "height": height, "alpha": alpha,
+            "codec": video.get("codec_name"), "pixel_format": pixel}
+
+
+def _encode_transport_image(source: Path, info: dict, temporary: Path) -> tuple[Path, dict]:
+    """Prefer the approved image's dimensions; reduce only when bytes require it."""
+    sizes = [None]
+    if max(info["width"], info["height"]) > 1920:
+        sizes.append(1920)
+    for edge in sizes:
+        filters = [] if edge is None else [
+            "-vf", f"scale=w='min({edge},iw)':h='min({edge},ih)':force_original_aspect_ratio=decrease"]
+        if info["alpha"]:
+            encodings = [("png", ["-c:v", "png", "-compression_level", "9", "-pix_fmt", "rgba"],
+                          {"format": "png", "lossless": True})]
+            encodings += [("webp", ["-c:v", "libwebp", "-quality", str(quality),
+                                   "-compression_level", "6", "-pix_fmt", "bgra"],
+                           {"format": "webp", "quality": quality, "alpha_preserved": True})
+                          for quality in (95, 90, 85, 75)]
+        else:
+            encodings = [("jpg", ["-c:v", "mjpeg", "-q:v", str(quality), "-pix_fmt", "yuvj420p"],
+                          {"format": "jpeg", "quality": quality}) for quality in (2, 3, 5, 7, 9)]
+        for extension, options, conversion in encodings:
+            candidate = temporary / ("reference." + extension)
+            _ffmpeg(["-protocol_whitelist", "file,pipe", "-i", str(source),
+                     "-map", "0:v:0", "-an", "-sn", "-dn", "-map_metadata", "-1",
+                     *filters, "-frames:v", "1", *options, str(candidate)])
+            if 0 < candidate.stat().st_size <= _VIDEO_REFERENCE_MAX_BYTES:
+                actual = _transport_image_info(candidate)
+                if (actual["width"] > info["width"] or actual["height"] > info["height"]
+                        or info["alpha"] and not actual["alpha"]):
+                    raise MediaError("参考图传输转换未保留尺寸或透明通道，未提交。")
+                return candidate, {**conversion, "long_edge_limit": edge,
+                                   "alpha_preserved": bool(info["alpha"])}
+    raise MediaError("参考图经有界本地压缩后仍超过 3 MB；未丢弃素材、未提交付费任务。")
+
+
+def prepare_video_references(
+    references: list[Path], audio_references: list[Path], output_dir: Path,
+) -> tuple[list[Path], list[Path], dict]:
+    """Prepare small, source-bound transmission copies without altering approvals.
+
+    This is local transport preparation, not new media generation. All references
+    and their order are retained. Large opaque images first use JPEG at the same
+    resolution, alpha images retain alpha, and only oversized audio is converted
+    to 16-bit PCM without trimming, loudness changes or time stretching. Immutable
+    cached copies are validated against both original and transmitted hashes.
+    """
+    if len(references) > 9 or len(audio_references) > 3:
+        raise MediaError("参考素材超过 9 张图片或 3 段音频；不会静默省略素材。")
+    directory = Path(output_dir).expanduser().resolve()
+    prepared = {"images": [], "audio": []}
+    manifest = {"version": 1, "policy": _VIDEO_REFERENCE_POLICY, "images": [], "audio": []}
+    for kind, paths in (("images", references), ("audio", audio_references)):
+        for raw in paths:
+            source = _local(raw)
+            source_sha = _sha256(source)
+            source_size = source.stat().st_size
+            if source_size <= 0:
+                raise MediaError("参考素材为空，未提交。")
+            if kind == "images":
+                info = _transport_image_info(source)
+                facts = {"source_width": info["width"], "source_height": info["height"],
+                         "width": info["width"], "height": info["height"],
+                         "alpha_preserved": bool(info["alpha"])}
+            else:
+                info = probe(source)
+                if (not info["has_audio"] or info["has_video"] or not 2 <= info["duration"] <= 15
+                        or info["channels"] not in (1, 2) or info["sample_rate"] <= 0):
+                    raise MediaError("音频传输参考须为 2–15 秒的单声道或双声道音频；不会裁句或混缩声道。")
+                facts = {"source_duration": info["duration"], "duration": info["duration"],
+                         "source_sample_rate": info["sample_rate"], "sample_rate": info["sample_rate"],
+                         "source_channels": info["channels"], "channels": info["channels"]}
+            common = {"source_path": str(source), "source_sha256": source_sha, "source_bytes": source_size,
+                      "source_format": source.suffix.lower().lstrip("."), **facts}
+            if source_size <= _VIDEO_REFERENCE_MAX_BYTES:
+                target = source
+                metadata = {**common, "path": str(source), "sha256": source_sha, "bytes": source_size,
+                            "format": source.suffix.lower().lstrip("."), "derived": False,
+                            "strategy": {"operation": "original_bytes"}}
+            else:
+                directory.mkdir(parents=True, exist_ok=True)
+                prefix = f"{kind}-{source_sha}-{_VIDEO_REFERENCE_POLICY}"
+                marker = directory / (prefix + ".json")
+                with (directory / ".video-references.lock").open("a+b") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    if marker.exists() or marker.is_symlink():
+                        try:
+                            if marker.is_symlink() or not marker.is_file():
+                                raise ValueError("缓存标记无效")
+                            metadata = json.loads(marker.read_text(encoding="utf-8"))
+                            filename = metadata.get("path", "")
+                            if (not isinstance(filename, str)
+                                    or not re.fullmatch(re.escape(prefix) + r"\.(jpg|png|webp|wav)", filename)):
+                                raise ValueError("缓存路径无效")
+                            target = directory / filename
+                            if (target.is_symlink() or not target.is_file()
+                                    or metadata.get("source_sha256") != source_sha
+                                    or metadata.get("source_bytes") != source_size
+                                    or metadata.get("policy") != _VIDEO_REFERENCE_POLICY
+                                    or metadata.get("derived") is not True
+                                    or metadata.get("sha256") != _sha256(target)
+                                    or metadata.get("bytes") != target.stat().st_size
+                                    or not 0 < target.stat().st_size <= _VIDEO_REFERENCE_MAX_BYTES):
+                                raise ValueError("缓存哈希或大小不符")
+                            if kind == "images":
+                                actual = _transport_image_info(target)
+                                if (actual["width"] != metadata.get("width")
+                                        or actual["height"] != metadata.get("height")
+                                        or info["alpha"] and not actual["alpha"]):
+                                    raise ValueError("缓存图像信息不符")
+                            else:
+                                actual = probe(target)
+                                if (not actual["has_audio"] or actual["has_video"]
+                                        or actual["duration"] != metadata.get("duration")
+                                        or abs(actual["duration"] - info["duration"]) > .002
+                                        or actual["channels"] != info["channels"]):
+                                    raise ValueError("缓存音频信息不符")
+                            # Identical approved bytes at a new path may share
+                            # a derivative, but this invocation names its own
+                            # current source rather than a retired location.
+                            metadata = {**metadata, "source_path": str(source)}
+                        except (OSError, MediaError, ValueError, AttributeError, TypeError) as exc:
+                            raise MediaError("视频参考传输缓存已改变或不完整；原件未改变，停止提交。") from exc
+                    else:
+                        with tempfile.TemporaryDirectory(prefix=".nolan-video-reference-", dir=directory) as raw_temp:
+                            temporary = Path(raw_temp)
+                            if kind == "images":
+                                candidate, strategy = _encode_transport_image(source, info, temporary)
+                                actual = _transport_image_info(candidate)
+                                facts.update(width=actual["width"], height=actual["height"])
+                            else:
+                                candidate = temporary / "reference.wav"
+                                rate = min(info["sample_rate"], 48000)
+                                _ffmpeg(["-protocol_whitelist", "file,pipe", "-i", str(source),
+                                         "-map", "0:a:0", "-vn", "-sn", "-dn", "-map_metadata", "-1",
+                                         "-ar", str(rate), "-ac", str(info["channels"]),
+                                         "-c:a", "pcm_s16le", str(candidate)])
+                                actual = probe(candidate)
+                                if (not actual["has_audio"] or actual["has_video"]
+                                        or abs(actual["duration"] - info["duration"]) > .002
+                                        or actual["channels"] != info["channels"]
+                                        or not 0 < candidate.stat().st_size <= _VIDEO_REFERENCE_MAX_BYTES):
+                                    raise MediaError("音频压缩结果未保留时长或声道，未提交。")
+                                facts.update(duration=actual["duration"], sample_rate=actual["sample_rate"])
+                                strategy = {"format": "wav", "codec": "pcm_s16le", "sample_rate": rate,
+                                            "trimmed": False, "loudness_changed": False}
+                            if _sha256(source) != source_sha:
+                                raise MediaError("参考原件在传输准备期间发生改变；请重新核对审批。")
+                            filename = prefix + candidate.suffix
+                            target = directory / filename
+                            metadata = {**common, **facts, "path": filename,
+                                        "sha256": _sha256(candidate), "bytes": candidate.stat().st_size,
+                                        "format": strategy["format"], "strategy": strategy,
+                                        "derived": True, "policy": _VIDEO_REFERENCE_POLICY}
+                            candidate_marker = temporary / "reference.json"
+                            candidate_marker.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+                            if target.exists() or target.is_symlink():
+                                # A crash between publishing the file and its
+                                # marker leaves an orphan. Adopt it only when
+                                # it is exactly the freshly prepared bytes;
+                                # never overwrite an unexpected cached file.
+                                if (target.is_symlink() or not target.is_file()
+                                        or _sha256(target) != metadata["sha256"]):
+                                    raise MediaError("视频参考缓存发布位置已有不同内容；未覆盖文件或提交。")
+                            else:
+                                os.link(candidate, target)
+                            os.link(candidate_marker, marker)
+            if _sha256(source) != source_sha:
+                raise MediaError("参考原件在传输准备期间发生改变；请重新核对审批。")
+            prepared[kind].append(target)
+            manifest[kind].append(metadata)
+    manifest["source_bytes"] = sum(item["source_bytes"] for kind in ("images", "audio") for item in manifest[kind])
+    manifest["transport_bytes"] = sum(item["bytes"] for kind in ("images", "audio") for item in manifest[kind])
+    return prepared["images"], prepared["audio"], manifest
+
+
 @functools.lru_cache(maxsize=1)
 def _filters() -> str:
     return _run(["ffmpeg", "-hide_banner", "-filters"], timeout=30)

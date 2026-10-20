@@ -28,6 +28,16 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from .failures import sanitize_failure
 
+REQUEST_LIMIT_BYTES = 64_000_000
+
+
+def _request_body(payload: dict | None) -> bytes | None:
+    """One exact UTF-8 encoding for both local preflight and actual transport."""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    if body is not None and len(body) >= REQUEST_LIMIT_BYTES:
+        raise ProviderError("参考素材编码后的请求超过 64 MB，本机预检已阻止提交；请检查参考素材传输准备。")
+    return body
+
 
 class ProviderError(RuntimeError):
     safe_message = True
@@ -213,9 +223,7 @@ class ArkProvider:
         return model
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> tuple[dict, str]:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-        if body is not None and len(body) >= 64_000_000:
-            raise ProviderError("参考素材编码后的请求超过 64 MB，请减少或压缩参考图和音频。")
+        body = _request_body(payload)
         request = Request(self.base_url + path, data=body, method=method,
                           headers={"Authorization": "Bearer " + self._key(), "Content-Type": "application/json"})
         stage = "submission" if method == "POST" else "poll"
@@ -382,9 +390,9 @@ class ArkProvider:
         if sum(self._audio_duration(p) for p in audio_references) > 15.01:
             raise ProviderError("当前连续性流程的声音参考总时长不能超过 15 秒。")
 
-    def submit_video(self, prompt: str, duration: float, references: list[Path],
-                     previous_video: Path | str | None = None,
-                     audio_references: list[Path] | None = None) -> dict:
+    def _video_payload(self, prompt: str, duration: float, references: list[Path],
+                       previous_video: Path | str | None = None,
+                       audio_references: list[Path] | None = None) -> dict:
         watermark = self._video_watermark()
         refs, audio = list(references), list(audio_references or [])
         if not prompt.strip():
@@ -417,10 +425,35 @@ class ArkProvider:
             content.append({"type": "video_url", "video_url": {"url": video_url}, "role": "reference_video"})
         content.extend({"type": "audio_url", "audio_url": {"url": _data_uri(p, "audio", 15_000_000)},
                         "role": "reference_audio"} for p in audio)
-        payload = {"model": self._model("video"), "content": content, "duration": int(duration),
+        return {"model": self._model("video"), "content": content, "duration": int(duration),
                    "ratio": self.config.get("ratio", "16:9"), "resolution": self.config.get("resolution", "720p"),
                    "generate_audio": bool(self.config.get("generate_audio", True)), "watermark": watermark,
                    "return_last_frame": True}
+
+    def preflight_video_request(self, prompt: str, duration: float, references: list[Path],
+                                previous_video: Path | str | None = None,
+                                audio_references: list[Path] | None = None) -> dict:
+        """Validate the exact complete wire request before any reservation/POST.
+
+        Only byte counts and a digest escape this method; base64, signed URLs and
+        credentials are never persisted in the transport manifest.
+        """
+        payload = self._video_payload(prompt, duration, references, previous_video, audio_references)
+        body = _request_body(payload)
+        return {"request_bytes": len(body), "request_limit_bytes": REQUEST_LIMIT_BYTES,
+                "payload_sha256": hashlib.sha256(body).hexdigest()}
+
+    def submit_video(self, prompt: str, duration: float, references: list[Path],
+                     previous_video: Path | str | None = None,
+                     audio_references: list[Path] | None = None,
+                     expected_payload_sha256: str | None = None) -> dict:
+        payload = self._video_payload(prompt, duration, references, previous_video, audio_references)
+        body = _request_body(payload)
+        if expected_payload_sha256 is not None:
+            if (not isinstance(expected_payload_sha256, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", expected_payload_sha256)
+                    or hashlib.sha256(body).hexdigest() != expected_payload_sha256):
+                raise ProviderError("视频请求与本机预检的内容不一致，已在联网前停止；未提交付费任务。")
         result, request_id = self._request("POST", "/contents/generations/tasks", payload)
         if not isinstance(result.get("id"), str) or not result["id"]:
             failure = _remote_failure(result, stage="submission", uncertain=True, request_id=request_id,

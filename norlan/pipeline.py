@@ -536,6 +536,45 @@ def _poll_video(root, job_id, output):
         time.sleep(s["settings"]["poll_seconds"])
 
 
+def _prepare_video_transport(root, provider, kind, item_id, prompt, duration, references, audio_references,
+                             previous_video=None):
+    """Create traceable local copies and check the whole request before reserving."""
+    # Test/demo or other adapters without a real class implementation keep
+    # their existing path; a dynamically generated Mock method is not an API.
+    if not callable(getattr(type(provider), "preflight_video_request", None)):
+        return references, audio_references, None
+    from .providers import ProviderError
+    directory = Path(root) / "media" / "reference-transports"
+    try:
+        images, audio, manifest = media.prepare_video_references(references, audio_references, directory)
+    except (media.MediaError, ValueError, OSError) as exc:
+        raise ProviderError(str(exc)) from None
+    state = core.load_project(root)
+    obj = core._find(state, "asset" if kind == "voice" else "shot", item_id)
+    source_manifest = obj.get("reference_manifest", {}) if kind == "video" and obj.get("prompt_approval") else None
+    for key, paths, prepared, info_key in (("images", references, images, "image_references"),
+                                          ("audio", audio_references, audio, "audio_references")):
+        rows = manifest.get(key, [])
+        if len(paths) != len(rows) or len(prepared) != len(paths):
+            raise ProviderError("传输准备后的参考素材数量不符；未提交，也未省略任何参考。")
+        expected_files = source_manifest.get(key, []) if source_manifest else None
+        expected_info = source_manifest.get("context", {}).get(info_key, []) if source_manifest else None
+        if source_manifest and (len(expected_files) != len(paths) or len(expected_info) != len(paths)):
+            raise ProviderError("本次传输素材与已确认的原始清单不符，未提交。")
+        for index, (original, target, row) in enumerate(zip(paths, prepared, rows)):
+            if (row.get("source_sha256") != core.digest(original)
+                    or row.get("sha256") != core.digest(target)):
+                raise ProviderError("参考原件或传输副本在准备后发生变化，未提交。")
+            if source_manifest and (core.safe_path(root, expected_files[index]) != Path(original).resolve()
+                                    or expected_info[index].get("sha256") != row["source_sha256"]):
+                raise ProviderError("传输素材与已批准版本不一致，未提交。")
+            row["source_path"], row["path"] = _rel(root, original), _rel(root, target)
+    checked = provider.preflight_video_request(prompt, duration, images, previous_video=previous_video,
+                                               audio_references=audio)
+    manifest.update(checked)
+    return images, audio, manifest
+
+
 def _video(root, kind, item_id, output, duration, prompt, references, audio_references=None, old_job=None,
            previous_video=None, reference_duration=0):
     s = _gate(root)
@@ -568,6 +607,10 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
         validate_inputs = getattr(provider, "validate_video_inputs", None)
         if callable(validate_inputs):
             validate_inputs(duration, references, audio_references or [], previous_video)
+    transport = None
+    if provider:
+        references, audio_references, transport = _prepare_video_transport(
+            root, provider, kind, item_id, prompt, duration, references, audio_references or [], previous_video)
     job_id = f"{kind}-{item_id}-{uuid.uuid4().hex[:8]}"
     if previous_video is not None and (isinstance(reference_duration, bool)
             or not isinstance(reference_duration, (int, float)) or not math.isfinite(reference_duration)
@@ -596,6 +639,8 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
         current["jobs"][job_id]["video_request"] = {
             key: config[key] for key in ("video_model", "ratio", "resolution", "generate_audio", "video_watermark")
             if key in config}
+        if transport is not None:
+            current["jobs"][job_id]["reference_transport"] = copy.deepcopy(transport)
         if kind == "voice":
             current["jobs"][job_id]["audition_profile"] = copy.deepcopy(obj.get("audition_profile", {}))
             current["jobs"][job_id]["duration"] = duration
@@ -607,15 +652,20 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
     try:
         _job_progress(root, {"kind": kind, "item_id": item_id}, "shot_submission")
         video_options = {"audio_references": audio_references or []}
+        if transport is not None:
+            video_options["expected_payload_sha256"] = transport["payload_sha256"]
         if previous_video is not None:
             video_options["previous_video"] = previous_video
         result = provider.submit_video(prompt, duration, references, **video_options)
     except Exception as exc:
         uncertain = getattr(exc, "uncertain", True)
         detail = {**exception_failure(exc, "submission"), "uncertain": uncertain}
+        local_only = (uncertain is False and detail.get("stage") == "local_validation"
+                      and not any(detail.get(key) for key in ("request_id", "http_status", "provider_code")))
         _record_video_failure(root, job_id, detail,
                               state="uncertain" if uncertain else "failed",
-                              accounting="unknown" if uncertain else "spent")
+                              accounting="unknown" if uncertain else "released" if local_only else "spent",
+                              submission_status="not_submitted" if local_only else "unknown" if uncertain else "rejected")
         raise
     core.update_job(root, job_id, state="submitted", task_id=result["id"],
                     request_id=sanitize_failure({"request_id": result.get("request_id")}).get("request_id"), failure=None)
@@ -1108,7 +1158,10 @@ def _shot(root, ep_id, shot_id, previous):
     if not recovering:
         _new_work_gate(s)
         _progress(root, ep_id, "shot_preparation", shot_id)
-        if not (approved_candidate and approved_candidate.get("manual_prompt")):
+        if not approved_candidate:
+            # A validated human-approved candidate already binds its asset
+            # routing and revision result. Re-running them could rewrite a
+            # locally restored request after the user's final confirmation.
             shot = _system_voice_reference(root, shot)
             if core.resolve_completed_asset_feedback(root, shot_id):
                 shot = core._find(core.load_project(root), "shot", shot_id)
@@ -1609,6 +1662,9 @@ def run(root):
                         or not all(core.human_approved_shot(sh) for sh in manual["shots"])):
                     raise core.GateError("先逐段批准本集视频，再手动调整本集字幕或配乐。")
                 _episode(root, manual["id"])
+                return core.load_project(root)
+            from .local_submission import recover_oversized_requests
+            if recover_oversized_requests(root, already_locked=True):
                 return core.load_project(root)
             recovered = _recover(root)
             s = _gate(root)

@@ -320,6 +320,11 @@ def _public_prompt_candidate(value, shot=None, state=None):
     if state is not None:
         from .video_models import options
         result["model_options"] = options(state, shot, value)
+    recovery = (shot or {}).get("local_submission_recovery", {})
+    if recovery.get("candidate_id") == value.get("id"):
+        note = recovery.get("public_summary")
+        if isinstance(note, str) and 0 < len(note) <= 800:
+            result["recovery_note"] = note
     if "broadcast_proposal" in value:
         result["broadcast_proposal"] = _public_broadcast_proposal(value, shot)
     if "timing_proposal" in value:
@@ -1382,6 +1387,14 @@ def public_state(state: dict) -> dict:
             model = _public_generation_model(state, shot)
             if model:
                 entry["generation_model"] = model
+            transport = _bound_shot_job(state, shot).get("reference_transport")
+            if isinstance(transport, dict):
+                counts = {key: transport.get(key) for key in ("source_bytes", "transport_bytes", "request_bytes")}
+                if all(type(number) is int and number >= 0 for number in counts.values()):
+                    entry["reference_transport"] = {**counts,
+                        "image_count": len(transport.get("images", [])), "audio_count": len(transport.get("audio", [])),
+                        "derived_images": sum(row.get("derived") is True for row in transport.get("images", [])
+                                              if isinstance(row, dict))}
             manual_prompt = _public_manual_prompt(shot)
             if manual_prompt is not None:
                 entry.update(prompt=manual_prompt, manual_prompt=True)

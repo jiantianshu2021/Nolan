@@ -84,9 +84,21 @@ def fake_media():
         return list(paths), [{"source_sha256": core.digest(p), "sha256": core.digest(p),
                               "trim_start": 0, "trim_duration": 4, "derived": False} for p in paths]
 
+    def video_references(images, audio, directory):
+        # Synthetic fixture bytes are deliberately not decodable pictures or
+        # sound. Preserve identity here; real FFmpeg transport behavior has its
+        # own integration tests rather than weakening production validation.
+        rows = lambda paths: [{"source_path": str(p), "path": str(p),
+            "source_sha256": core.digest(p), "sha256": core.digest(p),
+            "source_bytes": Path(p).stat().st_size, "bytes": Path(p).stat().st_size,
+            "derived": False, "synthetic": True} for p in paths]
+        return list(images), list(audio), {"version": 1, "synthetic": True,
+            "images": rows(images), "audio": rows(audio)}
+
     with ExitStack() as stack:
         for name, fn in {"synthetic_asset": asset, "synthetic_clip": clip, "extract_evidence": evidence,
                          "compose": compose, "prepare_voice_references": voice_references,
+                         "prepare_video_references": video_references,
                          "probe": lambda p: {"duration": 4, "has_video": True, "has_audio": True}}.items():
             stack.enter_context(patch.object(pipeline.media, name, side_effect=fn))
         yield
@@ -338,7 +350,9 @@ class PipelineTests(unittest.TestCase):
             self.ready()
             self.live()
             api = Mock()
-            api.submit_video.side_effect = ProviderError("rejected", uncertain=False)
+            # This fixture represents a remote rejection after submission,
+            # distinct from a proven pre-network local validation refusal.
+            api.submit_video.side_effect = ProviderError("rejected", uncertain=False, stage="submission")
             refinement = {"prompt": "new", "dialogue": "", "continuity_notes": "none"}
             def brain(root, method, *args, **kwargs):
                 if method == "plan_revision":

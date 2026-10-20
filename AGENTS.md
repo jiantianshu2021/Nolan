@@ -43,6 +43,16 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
 - Keep keys out of project state, logs, tests and version control.
 - Use argv for subprocesses, never shell commands from GPT output.
 - Keep original media immutable and decisions bound to version and file hash.
+- Prepare source-hash-bound transport copies without removing/reordering any
+  references. Preserve source dimensions where possible, image alpha and audio
+  duration/channels; never alter approved originals or official tail frames.
+  Validate exact encoded request size before reserving and verify the same
+  payload digest immediately before POST. Keep only counts/digests/provenance,
+  never base64 bodies or signed video URLs, in the ledger/UI.
+  Proven pre-network local refusals release only their reservation. Legacy
+  refunds require the exact known local failure and absence of all remote,
+  usage/bill/output evidence; preserve the failed record and restore a fresh
+  human prompt gate. Never loosen generic spent-accounting or retry protections.
 - Show the current final export directly in the episode postproduction panel,
   with its human approval and subtitle/music feedback together. Never substitute
   a dry cut or retired export for the current final preview.
