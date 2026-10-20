@@ -302,13 +302,42 @@ def _captions(root, ep, dry, brain_call, gate):
     passed = report_matches(report, checked, audio_sha256=audio_hash, source_key=pp["source_key"])
     subtitles = {**base, "status": "ready" if passed else "needs_attention", "segments": checked,
                  "sync_check": report, "sync_metadata": verifier.last_metadata}
+    # A script/spelling correction can change a spoken word. Moving its clock
+    # cannot repair that conflict. Try the original audio-derived wording once,
+    # only when independently supported; never reset the timing-repair budget.
+    if not passed:
+        from .subtitle_text_recovery import recover_audio_text
+        recovery_key = _hash({"policy": 1, "proofread_key": key, "raw": raw,
+            "audio": audio_hash, "source": pp["source_key"], "checker": verifier.identity})
+        old_recovery = stored.get("text_recovery", {})
+        if old_recovery.get("key") == recovery_key:
+            subtitles["text_recovery"] = copy.deepcopy(old_recovery)
+        else:
+            recovered, audit = recover_audio_text(checked, raw,
+                verify=lambda cues: verifier.verify(audio, cues), duration=media.probe(audio)["duration"],
+                audio_sha256=audio_hash, source_key=pp["source_key"], checker_identity=verifier.identity)
+            audit["key"] = recovery_key
+            subtitles["text_recovery"] = audit
+            if audit.get("status") == "recovered":
+                subtitles["previous_sync_check"] = copy.deepcopy(report)
+                checked = recovered
+                report = copy.deepcopy(audit["final_report"])
+                report.update(attempts=subtitles["sync_check"]["attempts"],
+                    input_caption_hash=subtitles["sync_check"]["input_caption_hash"])
+                passed = report_matches(report, checked, audio_sha256=audio_hash, source_key=pp["source_key"])
+                subtitles.update(status="ready" if passed else "needs_attention", segments=checked,
+                    sync_check=report, sync_metadata=verifier.last_metadata)
+    elif stored.get("text_recovery"):
+        subtitles["text_recovery"] = copy.deepcopy(stored["text_recovery"])
+        subtitles["previous_sync_check"] = copy.deepcopy(stored.get("previous_sync_check"))
     _save(root, ep["id"], subtitle_proofread_key=key,
           subtitle_key=_hash({"proofread_key": key, "segments": checked, "sync_check": report}), subtitles=subtitles)
     if not passed:
         _wait(root, ep["id"], "subtitle_sync_needs_attention", subtitles=subtitles)
-        if pp.get("revision_target") == "manual_music":
-            return checked
-        return None
+        # Evidence uncertainty blocks approval, not the ability to inspect a
+        # burned diagnostic preview. The final manifest still binds the failed
+        # report, and check_final remains the authoritative approval gate.
+        return checked
     return checked
 
 
@@ -527,6 +556,23 @@ def _finish(root, ep, *, brain_call, gate, soundtrack):
     source = [{"id": sh["id"], "version": sh["version"], "sha256": sh["sha256"]} for sh in ep["shots"]]
     source_key = _hash(source)
     pp = ep.get("postproduction", {})
+    # A diagnostic export is reusable evidence, not permission to repeat local
+    # work or spend on another music arrangement when Continue is pressed.
+    if (pp.get("preview_kind") == "subtitle_diagnostic"
+            and pp.get("status") == "subtitle_sync_needs_attention"
+            and pp.get("source_key") == source_key and pp.get("final_ready")
+            and pp.get("final_file") == ep.get("file") and pp.get("final_version") == ep.get("version")
+            and pp.get("final_sha256") == ep.get("sha256")
+            and ep.get("render_manifest", {}).get("postproduction", {}).get("revision") == pp.get("revision", 0)
+            and ep.get("render_manifest", {}).get("postproduction", {}).get("subtitle_sync_hash")
+                == _hash(pp.get("subtitles", {}).get("sync_check"))
+            and ep.get("render_manifest", {}).get("postproduction", {}).get("subtitle_content_hash")
+                == _hash(pp.get("subtitles", {}).get("segments"))
+            and core.digest(core.safe_path(root, ep["file"])) == ep["sha256"]):
+        with core.transaction(root) as current:
+            core._find(current, "episode", ep["id"])["status"] = "awaiting_review"
+            current.update(status="awaiting_postproduction", last_error=None)
+        return False
     if (pp.get("revision_target") in {"manual_music", "manual_subtitles"}
             and pp.get("source_key") != source_key):
         raise core.GateError("本集源片段已变化，请先更新后期，再编辑当前版本。")
@@ -643,7 +689,8 @@ def _finish(root, ep, *, brain_call, gate, soundtrack):
                 audio_sha256=pp["subtitles"]["audio_sha256"], source_key=source_key))
         mix_passed = not music_mix or mix_report.get("status") in {"passed", "manual"}
         pp.update(status=("awaiting_final_approval" if mix_passed else "music_mix_needs_attention") if sync_passed else "subtitle_sync_needs_attention",
-                  manual_preview=not sync_passed, final_ready=True, final_file=_rel(root, out),
+                  manual_preview=not sync_passed, preview_kind="final" if sync_passed else "subtitle_diagnostic",
+                  final_ready=True, final_file=_rel(root, out),
                   final_sha256=core.digest(out), final_version=version, missing_configuration=[])
         pp["music"].update(credits_file=_rel(root, credits["file"]), credits_sha256=credits["sha256"])
         pp["subtitles"]["file"] = _rel(root, result["subtitles"]) if result.get("subtitles") else None
@@ -674,6 +721,8 @@ def check_final(root, state, ep):
     from .subtitle_sync import report_matches, manual_report_matches
     pp = ep.get("postproduction", {})
     manifest = ep.get("render_manifest", {}).get("postproduction", {})
+    if pp.get("preview_kind") == "subtitle_diagnostic":
+        raise core.GateError("字幕同步自动检查尚未通过，待核验预览不能最终批准；请先处理字幕。")
     source = [{"id": sh["id"], "version": sh["version"], "sha256": sh["sha256"]} for sh in ep["shots"]]
     sub = pp.get("subtitles", {})
     report = sub.get("sync_check", {})

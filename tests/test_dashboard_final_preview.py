@@ -209,6 +209,54 @@ assert.ok(preview.querySelector('.subtitle-sync-approval-blocked').textContent.i
 assert.equal(card.querySelector('.final-approval'),null);assert.equal(actions.length,0);
 ''')
 
+    def test_diagnostic_preview_is_burned_and_viewable_without_manual_or_passed_claim(self):
+        self.run_dom(r'''
+episode.postproduction.manual_preview=true;episode.postproduction.final_ready=false;
+episode.postproduction.preview_kind='subtitle_diagnostic';episode.postproduction.status='subtitle_sync_needs_attention';
+episode.postproduction.subtitles.sync_check={status:'needs_attention',summary:'两轮后仍有疑点',attempts:2,max_attempts:2,issues:[{start:6,end:8,reason:'字幕边界待核验'}]};
+const card=episodeCard(episode,0),preview=card.querySelector('.postproduction-final-preview'),report=card.querySelector('.subtitle-sync-report');nodes.set(preview.id,preview);nodes.set(report.id,report);
+assert.equal(preview.querySelector('.final-preview-title').textContent,'字幕待核验预览');
+assert.equal(preview.querySelector('video').src,'/media/exports/E1-v4.mp4');
+assert.equal(preview.querySelector('a').textContent,'下载字幕待核验预览');
+assert.equal(preview.querySelector('a').href,preview.querySelector('video').src);
+assert.ok(preview.querySelector('.final-media-status').textContent.includes('字幕已烧录'));
+assert.ok(preview.querySelector('.subtitle-sync-approval-blocked').textContent.includes('同步检查尚未通过'));
+assert.equal(walk(preview).some(node=>node.textContent.includes('手动调整')),false);
+assert.equal(walk(preview).some(node=>node.textContent.includes('字幕自动检查通过')),false);
+assert.equal(card.querySelector('.final-approval'),null);
+assert.equal(preview.querySelectorAll('.postproduction-feedback').length,2);
+paintPostproductionStatus(state);assert.equal(nodes.get('status').textContent,'字幕已烧录，等待核验');assert.equal(nodes.get('run').textContent,'查看字幕待核验预览');
+nodes.get('run').listeners.click();assert.equal(preview.scrolls.length,1);assert.equal(preview.focuses.length,1);assert.equal(Boolean(report.open),false);assert.equal(actions.length,0);
+const locate=walk(card).find(node=>node.tag==='button'&&node.textContent==='查看字幕检查报告');locate.listeners.click();assert.equal(report.open,true);assert.equal(actions.length,0);
+// Defensive: a contradictory incoming flag must not expose a diagnostic approval.
+episode.postproduction.final_ready=true;episode.postproduction.subtitles.sync_check.status='passed';
+assert.equal(episodeCard(episode,0).querySelector('.final-approval'),null);
+''')
+
+    def test_audio_text_recovery_notice_shows_collapsed_before_after_and_human_listening_limit(self):
+        self.run_dom(r'''
+episode.postproduction.subtitles.text_recovery={status:'recovered',change_count:1,changes:[{cue_index:13,start:70.76,end:71.51,before:{text:'账我看了。'},after:{text:'让我看了'}}],limitations:'PRIVATE-UNTRUSTED'};
+const card=episodeCard(episode,0),report=card.querySelector('.subtitle-sync-report'),recovery=report.querySelector('.subtitle-text-recovery');
+assert.ok(recovery);assert.equal(recovery.tag,'details');assert.equal(Boolean(recovery.open),false);
+assert.equal(recovery.children[0].textContent,'已按音轨恢复 1 条文字');
+assert.ok(walk(recovery).some(node=>node.textContent==='第 14 条：账我看了。 → 让我看了'));
+assert.ok(walk(recovery).some(node=>node.textContent==='70.76–71.51 秒 · '));
+assert.ok(walk(recovery).some(node=>node.textContent.includes('机器识别仍可能听错')));
+assert.ok(walk(recovery).some(node=>node.textContent.includes('人工听验')));
+assert.equal(walk(recovery).some(node=>node.textContent.includes('PRIVATE-')),false);
+assert.ok(card.querySelector('.subtitle-text-recovery-notice').textContent.includes('前后对照'));
+assert.ok(card.querySelector('.final-approval'),'recovery still leaves explicit final human approval');
+assert.equal(actions.length,0);
+''')
+
+    def test_invalid_recovery_fields_do_not_advertise_a_recovered_result(self):
+        self.run_dom(r'''
+for(const recovery of [{status:'recovered',change_count:1,changes:[null]},{status:'failed',change_count:1,changes:[]},{status:'recovered',change_count:true,changes:[]},{status:'recovered',change_count:1,changes:[{cue_index:0,before:{text:{html:'PRIVATE-INJECT'}},after:{text:'让我看了'}}]}]){
+ episode.postproduction.subtitles.text_recovery=recovery;
+ const card=episodeCard(episode,0);assert.equal(card.querySelector('.subtitle-text-recovery'),null);assert.equal(card.querySelector('.subtitle-text-recovery-notice'),null);
+}assert.equal(actions.length,0);
+''')
+
     def test_manual_adoption_is_final_human_verification_without_automatic_recheck_claim(self):
         self.run_dom(r'''
 episode.postproduction.subtitles.sync_check={status:'manual',summary:'采用你输入的字幕文字和时间，不再自动复检。',attempts:2,max_attempts:2,checked_cues:3,total_cues:3,issues:[]};

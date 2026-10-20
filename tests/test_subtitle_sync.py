@@ -105,6 +105,21 @@ class SubtitleSyncTests(unittest.TestCase):
         observed["cues"][0]["consistent"] = False
         self.assertFalse(self.matches(self.evaluate(observations=observed)))
 
+    def test_checker_upgrade_rechecks_without_resetting_exhausted_repair_budget(self):
+        observed = self.observations()
+        observed["cues"][0]["consistent"] = False
+        _, previous = self.call_engine(verify=Mock(return_value=observed), repair=lambda c, r, a: c)
+        self.assertEqual(previous["attempts"], 2)
+        self.binding["checker_identity"] = {"engine": "synthetic-upgraded-independent-checker"}
+        upgraded = self.observations()
+        upgraded["cues"][0]["consistent"] = False
+        verify, repair = Mock(return_value=upgraded), Mock()
+        _, report = self.call_engine(previous_report=previous, verify=verify, repair=repair)
+        self.assertEqual(report["attempts"], 2)
+        self.assertEqual(report["status"], "needs_attention")
+        verify.assert_called_once()
+        repair.assert_not_called()
+
     def test_missing_or_same_vad_or_dtw_evidence_never_passes(self):
         for method in (None, "vad", "dtw", "original_captions", "spelling_proofreading"):
             observed = self.observations()

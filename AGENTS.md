@@ -70,6 +70,13 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   Keep prior exports and provenance.
 - Prefer nearby scripted dialogue for caption text, then verify against actual
   audio. Do not add unspoken lines or overwrite differing numbers from a script.
+  If automatic spelling changes fail acoustic support, a bounded original-ASR
+  text recovery must require unique same-clock mapping, full independent
+  support and no new problems elsewhere. Preserve failed reports and used
+  timing-repair attempts; never apply this to explicit manual edits. A burned
+  diagnostic preview may show unresolved captions, but cannot open final approval
+  or repeat rendering/arrangement on ordinary Continue. Check subtitle filter
+  and CJK font capability before normalizing clips for a requested hard burn.
 - Automatic episode music uses source-hash-bound local acoustic analysis for
   excerpt choices, a shared track loudness reference, and bounded ducking only
   in verified speech windows. Check the rendered mix numerically and allow at

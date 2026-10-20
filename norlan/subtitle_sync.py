@@ -307,11 +307,11 @@ def run_sync(captions: list[dict], *, verify: Callable[[list[dict]], dict],
     current = canonical_captions(captions, duration)
     _binding(audio_sha256, source_key, checker_identity)
     bound = (_report_bound(previous_report, current, audio_sha256=audio_sha256,
-                           source_key=source_key, allow_initial=True)
-             and previous_report.get("checker_identity") == checker_identity)
-    if bound and report_matches(previous_report, current, audio_sha256=audio_sha256, source_key=source_key):
+                           source_key=source_key, allow_initial=True))
+    same_checker = bound and previous_report.get("checker_identity") == checker_identity
+    if same_checker and report_matches(previous_report, current, audio_sha256=audio_sha256, source_key=source_key):
         return current, deepcopy(previous_report)
-    if bound and previous_report.get("status") == "needs_attention" and previous_report["attempts"] >= MAX_ATTEMPTS:
+    if same_checker and previous_report.get("status") == "needs_attention" and previous_report["attempts"] >= MAX_ATTEMPTS:
         return current, deepcopy(previous_report)
     attempts = previous_report["attempts"] if bound else 0
     initial_hash = previous_report.get("input_caption_hash", caption_hash(current)) if bound else caption_hash(current)

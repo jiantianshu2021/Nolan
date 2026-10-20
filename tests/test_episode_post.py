@@ -349,24 +349,82 @@ class EpisodePostTests(unittest.TestCase):
             result["cues"][0]["consistent"] = False
             return result
         self.verifier.verify.side_effect = uncertain
-        self.assertFalse(self.finish())
+        self.assertTrue(self.finish())
         post = self.episode()["postproduction"]
         self.assertEqual(post["status"], "subtitle_sync_needs_attention")
         self.assertEqual(post["subtitles"]["sync_check"]["attempts"], 2)
-        self.assertFalse(post["final_ready"])
-        self.assertNotIn("file", self.episode())
+        self.assertTrue(post["final_ready"])
+        self.assertEqual(post["preview_kind"], "subtitle_diagnostic")
+        self.assertTrue(self.episode()["subtitles_burned"])
+        self.assertTrue(core.safe_path(self.root, self.episode()["file"]).is_file())
+        with self.assertRaisesRegex(core.GateError, "字幕同步自动检查尚未通过"):
+            episode_post.check_final(self.root, core.load_project(self.root), self.episode())
+        verify_count = self.verifier.verify.call_count
+        export = self.episode()["file"]
         self.assertFalse(self.finish())
-        self.assertEqual(self.verifier.verify.call_count, 3)
+        self.assertEqual(self.verifier.verify.call_count, verify_count)
+        self.assertEqual(self.episode()["file"], export)
         self.assertEqual(self.verifier.repair.call_count, 2)
         self.assertEqual(len(self.calls("proofread_subtitles")), 1)
-        self.assertFalse(self.calls("arrange_music"))
+        self.assertEqual(len(self.calls("arrange_music")), 1)
         self.assertEqual(self.shots(), original)
+        # Production marks the episode generating before reentering finish.
+        # Reusing a diagnostic must restore the viewable review state each time.
+        from norlan import pipeline, dashboard
+        with core.transaction(self.root) as state:
+            state["episodes"][0]["reviews"] = []
+            # Public projection uses the current list-shaped attempt history.
+            for shot in state["episodes"][0]["shots"]:
+                shot["attempts"] = []
+        synthetic_cut = {"key": "synthetic-cached-diagnostic-cut", "sha256": "e" * 64,
+                         "review_skipped": {"reason": "disabled", "sha256": "e" * 64}}
+        with patch.object(pipeline, "_gate", side_effect=core.load_project), \
+                patch.object(pipeline, "_shot", return_value=True), \
+                patch.object(pipeline, "_rough_cut", return_value=synthetic_cut):
+            for _ in range(2):
+                pipeline._episode(self.root, "E001")
+                self.assertEqual(self.episode()["status"], "awaiting_review")
+                public = dashboard.public_state(core.load_project(self.root))["episodes"][0]
+                self.assertTrue(public["postproduction"]["final_available"])
+                self.assertFalse(public["postproduction"]["final_ready"])
+        self.assertEqual(self.verifier.verify.call_count, verify_count)
         # An explicit new subtitle opinion starts a new bounded repair cycle.
         ep = self.episode()
         episode_post.request(self.root, ep["id"], ep["version"], "subtitles", "重新检查这句实际声音")
         self.verifier.verify.side_effect = self.sync_observations
         self.assertTrue(self.finish())
         self.assertEqual(self.episode()["postproduction"]["subtitles"]["sync_check"]["attempts"], 0)
+        self.soundtrack.assert_not_called()
+
+    def test_spelling_conflict_can_restore_audio_text_without_resetting_repair_budget(self):
+        self.import_music(approve=True)
+        self.raw[0]["text"] = "让我看了"
+        self.asr.transcribe.return_value = copy.deepcopy(self.raw)
+        def script_spelling(root, method, *args, **kwargs):
+            result = self.brain_response(root, method, *args, **kwargs)
+            if method == "proofread_subtitles":
+                result[0]["text"] = "账我看了。"
+            return result
+        self.brain.side_effect = script_spelling
+        def words_from_audio(audio, captions):
+            result = self.sync_observations(audio, captions)
+            for row in result["cues"]:
+                row["boundary_supported"] = True
+            if captions[0]["text"] != self.raw[0]["text"]:
+                result["cues"][0].update(coverage=.75, consistent=False, boundary_supported=False)
+            return result
+        self.verifier.verify.side_effect = words_from_audio
+        original_shots = self.shots()
+        self.assertTrue(self.finish())
+        subtitles = self.episode()["postproduction"]["subtitles"]
+        self.assertEqual(subtitles["segments"][0]["text"], self.raw[0]["text"])
+        self.assertEqual(subtitles["sync_check"]["status"], "passed")
+        self.assertEqual(subtitles["sync_check"]["attempts"], 2)
+        self.assertEqual(subtitles["previous_sync_check"]["status"], "needs_attention")
+        self.assertEqual(subtitles["text_recovery"]["status"], "recovered")
+        self.assertEqual(self.shots(), original_shots)
+        self.assertEqual(self.episode()["status"], "awaiting_review")
+        episode_post.check_final(self.root, core.load_project(self.root), self.episode())
         self.soundtrack.assert_not_called()
 
     def test_missing_or_changed_sync_report_blocks_final_human_approval(self):

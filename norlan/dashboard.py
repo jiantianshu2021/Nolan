@@ -1010,6 +1010,52 @@ def _public_music_mix_report(value: object, *, current: bool | None = None) -> d
     return result
 
 
+def _public_subtitle_text_recovery(value, captions, *, audio_sha256, source_key):
+    """Publish only bound, reversible text changes, never the acoustic audit."""
+    from .subtitle_sync import canonical_captions, caption_hash
+    from .subtitle_text_recovery import LIMITATIONS, SCHEMA
+    if (not isinstance(value, dict) or value.get("schema") != SCHEMA
+            or value.get("status") != "recovered" or type(value.get("policy")) is not int
+            or value["policy"] != 1 or not _valid_sha(audio_sha256) or not _valid_sha(source_key)
+            or value.get("source_audio_sha256") != audio_sha256 or value.get("source_key") != source_key
+            or not _valid_sha(value.get("input_caption_hash"))
+            or not _valid_sha(value.get("output_caption_hash"))):
+        return None
+    changes = value.get("changes")
+    if not isinstance(changes, list) or not 1 <= len(changes) <= 2000:
+        return None
+    try:
+        current = canonical_captions(captions, 3600)
+        if caption_hash(current) != value["output_caption_hash"]:
+            return None
+        previous = [dict(cue) for cue in current]
+        safe_changes, indices = [], set()
+        from .failures import sanitize_failure
+        for change in changes:
+            if not isinstance(change, dict):
+                return None
+            index = change.get("cue_index")
+            if type(index) is not int or not 0 <= index < len(current) or index in indices:
+                return None
+            before = canonical_captions([change.get("before")], 3600)[0]
+            after = canonical_captions([change.get("after")], 3600)[0]
+            if (after != current[index] or before["text"] == after["text"]
+                    or any(before[key] != after[key] for key in ("start", "end"))):
+                return None
+            indices.add(index)
+            previous[index] = before
+            if len(safe_changes) < 20:
+                safe_changes.append({"cue_index": index, "start": after["start"], "end": after["end"],
+                    "before": {"text": sanitize_failure({"message": before["text"][:1200]})["message"]},
+                    "after": {"text": sanitize_failure({"message": after["text"][:1200]})["message"]}})
+        if caption_hash(previous) != value["input_caption_hash"]:
+            return None
+    except (TypeError, ValueError, KeyError, IndexError):
+        return None
+    return {"status": "recovered", "change_count": len(changes), "changes": safe_changes,
+            "limitations": LIMITATIONS}
+
+
 def _public_postproduction(state: dict, episode: dict) -> dict:
     """Only the editing plan and bounded human-facing diagnostics reach the page."""
     from .failures import sanitize_failure
@@ -1025,6 +1071,10 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
     shots = episode.get("shots", [])
     result["ready"] = bool(shots) and all(human_approved_shot(shot) for shot in shots)
     result["manual_preview"] = value.get("manual_preview") is True
+    # Diagnostic exports are viewable without claiming that automatic subtitle
+    # timing checks passed or that the user manually adopted the timings.
+    if value.get("preview_kind") == "subtitle_diagnostic":
+        result["preview_kind"] = "subtitle_diagnostic"
     # A previous export may remain on the episode during postproduction rework.
     # Publish a final preview only when its saved identity is the current export,
     # rather than letting the UI fall back to the dry cut or a retired version.
@@ -1038,7 +1088,8 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
     result["final_available"] = bool(result["enabled"] and result["ready"]
         and value.get("final_ready") is True
         and (value.get("status") in {"awaiting_final_approval", "approved", "music_mix_needs_attention"}
-             or (result["manual_preview"] and value.get("status") == "subtitle_sync_needs_attention"))
+             or ((result["manual_preview"] or result.get("preview_kind") == "subtitle_diagnostic")
+                 and value.get("status") == "subtitle_sync_needs_attention"))
         and episode.get("status") in {"awaiting_review", "approved"}
         and final_path_ok and final_file == episode.get("file")
         and type(final_version) is int and final_version > 0
@@ -1068,7 +1119,8 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
         except (TypeError, ValueError):
             mix_current = False
     mix_passed = mix_current is None or (mix_current and mix_report.get("status") in {"passed", "manual"})
-    result["final_ready"] = result["final_available"] and sync_current and mix_passed
+    result["final_ready"] = (result["final_available"] and sync_current and mix_passed
+                             and result.get("preview_kind") != "subtitle_diagnostic")
     if result["final_available"]:
         result.update(final_file=final_file, final_version=final_version, final_sha256=final_sha256)
     result["missing_configuration"] = [sanitize_failure({"message": text})["message"] for text in value.get("missing_configuration", [])
@@ -1101,6 +1153,10 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
             segments = source.get("segments", source.get("cues", []))
             item["segments"] = [_pick(cue, ("start", "end", "text")) for cue in segments
                                 if isinstance(cue, dict)][:2000] if isinstance(segments, list) else []
+            recovery = _public_subtitle_text_recovery(source.get("text_recovery"), source.get("segments", []),
+                audio_sha256=source.get("audio_sha256"), source_key=value.get("source_key"))
+            if recovery is not None:
+                item["text_recovery"] = recovery
             for report_key in ("sync_check", "previous_sync_check"):
                 report = _public_subtitle_sync_report(source.get(report_key),
                     current=sync_current if report_key == "sync_check" else None)

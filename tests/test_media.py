@@ -4,7 +4,9 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
+from norlan import media
 from norlan.media import MediaError, compose, extract_evidence, probe, synthetic_asset, synthetic_clip
 
 
@@ -55,6 +57,76 @@ class MediaTests(unittest.TestCase):
             return sum(value * value for value in region) / len(region)
         self.assertLess(power(0.05, 0.25), 1e-7)
         self.assertGreater(power(0.55, 0.8), 1e-5)
+
+    def test_missing_subtitle_filter_refuses_before_media_processing(self):
+        source = self.root / "synthetic-input.mp4"
+        source.write_bytes(b"synthetic placeholder; must not be probed")
+        output = self.root / "missing-filter.mp4"
+        with patch.object(media, "_has_filter", return_value=False), \
+                patch.object(media, "_font_path") as font, \
+                patch.object(media, "probe") as probe_mock, \
+                patch.object(media, "_ffmpeg") as render:
+            with self.assertRaisesRegex(MediaError, "subtitles.*libass") as raised:
+                compose([source], output, [{"start": 0, "end": 1, "text": "合成字幕"}])
+        self.assertTrue(raised.exception.safe_message)
+        font.assert_not_called()
+        probe_mock.assert_not_called()
+        render.assert_not_called()
+        self.assertFalse(output.exists())
+        self.assertFalse(output.with_suffix(".srt").exists())
+        self.assertEqual(source.read_bytes(), b"synthetic placeholder; must not be probed")
+
+    def test_missing_cjk_font_refuses_before_media_processing(self):
+        source = self.root / "synthetic-input.mp4"
+        source.write_bytes(b"synthetic placeholder; must not be probed")
+        with patch.object(media, "_has_filter", return_value=True), \
+                patch.object(media, "_font_path", return_value=None) as font, \
+                patch.object(media, "probe") as probe_mock, \
+                patch.object(media, "_ffmpeg") as render:
+            with self.assertRaisesRegex(MediaError, "中文字体") as raised:
+                compose([source], self.root / "missing-font.mp4",
+                        [{"start": 0, "end": 1, "text": "合成字幕"}])
+        self.assertTrue(raised.exception.safe_message)
+        font.assert_called_once_with(cjk_only=True)
+        probe_mock.assert_not_called()
+        render.assert_not_called()
+
+    def test_latin_fallback_is_not_a_chinese_subtitle_font(self):
+        latin_font = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+        with patch.object(Path, "is_file", lambda candidate: candidate == latin_font):
+            self.assertEqual(media._font_path(), latin_font)
+            self.assertIsNone(media._font_path(cjk_only=True))
+
+    def test_explicit_srt_only_export_does_not_require_subtitle_dependencies(self):
+        source = self.clip("srt-only.mp4")
+        with patch.object(media, "_has_filter") as filters, \
+                patch.object(media, "_font_path") as font:
+            result = compose([source], self.root / "srt-only-output.mp4",
+                             [{"start": 0.1, "end": 0.35, "text": "仅导出合成字幕文件"}],
+                             burn_subtitles=False)
+        filters.assert_not_called()
+        font.assert_not_called()
+        self.assertFalse(result["burned_subtitles"])
+        self.assertTrue(Path(result["output"]).is_file())
+        self.assertIn("仅导出合成字幕文件", Path(result["subtitles"]).read_text())
+
+    def test_real_chinese_subtitles_are_present_in_rendered_pixels(self):
+        if not media._has_filter("subtitles") or not media._font_path(cjk_only=True):
+            self.skipTest("requires libass and a local CJK subtitle font")
+        source = self.clip("synthetic-chinese-source.mp4", size="640x360", duration=1)
+        result = compose([source], self.root / "synthetic-chinese-burned.mp4",
+                         [{"start": 0.2, "end": 0.9, "text": "合成中文字幕：账我看了。"}])
+        self.assertTrue(result["burned_subtitles"])
+
+        def bright_pixels(at):
+            pixels = subprocess.run([
+                "ffmpeg", "-v", "error", "-ss", str(at), "-i", result["output"],
+                "-frames:v", "1", "-vf", "crop=iw:ih/2:0:ih/2", "-f", "rawvideo",
+                "-pix_fmt", "gray", "-"], capture_output=True, check=True).stdout
+            return sum(value > 180 for value in pixels)
+
+        self.assertEqual(bright_pixels(0.05), 0)
+        self.assertGreater(bright_pixels(0.5), 100)
 
     def test_evidence_keeps_identity_and_marks_sampling_limits(self):
         source = self.clip("native.mp4", audio=True)

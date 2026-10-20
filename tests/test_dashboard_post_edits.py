@@ -231,7 +231,7 @@ vm.runInNewContext(source+`\n(async()=>{const edit={action:'edit_postproduction'
         program = r'''
 const assert=require('node:assert/strict'),vm=require('node:vm');
 const {sources,assertions}=JSON.parse(require('node:fs').readFileSync(0,'utf8'));
-class Element{constructor(tag){this.tag=tag;this.children=[];this.dataset={};this.listeners={};this.textContent='';this.value='';}append(...nodes){this.children.push(...nodes);}setAttribute(k,v){this[k]=v;}addEventListener(k,v){this.listeners[k]=v;}}
+class Element{constructor(tag){this.tag=tag;this.children=[];this.dataset={};this.listeners={};this.textContent='';this.value='';}append(...nodes){this.children.push(...nodes);}setAttribute(k,v){this[k]=v;}addEventListener(k,v){this.listeners[k]=v;}replaceWith(node){this.replacement=node;}remove(){this.removed=true;}}
 const actions=[],messages=[],state={paused:false,dashboard:{running:false},music_library:{tracks:[{id:'theme',title:'合成测试音乐'}]}};
 const context={state,assert,actions,messages,requestBusy:false,document:{createElement:tag=>new Element(tag),createTextNode:text=>({tag:'text',textContent:text})},action:async payload=>actions.push(payload),toast:(text,error)=>messages.push({text,error}),refresh:async()=>{},updateInputControls:()=>{}};
 vm.runInNewContext(sources.join('\n')+`
@@ -283,6 +283,44 @@ editor=postproductionEditor(episode,'music');assert.equal(field(rows(editor)[0],
 episode.postproduction.revision++;editor=postproductionEditor(episode,'music');assert.equal(field(rows(editor)[0],'gain_db').value,'-12');assert.equal(save(editor).disabled,true);
 range=field(rows(editor)[0],'gain_db');range.value='-28';range.listeners.input();episode.version++;
 editor=postproductionEditor(episode,'music');assert.equal(field(rows(editor)[0],'gain_db').value,'-12');assert.equal(save(editor).disabled,true);
+''')
+
+    def test_clean_rows_follow_same_revision_asr_proofreading_and_alignment_updates(self):
+        self.run_dom(r'''
+let editor=postproductionEditor(episode,'subtitles');assert.equal(field(rows(editor)[0],'text').value,'合成字幕一');
+episode.postproduction.subtitles.segments=[{start:.9,end:2.2,text:'GPT已校对文字'},{start:3.3,end:4.3,text:'独立检查已修正时间'}];
+editor=postproductionEditor(episode,'subtitles');assert.equal(field(rows(editor)[0],'text').value,'GPT已校对文字');assert.equal(field(rows(editor)[0],'start').value,'0.9');assert.equal(field(rows(editor)[1],'end').value,'4.3');
+assert.equal(save(editor).disabled,true);assert.equal(walk(editor).some(node=>node.className==='notice post-edit-source-updated'),false);
+editor=postproductionEditor(episode,'music');episode.postproduction.music.cues[0].gain_db=-12;episode.postproduction.music.cues[0].source_start=7;
+editor=postproductionEditor(episode,'music');assert.equal(field(rows(editor)[0],'gain_db').value,'-12');assert.ok(walk(rows(editor)[0]).some(node=>node.className==='muted music-source-window'&&node.textContent.includes('00:07.0–00:11.0')));
+assert.equal(save(editor).disabled,true);assert.equal(episode.version,4);assert.equal(episode.postproduction.revision,2);assert.equal(actions.length,0);
+''')
+
+    def test_dirty_same_revision_rows_survive_background_updates_with_explicit_notice(self):
+        self.run_dom(r'''
+let editor=postproductionEditor(episode,'subtitles');let text=field(rows(editor)[0],'text');text.value='我正在手动修改';text.listeners.input();let start=field(rows(editor)[0],'start');start.value='0.75';start.listeners.input();
+episode.postproduction.subtitles.segments[0]={start:1,end:2.5,text:'后台新校对'};episode.postproduction.subtitles.segments[1].text='后台其他更新';
+editor=postproductionEditor(episode,'subtitles');assert.equal(field(rows(editor)[0],'text').value,'我正在手动修改');assert.equal(field(rows(editor)[0],'start').value,'0.75');assert.equal(field(rows(editor)[1],'text').value,'合成字幕二');
+assert.ok(walk(editor).some(node=>node.className==='notice post-edit-source-updated'&&node.textContent.includes('仍保留你的未保存内容')));assert.equal(save(editor).disabled,false);assert.equal(actions.length,0);
+await save(editor).listeners.click();assert.equal(actions.length,1);assert.equal(actions[0].edits[0].text,'我正在手动修改');assert.equal(actions[0].edits[0].start,.75);
+''')
+
+    def test_dirty_music_metadata_stays_bound_and_changed_tracks_require_explicit_reload(self):
+        self.run_dom(r'''
+let editor=postproductionEditor(episode,'music'),gain=field(rows(editor)[0],'gain_db');gain.value='-28';gain.listeners.input();
+episode.postproduction.music.cues[0]={...episode.postproduction.music.cues[0],track_id:'new-theme',source_start:9,gain_db:-16};
+editor=postproductionEditor(episode,'music');assert.equal(field(rows(editor)[0],'gain_db').value,'-28');assert.ok(walk(rows(editor)[0]).some(node=>node.className==='muted music-source-window'&&node.textContent.includes('00:01.0–00:05.0')));
+assert.equal(save(editor).disabled,true);await save(editor).listeners.click();assert.equal(actions.length,0);
+const latest=walk(editor).find(node=>node.className==='quiet post-edit-load-latest');assert.ok(latest);latest.listeners.click();
+assert.ok(editor.replacement);assert.equal(field(rows(editor.replacement)[0],'gain_db').value,'-16');assert.ok(walk(rows(editor.replacement)[0]).some(node=>node.className==='muted music-source-window'&&node.textContent.includes('00:09.0–00:13.0')));
+assert.equal(save(editor.replacement).disabled,true);assert.equal(actions.length,0);
+''')
+
+    def test_dirty_rows_are_retained_when_background_source_temporarily_changes_count(self):
+        self.run_dom(r'''
+let editor=postproductionEditor(episode,'subtitles'),text=field(rows(editor)[0],'text');text.value='未保存的字幕';text.listeners.input();
+episode.postproduction.subtitles.segments=[];editor=postproductionEditor(episode,'subtitles');assert.ok(editor);assert.equal(rows(editor).length,2);assert.equal(field(rows(editor)[0],'text').value,'未保存的字幕');assert.equal(save(editor).disabled,true);
+assert.ok(walk(editor).some(node=>node.textContent.includes('条目数量或选曲发生变化')));await save(editor).listeners.click();assert.equal(actions.length,0);
 ''')
 
     def test_busy_and_unready_disable_controls_and_prevent_submit(self):

@@ -83,6 +83,110 @@ class PostproductionProjectionTests(unittest.TestCase):
                          (episode["file"], episode["version"], episode["sha256"]))
         self.assertEqual(progress.episode_progress(state, episode)["percent"], 100)
 
+    def test_subtitle_diagnostic_preview_is_current_but_never_final_approval_ready(self):
+        state = synthetic_state()
+        episode = state["episodes"][0]
+        episode.update(status="awaiting_review", version=2, file="exports/E1-v2.mp4", sha256="c" * 64,
+                       has_subtitles=True, subtitles_burned=True)
+        post = episode["postproduction"]
+        post.update(status="subtitle_sync_needs_attention", final_ready=True, manual_preview=False,
+                    preview_kind="subtitle_diagnostic", final_file=episode["file"],
+                    final_version=2, final_sha256=episode["sha256"])
+        post["subtitles"]["sync_check"] = {"status": "needs_attention", "summary": "合成测试疑点保留",
+                                           "attempts": 2, "max_attempts": 2, "issues": []}
+        before = copy.deepcopy(state)
+        public = dashboard.public_state(state)["episodes"][0]["postproduction"]
+        self.assertTrue(public["final_available"])
+        self.assertEqual(public["preview_kind"], "subtitle_diagnostic")
+        self.assertFalse(public["final_ready"])
+        self.assertEqual(public["subtitles"]["sync_check"]["attempts"], 2)
+        self.assertEqual(state, before)
+        # Even contradictory passed evidence cannot turn a diagnostic preview
+        # into the final human-approval route.
+        self.assertFalse(self.expose_verified(state)["episodes"][0]["postproduction"]["final_ready"])
+        for change in ({"final_file": "exports/E1-v1.mp4"}, {"final_version": 1},
+                       {"final_sha256": "d" * 64}, {"final_ready": False}):
+            candidate = copy.deepcopy(before)
+            candidate["episodes"][0]["postproduction"].update(change)
+            projected = dashboard.public_state(candidate)["episodes"][0]["postproduction"]
+            self.assertFalse(projected["final_available"])
+            self.assertFalse(projected["final_ready"])
+            self.assertNotIn("final_file", projected)
+
+    def test_preview_kind_projection_uses_allowlist_and_never_leaks_internal_values(self):
+        for value in ("private-preview-kind", {"token": "PRIVATE-PREVIEW"}, None, True):
+            with self.subTest(value=value):
+                state = synthetic_state()
+                state["episodes"][0]["postproduction"]["preview_kind"] = value
+                post = dashboard.public_state(state)["episodes"][0]["postproduction"]
+                self.assertNotIn("preview_kind", post)
+                self.assertNotIn("PRIVATE-PREVIEW", json.dumps(post))
+
+    def recovery_state(self, count=1):
+        from norlan.subtitle_text_recovery import SCHEMA
+        state = synthetic_state()
+        post = state["episodes"][0]["postproduction"]
+        post["source_key"] = "e" * 64
+        subtitles = post["subtitles"]
+        subtitles["audio_sha256"] = "d" * 64
+        before = [{"start": index * 2 + .5, "end": index * 2 + 1.5, "text": "账我看了。"}
+                  for index in range(count)]
+        subtitles["segments"] = [{**cue, "text": "让我看了"} for cue in before]
+        subtitles["text_recovery"] = {"schema": SCHEMA, "policy": 1, "status": "recovered",
+            "source_key": post["source_key"], "source_audio_sha256": subtitles["audio_sha256"],
+            "input_caption_hash": subtitle_sync.caption_hash(before),
+            "output_caption_hash": subtitle_sync.caption_hash(subtitles["segments"]),
+            "changes": [{"cue_index": index, "before": cue, "after": subtitles["segments"][index],
+                         "raw_cue_index": "PRIVATE-INDEX", "evidence": "PRIVATE-EVIDENCE"}
+                        for index, cue in enumerate(before)],
+            "limitations": "PRIVATE-UNTRUSTED-LIMITATIONS", "initial_report": {"path": "/private/audio.wav"},
+            "proposals": ["PRIVATE-PROPOSAL"], "cache_file": "/private/cache.json"}
+        return state
+
+    def test_text_recovery_projection_is_bound_bounded_and_preserves_wording_notice(self):
+        from norlan.subtitle_text_recovery import LIMITATIONS
+        state = self.recovery_state(25)
+        before = copy.deepcopy(state)
+        public = dashboard.public_state(state)["episodes"][0]["postproduction"]["subtitles"]["text_recovery"]
+        self.assertEqual(public["status"], "recovered")
+        self.assertEqual(public["change_count"], 25)
+        self.assertEqual(len(public["changes"]), 20)
+        self.assertEqual(public["changes"][0], {"cue_index": 0, "start": .5, "end": 1.5,
+            "before": {"text": "账我看了。"}, "after": {"text": "让我看了"}})
+        self.assertEqual(public["limitations"], LIMITATIONS)
+        self.assertEqual(set(public), {"status", "change_count", "changes", "limitations"})
+        self.assertNotIn("PRIVATE-", json.dumps(public))
+        self.assertNotIn("/private/", json.dumps(public))
+        self.assertEqual(state, before)
+
+    def test_invalid_or_stale_text_recovery_never_claims_recovered(self):
+        for change in ({"status": "recovered<script>"}, {"schema": "private-schema"}, {"policy": True},
+                       {"source_key": "f" * 64}, {"source_audio_sha256": "f" * 64},
+                       {"output_caption_hash": "f" * 64}, {"input_caption_hash": "f" * 64},
+                       {"changes": []}, {"changes": "PRIVATE-CHANGES"}):
+            with self.subTest(change=change):
+                state = self.recovery_state()
+                state["episodes"][0]["postproduction"]["subtitles"]["text_recovery"].update(change)
+                public = dashboard.public_state(state)["episodes"][0]["postproduction"]["subtitles"]
+                self.assertNotIn("text_recovery", public)
+        for edit in ({"cue_index": True}, {"cue_index": 99}, {"before": {"text": {"html": "PRIVATE-INJECT"}}},
+                     {"after": {"start": .5, "end": 1.5, "text": "伪造文字"}},
+                     {"before": {"start": 0, "end": 1.5, "text": "账我看了。"}},
+                     {"before": {"start": float("nan"), "end": 1.5, "text": "账我看了。"}}):
+            with self.subTest(edit=edit):
+                state = self.recovery_state()
+                recovery = state["episodes"][0]["postproduction"]["subtitles"]["text_recovery"]
+                recovery["changes"][0].update(edit)
+                public = dashboard.public_state(state)["episodes"][0]["postproduction"]["subtitles"]
+                self.assertNotIn("text_recovery", public)
+        state = self.recovery_state()
+        recovery = state["episodes"][0]["postproduction"]["subtitles"]["text_recovery"]
+        recovery["changes"].append(copy.deepcopy(recovery["changes"][0]))
+        self.assertNotIn("text_recovery", dashboard.public_state(state)["episodes"][0]["postproduction"]["subtitles"])
+        state = self.recovery_state()
+        state["episodes"][0]["postproduction"]["subtitles"]["segments"][0]["end"] += .1
+        self.assertNotIn("text_recovery", dashboard.public_state(state)["episodes"][0]["postproduction"]["subtitles"])
+
     def test_music_reports_publish_bounded_safe_summary_without_audio_evidence(self):
         state = synthetic_state()
         post = state["episodes"][0]["postproduction"]

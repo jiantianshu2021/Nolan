@@ -25,6 +25,12 @@ class MediaError(RuntimeError):
     """A local dependency, input, or media operation failed."""
 
 
+class SubtitleCapabilityError(MediaError):
+    """A fixed, safe diagnostic for a missing subtitle rendering dependency."""
+
+    safe_message = True
+
+
 # FFmpeg 7.1 loudnorm can emit NaN samples for completely silent input. Keep
 # silence exactly silent after normalization and before sidechain/encoding.
 _LOUDNORM = (
@@ -427,15 +433,16 @@ def _has_filter(name: str) -> bool:
                for line in _filters().splitlines())
 
 
-def _font_path() -> Path | None:
+def _font_path(*, cjk_only: bool = False) -> Path | None:
     # Prefer CJK fonts when present. No font is downloaded at runtime.
     candidates = [
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ]
+    if not cjk_only:
+        candidates.append("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
     return next((Path(p) for p in candidates if Path(p).is_file()), None)
 
 
@@ -660,6 +667,21 @@ def compose(
         raise MediaError("合成输出不能覆盖配乐原件。")
     if music_mix is not None and (not isinstance(music_mix, dict) or music_path is None):
         raise MediaError("对白配乐混音策略必须附带本地配乐文件。")
+    burned = bool(subtitles and burn_subtitles)
+    subtitle_font = None
+    if burned:
+        # Refuse before normalizing clips or writing an output. An explicitly
+        # requested hard-caption export must never silently become an SRT-only
+        # export, and a Latin fallback font is not evidence of CJK support.
+        if not _has_filter("subtitles"):
+            raise SubtitleCapabilityError(
+                "字幕未能烧录：当前 FFmpeg 缺少 subtitles（libass）滤镜；请安装带 libass 的 FFmpeg。"
+                "尚未开始视频合成，原素材和已有字幕均已保留。")
+        subtitle_font = _font_path(cjk_only=True)
+        if subtitle_font is None:
+            raise SubtitleCapabilityError(
+                "字幕未能烧录：未找到可用的中文字体；请安装 Noto Sans CJK 或系统中文字体。"
+                "尚未开始视频合成，原素材和已有字幕均已保留。")
     metadata = [probe(path) for path in paths]
     if any(not item["has_video"] or item["duration"] <= 0 for item in metadata):
         raise MediaError("每个镜头都必须包含有效的视频流和时长。")
@@ -671,10 +693,7 @@ def compose(
     height = max(2, int(first["height"] * factor) // 2 * 2)
     timeline: list[dict] = []
     srt_output: Path | None = output.with_suffix(".srt") if subtitles else None
-    burned = bool(subtitles and burn_subtitles and _has_filter("subtitles") and _font_path())
     warnings: list[str] = []
-    if subtitles and burn_subtitles and not burned:
-        warnings.append("未检测到字幕滤镜或字体；已保留 SRT，视频未烧录字幕。")
     if music_path is None:
         warnings.append("没有导入配乐；保留镜头原声，静音镜头填充静音。")
     elif music_mix is not None:
@@ -824,9 +843,7 @@ def compose(
         if subtitles:
             _write_subtitles(subtitles, temporary / "captions.srt", duration)
         if burned:
-            font = _font_path()
-            if font:
-                shutil.copyfile(font, temporary / font.name)
+            shutil.copyfile(subtitle_font, temporary / subtitle_font.name)
             # Fixed relative filenames avoid ffmpeg filter escaping of user paths.
             graph.append("[video]subtitles=filename=captions.srt:fontsdir=.[picture]")
         else:
