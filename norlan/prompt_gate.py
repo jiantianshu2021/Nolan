@@ -248,7 +248,8 @@ def specification(state, shot, prompt, manifest, refined=None):
         asset = core._find(state, "asset", identifier)
         bindings.append({key: copy.deepcopy(asset.get(key)) for key in
                          ("id", "version", "status", "sha256", "audio_sha256", "voice_only_digest")})
-    ark = state["settings"]["ark"]
+    from .video_models import effective_config
+    ark = effective_config(state, shot)
     specification = {"shot_id": shot["id"], "current_version": shot.get("version", 0),
             "revision": shot.get("revision", 0), "source_prompt": shot["prompt"],
             "source_dialogue": shot.get("dialogue"), "feedback": shot.get("feedback", ""),
@@ -343,6 +344,9 @@ def _validate_inputs(root, state, shot, candidate):
     if (candidate.get("revision") != shot.get("revision", 0)
             or candidate.get("version") != shot.get("version", 0) + 1):
         raise core.GateError("提示词候选已过期，请重新准备。")
+    from .video_models import effective_config
+    if "video_model" in candidate and candidate["video_model"] != effective_config(state, shot).get("video_model"):
+        raise core.GateError("视频模型与本次提示词候选不一致，请刷新后重新选择。")
     _validate_candidate_timing(shot, candidate)
     from .future_continuity import public_updates
     if candidate.get("future_continuity_updates", []) != public_updates(state, shot, strict=True):
@@ -383,6 +387,8 @@ def prepare(root, shot_id, refined, prompt, manifest):
                      "continuity_notes": refined.get("continuity_notes", ""),
                      "refined": copy.deepcopy(refined), "reference_manifest": copy.deepcopy(manifest),
                      "created_at": core.now()}
+        from .video_models import effective_config
+        candidate["video_model"] = effective_config(state, shot).get("video_model")
         from .storyboard_revision import public
         try:
             redesign = public(shot)
@@ -420,25 +426,63 @@ def _bound(shot, candidate_id, request_hash):
     return candidate
 
 
-def approve(root, shot_id, candidate_id, request_hash):
+def _selected_model(state, shot, candidate, video_model):
+    """Resolve an explicit choice locally, without changing text or references.
+
+    Legacy callers that do not send a selection retain the old configuration
+    checks. The next request is still pinned to its current model so a later
+    project-default change cannot retarget human consent.
+    """
+    from .video_models import effective_config, validate_selection
+    if video_model is None:
+        return effective_config(state, shot).get("video_model")
+    try:
+        return validate_selection(state, shot, candidate["reference_manifest"], video_model)
+    except ValueError as exc:
+        raise core.GateError(str(exc)) from None
+
+
+def _pin_model(shot, video_model):
+    if video_model is not None:
+        shot["video_model"] = video_model
+
+
+def approve(root, shot_id, candidate_id, request_hash, video_model=None):
     with core.run_lock(root), core.transaction(root) as state:
         shot = core._find(state, "shot", shot_id)
         candidate = _bound(shot, candidate_id, request_hash)
         _validate_inputs(root, state, shot, candidate)
+        selected = _selected_model(state, shot, candidate, video_model)
+        original_model = specification(state, shot, candidate["prompt"], candidate["reference_manifest"],
+                                       candidate.get("refined"))["provider"]["video_model"]
+        stamp = core.now()
+        if selected != original_model:
+            shot.setdefault("prompt_history", []).append({**copy.deepcopy(candidate),
+                "status": "superseded_by_model_selection", "superseded_at": stamp})
+            candidate = copy.deepcopy(candidate)
+            candidate.update(id="prompt-" + uuid.uuid4().hex[:12], created_at=stamp)
+            shot["prompt_candidate"] = candidate
+        _pin_model(shot, selected)
+        candidate["video_model"] = selected
+        candidate["request_hash"] = _hash(specification(state, shot, candidate["prompt"],
+            candidate["reference_manifest"], candidate.get("refined")))
+        _validate_inputs(root, state, shot, candidate)
         candidate.update(status="approved", approved_at=core.now())
-        shot["prompt_approval"] = {"candidate_id": candidate_id, "request_hash": request_hash,
-                                   "at": core.now(), "decision": "generate"}
+        shot["prompt_approval"] = {"candidate_id": candidate["id"], "request_hash": candidate["request_hash"],
+                                   "at": stamp, "decision": "generate", "video_model": selected}
         shot["status"] = "prompt_approved"
         state.update(status="ready", last_error=None)
-        core.event(state, "human_approved_prompt", id=shot_id, candidate_id=candidate_id, request_hash=request_hash)
+        core.event(state, "human_approved_prompt", id=shot_id, candidate_id=candidate["id"],
+                   request_hash=candidate["request_hash"], video_model=selected)
     return core.load_project(root)
 
 
-def edit_and_approve(root, shot_id, candidate_id, request_hash, prompt):
+def edit_and_approve(root, shot_id, candidate_id, request_hash, prompt, video_model=None):
     """One explicit UI submission adopts raw text and authorizes one video.
 
     No LLM parses, rewrites, or appends to this prompt. The original candidate's
-    provider duration/references stay bound, while all stale GPT delivery claims
+    duration/references stay bound; an explicit model choice is checked locally.
+    All stale GPT delivery claims
     are archived with the original instead of attributed to the human text.
     """
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MANUAL_PROMPT_LIMIT or "\x00" in prompt:
@@ -449,6 +493,7 @@ def edit_and_approve(root, shot_id, candidate_id, request_hash, prompt):
         shot = core._find(state, "shot", shot_id)
         original = _bound(shot, candidate_id, request_hash)
         _validate_inputs(root, state, shot, original)
+        selected = _selected_model(state, shot, original, video_model)
         stamp = core.now()
         archived = {**copy.deepcopy(original), "status": "superseded_by_manual_edit", "superseded_at": stamp}
         shot.setdefault("prompt_history", []).append(archived)
@@ -459,15 +504,17 @@ def edit_and_approve(root, shot_id, candidate_id, request_hash, prompt):
             candidate.pop(key, None)
         candidate.update(id="prompt-" + uuid.uuid4().hex[:12], status="approved", prompt=prompt,
             dialogue="", continuity_notes=MANUAL_PROMPT_NOTE, refined=_manual_refined(prompt, marker),
-            manual_prompt=marker, created_at=stamp, approved_at=stamp)
+            manual_prompt=marker, created_at=stamp, approved_at=stamp, video_model=selected)
+        _pin_model(shot, selected)
         candidate["request_hash"] = _hash(specification(state, shot, prompt, candidate["reference_manifest"], candidate["refined"]))
         _validate_inputs(root, state, shot, candidate)
         shot.update(status="prompt_approved", prompt_candidate=candidate, prompt_approval={
             "candidate_id": candidate["id"], "request_hash": candidate["request_hash"],
-            "at": stamp, "decision": "generate", "source": "human_manual_edit"})
+            "at": stamp, "decision": "generate", "source": "human_manual_edit", "video_model": selected})
         state.update(status="ready", last_error=None)
         core.event(state, "human_edited_prompt", id=shot_id, candidate_id=candidate["id"],
-                   source_candidate_id=candidate_id, request_hash=candidate["request_hash"], version=candidate["version"])
+                   source_candidate_id=candidate_id, request_hash=candidate["request_hash"], version=candidate["version"],
+                   video_model=selected)
     return core.load_project(root)
 
 
@@ -500,7 +547,8 @@ def approved(root, shot):
     if (current.get("status") != "prompt_approved" or candidate.get("status") != "approved"
             or approval.get("candidate_id") != candidate.get("id")
             or approval.get("request_hash") != candidate.get("request_hash")
-            or approval.get("decision") != "generate"):
+            or approval.get("decision") != "generate"
+            or ("video_model" in approval and approval["video_model"] != candidate.get("video_model"))):
         raise core.GateError("请先在网页确认本次提示词并点击生成。")
     try:
         _validate_inputs(root, state, current, candidate)

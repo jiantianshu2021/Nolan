@@ -5,7 +5,7 @@ bill adjustments are deliberately not inferred here. This module performs no IO.
 """
 
 from collections.abc import Mapping
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP, localcontext
 import math
 import re
 
@@ -15,6 +15,30 @@ PRICE_SOURCE = "https://docs.volcengine.com/docs/ark/model-pricing?lang=zh&redir
 PRICE_CHECKED_AT = "2026-10-20"
 IMAGE_MODEL = "doubao-seedream-5-0-flash-260915"
 VIDEO_MODEL = "doubao-seedance-2-0-fast-260128"
+# Exact release IDs, public on-demand rates in CNY / million completion tokens.
+# Each pair is (without input video, with input video). The enterprise promotions
+# ended 2026-10-07; do not infer account discounts or rewrite historical snapshots.
+VIDEO_RATES = {
+    VIDEO_MODEL: {"480p": (37, 22), "720p": (37, 22)},
+    "doubao-seedance-2-0-260128": {"480p": (46, 28), "720p": (46, 28),
+                                      "1080p": (51, 31), "4k": (26, 16)},
+    "doubao-seedance-2-0-mini-260615": {"480p": (23, 14), "720p": (23, 14)},
+    "doubao-seedance-2-5-260628": {"480p": (70, 42), "720p": (70, 42), "1080p": (77, 46)},
+    "doubao-seedance-1-0-pro-250528": {"480p": (15, 15), "720p": (15, 15), "1080p": (15, 15)},
+    "doubao-seedance-1-0-pro-fast-251015": {"480p": (4.2, 4.2), "720p": (4.2, 4.2), "1080p": (4.2, 4.2)},
+}
+# Official video-generation-tutorial output-size table, checked 2026-10-20.
+# 2.5 differs from 2.0 only for 480p 16:9 / 9:16 in this table.
+_VIDEO_PIXELS = {
+    "480p": {"16:9": (864, 496), "9:16": (496, 864), "4:3": (752, 560),
+             "3:4": (560, 752), "1:1": (640, 640), "21:9": (992, 432)},
+    "720p": {"16:9": (1280, 720), "9:16": (720, 1280), "4:3": (1112, 834),
+             "3:4": (834, 1112), "1:1": (960, 960), "21:9": (1470, 630)},
+    "1080p": {"16:9": (1920, 1080), "9:16": (1080, 1920), "4:3": (1664, 1248),
+              "3:4": (1248, 1664), "1:1": (1440, 1440), "21:9": (2206, 946)},
+    "4k": {"16:9": (3840, 2160), "9:16": (2160, 3840), "4:3": (3326, 2494),
+           "3:4": (2494, 3326), "1:1": (2880, 2880), "21:9": (4398, 1886)},
+}
 USAGE_FIELDS = ("completion_tokens", "generated_images", "input_images", "output_tokens", "total_tokens")
 _SIX_PLACES = Decimal("0.000001")
 
@@ -72,9 +96,46 @@ def price_snapshot(config, kind, *, has_video_input=False):
         return snapshot
     if kind == "image" and model == IMAGE_MODEL and not has_video_input:
         snapshot.update(unit="generated_images", rate=0.12)
-    elif video and model == VIDEO_MODEL and resolution in {"480p", "720p"}:
-        snapshot.update(unit="million_completion_tokens", rate=22 if has_video_input else 37)
+    elif video and model in VIDEO_RATES and resolution in VIDEO_RATES[model]:
+        # Seedance 1.0 cannot accept video input, even though its fixed rate has
+        # no input-video tier. Such a contradictory configuration is unpriced.
+        if "seedance-1-" not in model or not has_video_input:
+            snapshot.update(unit="million_completion_tokens", rate=VIDEO_RATES[model][resolution][int(has_video_input)])
     return snapshot
+
+
+def estimate_reservation(config, duration, reference_duration=0):
+    """Round a known no-video-input public estimate upward to CNY cents.
+
+    This is a budget estimate, never actual account cost. Official token formula:
+    (input-video seconds + output seconds) * width * height * 24 / 1024.
+    Reference-video requests have an additional minimum-token schedule; without
+    a verified matching floor, return None and retain the configured budget cap.
+    Unknown aliases, gateways, adaptive ratios and unsupported specs are unknown.
+    """
+    config = config if isinstance(config, Mapping) else {}
+    seconds = _integer(duration)
+    reference = _number(reference_duration)
+    if seconds is None or seconds < 4 or reference is None or reference != 0:
+        return None
+    snapshot = price_snapshot(config, "video")
+    rate = _number(snapshot.get("rate"))
+    model, resolution, ratio = snapshot.get("model"), snapshot.get("resolution"), config.get("ratio", "16:9")
+    if rate is None or not isinstance(ratio, str) or "seedance-1-" in model:
+        return None
+    maximum = 30 if model == "doubao-seedance-2-5-260628" else 15
+    if seconds > maximum:
+        return None
+    dimensions = _VIDEO_PIXELS.get(resolution, {}).get(ratio)
+    if dimensions is None:
+        return None
+    if model == "doubao-seedance-2-5-260628" and resolution == "480p":
+        dimensions = {"16:9": (854, 480), "9:16": (480, 854)}.get(ratio, dimensions)
+    width, height = dimensions
+    tokens = (Decimal(seconds * width * height * 24) / Decimal(1024)).to_integral_value(rounding=ROUND_CEILING)
+    # The cent rounding is deliberately upward for reservations only. Actual
+    # usage pricing below retains its six-decimal precision and locked snapshot.
+    return float((tokens * rate / Decimal(1_000_000)).quantize(Decimal("0.01"), rounding=ROUND_CEILING))
 
 
 def usage_record(result, snapshot):
@@ -110,10 +171,10 @@ def usage_record(result, snapshot):
         return record
     if unit == "generated_images" and model == IMAGE_MODEL:
         field, divisor = "generated_images", Decimal(1)
-    elif (unit == "million_completion_tokens" and model == VIDEO_MODEL
-          and snapshot.get("resolution") in {"480p", "720p"}):
+    elif (unit == "million_completion_tokens" and model in VIDEO_RATES
+          and snapshot.get("resolution") in VIDEO_RATES[model]):
         returned_resolution = result.get("resolution", snapshot["resolution"])
-        if (not isinstance(returned_resolution, str) or returned_resolution not in {"480p", "720p"}
+        if (not isinstance(returned_resolution, str) or returned_resolution not in VIDEO_RATES[model]
                 or returned_resolution != snapshot["resolution"]):
             return record
         field, divisor = "completion_tokens", Decimal(1_000_000)
@@ -179,7 +240,7 @@ def _zero_usage_evidence(billing):
     usage = billing.get("usage")
     if not isinstance(usage, Mapping):
         return False
-    if billing.get("model") == VIDEO_MODEL:
+    if isinstance(billing.get("model"), str) and billing["model"] in VIDEO_RATES:
         return _integer(usage.get("completion_tokens")) == 0
     return (billing.get("model") == IMAGE_MODEL and _integer(usage.get("generated_images")) == 0
             and billing.get("provider_status") in {"failed", "cancelled", "expired"})

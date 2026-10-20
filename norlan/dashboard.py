@@ -163,6 +163,16 @@ def _bound_shot_job(state, shot):
     return job if version is None or version == _version(shot.get("version")) else {}
 
 
+def _public_generation_model(state, shot):
+    """Read the actual request's model, never the next-version selection."""
+    job = _bound_shot_job(state, shot)
+    request = job.get("video_request") or {}
+    billing = job.get("billing") or {}
+    price = billing.get("price") or {}
+    model = request.get("video_model") or price.get("model") or billing.get("model")
+    return model if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", model) else None
+
+
 def _public_shot_failures(state, shot):
     """Expose only sanitized diagnostics, bound to the current attempt or history."""
     from .failures import sanitize_failure
@@ -296,11 +306,20 @@ def _public_timing_proposal(value, shot):
         return None
 
 
-def _public_prompt_candidate(value, shot=None):
+def _public_prompt_candidate(value, shot=None, state=None):
     """Expose the exact human-review prompt, never request config or URLs."""
     if not isinstance(value, dict):
         return None
     result = _pick(value, ("id", "version", "revision", "prompt", "dialogue", "continuity_notes", "request_hash", "duration"))
+    model = value.get("video_model")
+    if model is None and state is not None:
+        from .video_models import effective_config
+        model = effective_config(state, shot).get("video_model")
+    if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", model):
+        result["video_model"] = model
+    if state is not None:
+        from .video_models import options
+        result["model_options"] = options(state, shot, value)
     if "broadcast_proposal" in value:
         result["broadcast_proposal"] = _public_broadcast_proposal(value, shot)
     if "timing_proposal" in value:
@@ -672,7 +691,7 @@ def _public_latest_episode_feedback(state, episode):
     return None
 
 
-def _public_shot_history(shot):
+def _public_shot_history(shot, state=None):
     history, seen = [], set()
     for record in shot.get("history", []):
         if (not isinstance(record, dict) or not _public_video_path(record.get("file"), "media")
@@ -685,6 +704,14 @@ def _public_shot_history(shot):
         item = {"file": record["file"], **_public_timestamps(record)}
         file_version = _file_version(shot, record["file"])
         item["version"] = file_version or _version(record.get("version"))
+        snapshot = {**record, "id": shot.get("id"), "version": item["version"]}
+        model = _public_generation_model(state, snapshot) if state is not None else None
+        allow_saved = state is None or not state.get("jobs", {}).get(record.get("job_id")) or bool(_bound_shot_job(state, snapshot))
+        if not model and allow_saved:
+            saved = record.get("video_model")
+            model = saved if isinstance(saved, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", saved) else None
+        if model:
+            item["generation_model"] = model
         report = _public_shot_report(record, item["version"])
         if report and (not record.get("version") or record["version"] == item["version"]):
             item["review"] = report
@@ -1204,6 +1231,8 @@ def public_state(state: dict) -> dict:
         result["status"] = "ready"
     from .core import video_review_enabled
     result["video_review"] = {"enabled": video_review_enabled(state)}
+    from .video_models import catalog
+    result["video_models"] = catalog(state)
     from .core import is_nonblocking_advisory_unknown
     result["pending_advisory_count"] = sum(is_nonblocking_advisory_unknown(job)
                                             for job in state.get("jobs", {}).values() if isinstance(job, dict))
@@ -1350,6 +1379,9 @@ def public_state(state: dict) -> dict:
         item["shots"] = []
         for shot in episode.get("shots", []):
             entry = _pick(shot, ("id", "status", "file", "prompt", "duration"))
+            model = _public_generation_model(state, shot)
+            if model:
+                entry["generation_model"] = model
             manual_prompt = _public_manual_prompt(shot)
             if manual_prompt is not None:
                 entry.update(prompt=manual_prompt, manual_prompt=True)
@@ -1371,7 +1403,7 @@ def public_state(state: dict) -> dict:
                                     for value in state.get("asset_amendments", []) if isinstance(value, dict)):
                 entry["asset_amendment_pending"] = True
             if shot.get("status") == "awaiting_prompt_approval":
-                candidate = _public_prompt_candidate(shot.get("prompt_candidate"), shot)
+                candidate = _public_prompt_candidate(shot.get("prompt_candidate"), shot, state)
                 if candidate:
                     entry["prompt_candidate"] = candidate
             from .future_continuity import public_updates
@@ -1409,7 +1441,7 @@ def public_state(state: dict) -> dict:
                     elapsed_seconds=None, stage_elapsed_seconds=None, waiting_for_human=False, is_working=False)
             if entry["progress"]["stage"] == "failed":
                 entry["status"] = "generation_failed"
-            entry["history"] = _public_shot_history(shot)
+            entry["history"] = _public_shot_history(shot, state)
             item["shots"].append(entry)
         episodes.append(item)
     result["episodes"] = episodes
@@ -1757,16 +1789,21 @@ class _Handler(BaseHTTPRequestHandler):
                 if path == "/api/prompt-edit" and action == "edit_prompt_and_generate":
                     item_id, candidate_id, request_hash, prompt = (data.get(key) for key in
                                                                  ("id", "candidate_id", "request_hash", "prompt"))
-                    if (set(data) != {"action", "id", "candidate_id", "request_hash", "prompt"}
+                    if (set(data) - {"action", "id", "candidate_id", "request_hash", "prompt", "video_model"}
+                            or not {"action", "id", "candidate_id", "request_hash", "prompt"} <= set(data)
                             or not isinstance(item_id, str) or not 0 < len(item_id) <= 128
                             or not isinstance(candidate_id, str) or not 0 < len(candidate_id) <= 128
                             or not _valid_sha(request_hash) or not isinstance(prompt, str)
                             or not prompt.strip() or len(prompt) > 100000 or "\x00" in prompt):
                         raise ValueError
+                    model = data.get("video_model")
+                    if "video_model" in data and (not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", model)):
+                        raise ValueError
                     if context.running or context.external_run_active():
                         return self._error(409, "制作正在进行，请等待当前任务结束后再编辑提示词。")
                     try:
-                        _core().edit_prompt_and_approve(context.project_dir, item_id, candidate_id, request_hash, prompt)
+                        options = {"video_model": model} if "video_model" in data else {}
+                        _core().edit_prompt_and_approve(context.project_dir, item_id, candidate_id, request_hash, prompt, **options)
                     except _core().GateError as exc:
                         from .failures import sanitize_failure
                         return self._error(409, sanitize_failure({"message": str(exc)})["message"])
@@ -1908,7 +1945,13 @@ class _Handler(BaseHTTPRequestHandler):
                             or not _valid_sha(request_hash)):
                         raise ValueError
                     if action == "approve_prompt":
-                        _core().approve_prompt(context.project_dir, item_id, candidate_id, request_hash)
+                        model = data.get("video_model")
+                        if "video_model" in data and (not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", model)):
+                            raise ValueError
+                        if context.running or context.external_run_active():
+                            return self._error(409, "制作正在进行，请等待当前任务结束后再确认模型与提示词。")
+                        options = {"video_model": model} if "video_model" in data else {}
+                        _core().approve_prompt(context.project_dir, item_id, candidate_id, request_hash, **options)
                     else:
                         feedback = data.get("feedback")
                         if not isinstance(feedback, str) or not feedback.strip() or len(feedback) > 8000:

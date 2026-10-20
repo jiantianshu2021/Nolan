@@ -119,11 +119,33 @@ def _brain(root, method, *args, **kwargs):
         raise
 
 
-def _ark(root):
+def _ark(root, video_config=None):
     from .providers import ArkProvider
     s = core.load_project(root)
     config = {**s["settings"]["ark"], "ratio": s["plan"].get("ratio", "16:9")}
+    if video_config is not None:
+        config.update(video_config)
     return ArkProvider(config)
+
+
+def _video_config(state, kind, item_id, job=None):
+    """Use the chosen segment model, or the original submitted job's settings."""
+    from .video_models import effective_config
+    shot = core._find(state, "shot", item_id) if kind == "video" else None
+    config = effective_config(state, shot)
+    if job:
+        saved = job.get("video_request")
+        if isinstance(saved, dict):
+            config.update({key: saved[key] for key in
+                           ("video_model", "ratio", "resolution", "generate_audio", "video_watermark")
+                           if key in saved})
+        else:
+            price = (job.get("billing") or {}).get("price") or {}
+            if price.get("model"):
+                config["video_model"] = price["model"]
+            if price.get("resolution"):
+                config["resolution"] = price["resolution"]
+    return config
 
 
 def _rel(root, path):
@@ -452,7 +474,9 @@ def _shot_generation_failed(root, shot_id):
 
 
 def _poll_video(root, job_id, output):
-    provider = _ark(root)
+    state = core.load_project(root)
+    saved_job = state["jobs"][job_id]
+    provider = _ark(root, _video_config(state, saved_job["kind"], saved_job["item_id"], saved_job))
     started = time.monotonic()
     while True:
         s = core.load_project(root)
@@ -532,16 +556,34 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
         if job["accounting"] == "unknown":
             raise core.GateError("未知任务必须先核实，不能再次提交")
     _new_work_gate(s)
-    provider = _ark(root) if s["mode"] == "live" else None
+    config = _video_config(s, kind, item_id)
+    # Store the effective wire defaults as well as explicit configuration, so
+    # a later project-default change cannot alter an interrupted request.
+    config.setdefault("resolution", "720p")
+    config.setdefault("generate_audio", True)
+    config.setdefault("video_watermark", False)
+    provider = _ark(root, config) if s["mode"] == "live" else None
     if provider:
         provider.preflight("video")
+        validate_inputs = getattr(provider, "validate_video_inputs", None)
+        if callable(validate_inputs):
+            validate_inputs(duration, references, audio_references or [], previous_video)
     job_id = f"{kind}-{item_id}-{uuid.uuid4().hex[:8]}"
     if previous_video is not None and (isinstance(reference_duration, bool)
             or not isinstance(reference_duration, (int, float)) or not math.isfinite(reference_duration)
             or not 2 <= reference_duration <= 15):
         raise core.GateError("原始视频参考时长尚未核实；未提交新任务。")
-    amount = 0 if s["mode"] == "demo" else (duration + reference_duration) * s["settings"]["caps"]["video_second"]
-    pricing = price_snapshot({**s["settings"]["ark"], "currency": s["budget"]["currency"]}, kind,
+    unit_cap = s["settings"]["caps"]["video_second"]
+    if s["mode"] == "live":
+        from .billing import estimate_reservation
+        # The no-input quote is a conservative per-second basis; input-video
+        # minimum-token rules make an exact input quote unavailable locally.
+        # Retain the operator's cap or a 15% margin above this model's basis.
+        basis = estimate_reservation({**config, "currency": s["budget"]["currency"]}, duration)
+        if basis is not None:
+            unit_cap = max(unit_cap, basis / duration * 1.15)
+    amount = 0 if s["mode"] == "demo" else round((duration + reference_duration) * unit_cap, 6)
+    pricing = price_snapshot({**config, "currency": s["budget"]["currency"]}, kind,
                              has_video_input=previous_video is not None)
     core.reserve(root, job_id, kind, item_id, amount, pricing=pricing if s["mode"] == "live" else None)
     with core.transaction(root) as current:
@@ -551,6 +593,9 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
                                                "version": obj.get("version", 0), "time": core.now()})
         current["jobs"][job_id].update(duration=duration, reference_video_duration=reference_duration,
                                        return_last_frame=s["mode"] == "live")
+        current["jobs"][job_id]["video_request"] = {
+            key: config[key] for key in ("video_model", "ratio", "resolution", "generate_audio", "video_watermark")
+            if key in config}
         if kind == "voice":
             current["jobs"][job_id]["audition_profile"] = copy.deepcopy(obj.get("audition_profile", {}))
             current["jobs"][job_id]["duration"] = duration
@@ -1042,9 +1087,8 @@ def _shot(root, ep_id, shot_id, previous):
     active = s["jobs"].get(shot.get("job_id", ""))
     if active and (active.get("kind") != "video" or active.get("item_id") != shot_id):
         raise core.GateError("生成任务与当前片段不匹配，请先核对记录；未提交新任务。")
-    if (not active and shot.get("status") == "generating" and shot.get("prompt_approval")
-            and shot.get("prompt_candidate", {}).get("manual_prompt")):
-        raise core.GateError("手动生成记录尚无可恢复的任务编号；已保留原文和费用记录，未自动改写或重新提交。")
+    if not active and shot.get("status") == "generating" and shot.get("prompt_approval"):
+        raise core.GateError("生成记录尚无可恢复的任务编号；已保留原文、所选模型和费用记录，未自动改写或重新提交。")
     if shot["status"] == "generation_failed" or (shot["status"] == "review_required" and not shot.get("file")
             and active and active.get("state") == "failed"):
         return _shot_generation_failed(root, shot_id)
@@ -1148,15 +1192,17 @@ def _shot(root, ep_id, shot_id, previous):
         current = core.load_project(root)
         current_shot = core._find(current, "shot", shot_id)
         candidate = current_shot.get("prompt_candidate", {})
-        if (candidate.get("manual_prompt") and current_shot.get("prompt_approval")
+        approval = current_shot.get("prompt_approval", {})
+        if (candidate and approval.get("candidate_id") == candidate.get("id")
+                and approval.get("request_hash") == candidate.get("request_hash")
                 and not current_shot.get("job_id")
                 and not any(core.execution_unsettled(job) and job.get("kind") == "video"
                             and job.get("item_id") == shot_id for job in current["jobs"].values())
                 and not any(attempt.get("revision", 0) == current_shot.get("revision", 0)
                             for attempt in current_shot.get("attempts", []))):
             # Local validation/budget can fail before any reservation or POST.
-            # Restore the still-unsubmitted consent instead of letting a resume
-            # interpret "generating, no job" as permission for a GPT rewrite.
+            # Preserve the unsubmitted model/text consent instead of letting a
+            # resume interpret "generating, no job" as a fresh GPT rewrite.
             _save_shot(root, shot_id, status="prompt_approved", version=candidate["version"] - 1)
         failed = current["jobs"].get(current_shot.get("job_id", ""), {})
         if failed.get("state") != "failed" or failed.get("accounting") == "unknown":

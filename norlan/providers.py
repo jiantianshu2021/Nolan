@@ -170,6 +170,8 @@ class ArkProvider:
 
     def __init__(self, config: dict):
         self.config = dict(config)
+        from .video_models import capabilities
+        self.capabilities = capabilities(config)
         self.base_url = _https_url(str(config.get("base_url", "https://ark.cn-beijing.volces.com/api/v3")).rstrip("/"))
         self.timeout = float(config.get("timeout", 120))
         if not math.isfinite(self.timeout) or not 1 <= self.timeout <= 600:
@@ -362,6 +364,24 @@ class ArkProvider:
         except (OSError, ValueError, KeyError, subprocess.SubprocessError):
             raise ProviderError("声音参考须为可读取的 2–15 秒 WAV/MP3，且本机已安装 ffprobe。") from None
 
+    def validate_video_inputs(self, duration, references, audio_references, previous_video=None):
+        """Reject incompatible models/specifications before reserving a paid task."""
+        from .video_models import validate_request
+        try:
+            validate_request(self.config, duration, len(references), len(audio_references), previous_video is not None)
+        except ValueError as exc:
+            raise ProviderError(str(exc)) from None
+        if (isinstance(duration, bool) or not math.isfinite(float(duration))
+                or not self.capabilities["min_duration"] <= duration <= self.capabilities["max_duration"]
+                or int(duration) != duration):
+            raise ProviderError(f"本模型视频时长须为 {self.capabilities['min_duration']}–{self.capabilities['max_duration']} 之间的整数秒。")
+        if len(references) > 9 or len(audio_references) > 3:
+            raise ProviderError("当前连续性流程每次最多 9 张参考图、3 段声音参考；不会静默丢弃素材。")
+        if audio_references and not (references or previous_video):
+            raise ProviderError("声音参考须搭配图片或视频。")
+        if sum(self._audio_duration(p) for p in audio_references) > 15.01:
+            raise ProviderError("当前连续性流程的声音参考总时长不能超过 15 秒。")
+
     def submit_video(self, prompt: str, duration: float, references: list[Path],
                      previous_video: Path | str | None = None,
                      audio_references: list[Path] | None = None) -> dict:
@@ -369,14 +389,7 @@ class ArkProvider:
         refs, audio = list(references), list(audio_references or [])
         if not prompt.strip():
             raise ProviderError("视频提示词不能为空。")
-        if isinstance(duration, bool) or not math.isfinite(float(duration)) or not 4 <= duration <= 15 or int(duration) != duration:
-            raise ProviderError("本适配器视频时长须为 4–15 之间的整数秒。")
-        if len(refs) > 9 or len(audio) > 3:
-            raise ProviderError("每次最多 9 张参考图、3 段声音参考；不会静默丢弃素材。")
-        if audio and not (refs or previous_video):
-            raise ProviderError("Seedance 2.0 的声音参考须搭配图片或视频。")
-        if sum(self._audio_duration(p) for p in audio) > 15.01:
-            raise ProviderError("全部声音参考的总时长不能超过 15 秒。")
+        self.validate_video_inputs(duration, refs, audio, previous_video)
         content = [{"type": "text", "text": prompt}]
         content.extend({"type": "image_url", "image_url": {"url": _data_uri(p, "image", 30_000_000)},
                         "role": "reference_image"} for p in refs)

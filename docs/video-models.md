@@ -1,0 +1,46 @@
+# 分段视频模型
+
+每个片段在生成前可以选择模型。选择与该片段的提示词候选、审批和生成任务绑定，不修改项目默认模型，不影响已经提交的任务、旧视频或声音资产。手动修改完整提示词后仍采用用户原文，模型选择不会触发 GPT 重写。
+
+## 已核实的模型
+
+核验日期：2026-10-20。以下为火山方舟正式 Model ID。
+
+| 模型 | Model ID | 输出时长 | 输出分辨率 |
+| --- | --- | --- | --- |
+| Seedance 2.0 Fast | `doubao-seedance-2-0-fast-260128` | 4–15 秒 | 480p、720p |
+| Seedance 2.0 | `doubao-seedance-2-0-260128` | 4–15 秒 | 480p、720p、1080p、4k |
+| Seedance 2.0 Mini | `doubao-seedance-2-0-mini-260615` | 4–15 秒 | 480p、720p |
+| Seedance 2.5 | `doubao-seedance-2-5-260628` | 4–30 秒 | 480p、720p、1080p |
+
+这四款均支持原生音频、全模态参考和官方尾帧。Nolan 本次继续采用已有的保守引用范围：最多 9 张参考图、3 段音频，总音频不超过 15 秒，原始视频参考不超过 15 秒。虽然 Seedance 2.5 的官方引用上限更高，本次没有扩大素材数量和引用时长，也不会因切换模型修改已经确认的片段时长。
+
+Seedance 1.0 Pro (`doubao-seedance-1-0-pro-250528`) 和 Pro Fast (`doubao-seedance-1-0-pro-fast-251015`) 保留在列表中并显示不可用原因：它们支持官方尾帧，但不支持当前流程所需的原生声音和全模态参考。Seedance 1.5 Pro 已于 2026-09-21 关停，不作为新增选项。
+
+时长、分辨率或引用不兼容时，在提交前说明原因；不会静默缩短时长、丢弃参考或更换为其他模型。既有自定义接入点可维持当前配置，任意未知 ID 不能通过网页新增为选择项。目录不代表当前账号已经取得服务权限；权限错误仍由供应商返回并展示。
+
+## 价格与预算
+
+当前在线推理刊例价，单位为人民币／百万 `completion_tokens`。每个单元格依次为「无参考视频／有参考视频」；图片和音频参考不属于参考视频。
+
+| 模型 | 480p、720p | 1080p | 4k |
+| --- | --- | --- | --- |
+| 2.0 Fast | 37／22 | — | — |
+| 2.0 | 46／28 | 51／31 | 26／16 |
+| 2.0 Mini | 23／14 | — | — |
+| 2.5 | 70／42 | 77／46 | — |
+
+Fast 和 Mini 的企业限时优惠已于 2026-10-07 结束，以上使用原价。Nolan 为每次新任务保存对应模型、分辨率和有无参考视频的价格快照，以供应商返回的 `usage.completion_tokens` 计算「按实际用量计费（未对账）」。优惠、赠额、账户扣费以供应商账单核对为准；新增模型不会重写旧快照。
+
+预算预占与实际费用分开。官方预估公式为「（输入视频时长 + 输出时长）× 输出宽 × 输出高 × 24 ÷ 1024」；含参考视频还存在最低 token 计费量。缺少匹配最低量证据时，不将普通像素公式冒充精确费用。未知接入点、币种、服务等级或规格保持费用待核实。
+
+规格已知时，新的预算预占会取原每秒上限与本模型无视频参考单秒估算的 115% 两者较大值，再计入输入及输出时长，避免较贵模型沿用 Fast 的预占额度。这个数是本地支出控制用的预占额度，不是供应商报价或实际扣费；含参考视频的精确最低用量仍以供应商回传为准。
+
+## 官方资料
+
+- [视频生成教程与像素尺寸表](https://docs.volcengine.com/docs/ark/video-generation-tutorial?lang=zh)
+- [创建视频生成任务 API 与素材限制](https://docs.volcengine.com/docs/ark/create-video-generation-task-api?lang=zh)
+- [Seedance 2.0 系列](https://docs.volcengine.com/docs/ark/seedance-2-0?lang=zh)
+- [Seedance 2.5](https://docs.volcengine.com/docs/ark/seedance-2-5?lang=zh)
+- [模型价格](https://docs.volcengine.com/docs/ark/model-pricing?lang=zh&redirect=1)
+- [模型下线通知](https://docs.volcengine.com/docs/ark/model-deprecation-notice?lang=zh)

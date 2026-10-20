@@ -29,11 +29,17 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   approval for the complete final prompt; do not add a seconds-selection gate.
 - The prompt editor at the pre-generation confirmation step starts with the entire prepared
   prompt. Its explicit Save and Generate action adopts the user's exact text
-  and authorizes one video, with current duration/provider/references. Never run
+  and authorizes one video, with current duration/references and any explicitly
+  selected video model. Never run
   GPT planning/refinement, append old prompt rules or require another prompt
   approval on this route. Archive original/corrected text with exact hashes;
   stale inputs and unknown outcomes block without discarding the human text or
   silently reverting to GPT. Ordinary video rework retains asset/storyboard gates.
+- Per-segment video model selection is bound atomically to the prompt hash,
+  human consent, provider request and price snapshot. Do not change project
+  defaults, existing media or in-flight jobs. Resume by the saved task ID and
+  original request settings; never silently switch models, remove references
+  or change duration to make a model compatible. Record effective wire defaults.
 - Keep keys out of project state, logs, tests and version control.
 - Use argv for subprocesses, never shell commands from GPT output.
 - Keep original media immutable and decisions bound to version and file hash.

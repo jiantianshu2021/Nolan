@@ -804,7 +804,7 @@ def _invalidate_shot(shot, reason, *, increment_revision=True, state=None):
             ("file", "sha256", "evidence", "review", "version", "human_decision", "approved_at",
              "approved_sha256", "approved_version", "continuity_review", "job_id", "prompt", "dialogue",
              "duration", "scene_id", "subshots", "continuity_notes", "asset_ids", "refined_prompt",
-             "reference_manifest", "prompt_candidate", "prompt_approval", "storyboard_revision",
+             "reference_manifest", "prompt_candidate", "prompt_approval", "video_model", "storyboard_revision",
              "storyboard_revision_binding", "source_shot_ids", "source_shot_instructions") if k in shot})
     if shot.get("prompt_candidate"):
         shot.setdefault("prompt_history", []).append(copy.deepcopy(shot["prompt_candidate"]))
@@ -1475,9 +1475,9 @@ def activate_asset_amendment(root, amendment_id):
     return True
 
 
-def approve_prompt(root, shot_id, candidate_id, sha256):
+def approve_prompt(root, shot_id, candidate_id, sha256, video_model=None):
     from .prompt_gate import approve
-    return approve(root, shot_id, candidate_id, sha256)
+    return approve(root, shot_id, candidate_id, sha256, video_model=video_model)
 
 
 def reject_prompt(root, shot_id, candidate_id, sha256, feedback):
@@ -1485,9 +1485,9 @@ def reject_prompt(root, shot_id, candidate_id, sha256, feedback):
     return reject(root, shot_id, candidate_id, sha256, feedback)
 
 
-def edit_prompt_and_approve(root, shot_id, candidate_id, sha256, prompt):
+def edit_prompt_and_approve(root, shot_id, candidate_id, sha256, prompt, video_model=None):
     from .prompt_gate import edit_and_approve
-    return edit_and_approve(root, shot_id, candidate_id, sha256, prompt)
+    return edit_and_approve(root, shot_id, candidate_id, sha256, prompt, video_model=video_model)
 
 
 def submit_planning_feedback(root, shot_id, feedback, expected_version, analysis_signature):
