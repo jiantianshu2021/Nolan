@@ -134,7 +134,10 @@ def doctor():
             findings["GPT 登录"] = "已有登录" if result.returncode == 0 else "需要 codex login"
         except (OSError, subprocess.TimeoutExpired):
             findings["GPT 登录"] = "无法查询"
-    for key in ("ARK_API_KEY", "OPENAI_API_KEY", "VOLC_ACCESS_KEY_ID", "VOLC_SECRET_ACCESS_KEY"):
+    from .credentials import ark_key_status
+    ark_status = ark_key_status()
+    findings["ARK_API_KEY"] = {key: ark_status.get(key) for key in ("available", "source", "message")}
+    for key in ("OPENAI_API_KEY", "VOLC_ACCESS_KEY_ID", "VOLC_SECRET_ACCESS_KEY"):
         findings[key] = "已设置（不显示内容）" if os.environ.get(key) else "未设置"
     print(json.dumps(findings, ensure_ascii=False, indent=2))
     print("即梦 CLI 仅检测安装；其当前文字生视频能力未用于需要实际参考素材的自动生产。")
@@ -146,13 +149,19 @@ def main(argv=None):
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--resume", action="store_true", help="继续最近一次 Nolan GPT 对话")
     parser.add_argument("-C", "--cd", dest="workdirs", action="append", type=Path, metavar="DIR",
-                        help="GPT 原生终端对话的工作目录；仅用于无子命令或 chat")
+                        help="GPT 原生终端对话的工作目录；用于无子命令、chat 或 ark-login")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("doctor", help="检查本地工具与账户配置，不显示密钥")
     sub.add_parser("connection", help="查看 GPT 订阅/API 连接选择")
     music_login = sub.add_parser("music-login", help="隐藏输入火山音乐AK/SK并启动Nolan，仅保留在本次进程")
     music_login.add_argument("project", type=Path, nargs="?")
     music_login.add_argument("--resume", action="store_true", dest="music_resume")
+    ark_login = sub.add_parser("ark-login", help="本机隐藏输入方舟 API Key，保存到 macOS 钥匙串后启动 Nolan")
+    ark_login.add_argument("project", type=Path, nargs="?")
+    ark_login.add_argument("--resume", action="store_true", dest="ark_resume", help="保存后继续最近一次 GPT 对话")
+    ark_login.add_argument("-C", "--cd", dest="ark_workdirs", action="append", type=Path, metavar="DIR",
+                           help="保存后启动 GPT 原生对话的工作目录")
+    ark_login.add_argument("--no-launch", action="store_true", help="仅保存凭据，不启动或打断对话，不调用生成服务")
     music_folder = sub.add_parser("music-folder", help="注册本地音乐文件夹；可扫描新曲目供本人试听审批，无需音乐 API")
     music_folder.add_argument("project", type=Path)
     music_folder.add_argument("folder", type=Path, nargs="?", help="本地音乐目录；省略则沿用项目已保存的目录")
@@ -220,13 +229,14 @@ def main(argv=None):
     p.add_argument("--correction", required=True)
     args = parser.parse_args(argv)
     try:
-        workdirs = (args.workdirs or []) + (getattr(args, "chat_workdirs", None) or [])
-        if workdirs and args.command not in {None, "chat"}:
-            raise ValueError("--cd 只用于 GPT 原生对话；请使用 nolan -C 目录 或 nolan chat -C 目录。")
+        workdirs = ((args.workdirs or []) + (getattr(args, "chat_workdirs", None) or [])
+                    + (getattr(args, "ark_workdirs", None) or []))
+        if workdirs and args.command not in {None, "chat", "ark-login"}:
+            raise ValueError("--cd 只用于 GPT 原生对话或 ark-login；请使用 nolan -C 目录 或 nolan chat -C 目录。")
         if len({os.path.abspath(path.expanduser()) for path in workdirs}) > 1:
             raise ValueError("多次指定的 --cd 工作目录冲突；请只指定一个工作目录。")
-        if args.resume and args.command not in {None, "chat"}:
-            raise ValueError("--resume 用于恢复 GPT 对话；使用 nolan --resume 或 nolan chat --resume。")
+        if args.resume and args.command not in {None, "chat", "ark-login"}:
+            raise ValueError("--resume 用于恢复 GPT 对话；使用 nolan --resume、nolan chat --resume 或 nolan ark-login --resume。")
         if args.command == "setup":
             from .connection import setup
             return setup(args.provider, args.model)
@@ -237,6 +247,11 @@ def main(argv=None):
         if args.command == "music-login":
             from .music_setup import launch_with_music
             return launch_with_music(args.project, resume=args.music_resume)
+        if args.command == "ark-login":
+            from .ark_setup import launch_with_ark
+            options = {"workdir": workdirs[0]} if workdirs else {}
+            return launch_with_ark(args.project, resume=args.resume or args.ark_resume,
+                                   no_launch=args.no_launch, **options)
         if args.command in (None, "chat"):
             from .interactive import launch
             launch_options = {"workdir": workdirs[0]} if workdirs else {}

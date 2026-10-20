@@ -11,6 +11,14 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   Ordinary files can be edited with native tools; production approvals, budget,
   provider submissions and ledger changes use Nolan's MCP flow. Never claim the
   desktop app's browser/plugins are automatically available in the CLI.
+- Ark credentials resolve from the explicitly selected environment variable,
+  then the fixed macOS Keychain item for default ARK_API_KEY. Saving/rotating
+  requires the user's local ark-login command and hidden input. Never put keys
+  into command arguments, shell tools, project JSON, logs or plaintext config.
+  Missing, locked and access-denied are distinct diagnostics. Native shell
+  isolation must not lead to a false report that the MCP provider lacks a key;
+  get_credentials_status/doctor use the same resolver. Credential checks do not
+  generate media, approve anything, clear failures or retry existing jobs.
 
 - Never auto-approve a person, scene, voice, plan, video segment or episode.
 - GPT video reviews are advisory only. Every new video version waits for the

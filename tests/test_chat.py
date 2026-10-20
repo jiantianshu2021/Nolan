@@ -207,7 +207,7 @@ class ChatTests(unittest.TestCase):
 
     def test_doctor_uses_actual_codex_resolver(self):
         selected = "/Applications/Codex.app/Contents/Resources/codex"
-        with patch("norlan.brain.resolve_codex", return_value=selected), patch("norlan.cli.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run, patch("norlan.cli.shutil.which", return_value="/old/path"), redirect_stdout(io.StringIO()) as output:
+        with patch("norlan.brain.resolve_codex", return_value=selected), patch("norlan.cli.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run, patch("norlan.cli.shutil.which", return_value="/old/path"), patch("norlan.credentials.ark_key_status", return_value={"available": False, "source": "missing", "message": "合成凭据测试"}), redirect_stdout(io.StringIO()) as output:
             self.assertEqual(doctor(), 0)
         self.assertEqual(run.call_args.args[0], [selected, "login", "status"])
         self.assertIn(selected, output.getvalue())

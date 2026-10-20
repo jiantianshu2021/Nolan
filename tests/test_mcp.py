@@ -48,7 +48,7 @@ class MCPTests(unittest.TestCase):
             self.assertEqual(self.initialize(protocol)["result"]["protocolVersion"], protocol)
         self.assertEqual(self.initialize("future")["result"]["protocolVersion"], "2025-06-18")
         tools = self.server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})["result"]["tools"]
-        self.assertEqual(len(tools), 18)
+        self.assertEqual(len(tools), 19)
         self.assertIn("import_season", {tool["name"] for tool in tools})
         self.assertTrue({"list_directory", "find_files"} <= {tool["name"] for tool in tools})
         self.assertTrue(all(t["inputSchema"]["additionalProperties"] is False for t in tools))
@@ -88,7 +88,7 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         responses = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([response["id"] for response in responses], [1, 2])
-        self.assertEqual(len(responses[1]["result"]["tools"]), 18)
+        self.assertEqual(len(responses[1]["result"]["tools"]), 19)
         self.assertEqual(result.stderr, "")
 
     def test_module_stdio_entrypoint_passes_explicit_workdir(self):

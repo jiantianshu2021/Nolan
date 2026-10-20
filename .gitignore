@@ -11,6 +11,10 @@ dist/
 !.env.example
 auth.json
 *credentials*
+!norlan/credentials.py
+!tests/test_credentials.py
+!tests/test_ark_credentials_flow.py
+!docs/credentials.md
 projects/
 norlan-project-*/
 norlan-demo-*/

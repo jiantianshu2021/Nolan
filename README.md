@@ -1,5 +1,7 @@
 # Nolan
 
+0.7.9 修复重开终端后丢失方舟凭据的问题。方舟图片、视频 API Key 可通过 `nolan ark-login` 在本人终端隐藏输入，并保存到 macOS 钥匙串。以后启动自动读取，无需每次重新配置；环境变量优先。凭据不写入项目、命令参数或日志。详见[方舟凭据与重启恢复](docs/credentials.md)。
+
 0.7.8 接通原生 Codex CLI 的本地文件与命令能力。可用 `nolan -C "/Users/jts2025/Desktop/御剑飞行"` 指定工作目录，让 Nolan 自己查找剧本、读取和编辑文件、按需执行本地命令；也支持 `nolan chat -C 目录` 和 `nolan --resume -C 目录`。标准权限为 `workspace-write` 与 `on-request`，需要扩大权限时由原生终端发起审批，不静默启用无限制执行。新制作项目放在指定目录内的独立空子目录，旧项目不搬移，原有资产、提示词和成片审批保留。详见[本地工作目录与原生工具](docs/local-workspace.md)。
 
 0.7.7 修复剧本/GPT改字与实际发音不符、自动对齐只改时间而无法解开阻塞的问题。原识别文字只有经独立音轨证据完整支持才可恢复；保留失败报告与已用的两次时间修复额度，不降低字幕验收标准。仍有疑点时生成字幕待核验预览，阻止最终批准，方便直接对照声音修改。继续不会反复检查或重渲染同版诊断预览。字幕烧录在耗时合成前明确检查滤镜和中文字体，缺失时显示具体配置原因。后期表格随后台最新校对结果更新；未保存的手动编辑保留并提示后台变化，避免旧识别稿一直显示或旧索引套用新音乐。
@@ -68,6 +70,8 @@ nolan -C "/Users/jts2025/Desktop/御剑飞行"  # 在指定文件夹中对话、
 nolan chat --resume -C "/Users/jts2025/Desktop/御剑飞行"
 nolan setup              # 选择或切换 GPT 连接方式
 nolan connection         # 查看当前连接选择
+nolan ark-login --resume -C "/Users/jts2025/Desktop/御剑飞行"  # 本机保存方舟 Key 后恢复对话
+nolan ark-login --no-launch  # 仅安全保存，不启动对话或生成素材
 ```
 
 原生对话里的 `/new` 是新对话，不是旧控制台的导入小说命令。导入小说直接使用自然语言即可。退出后制作文件与历史仍保留；重新打开可让 Nolan 查看项目并继续。
@@ -159,7 +163,8 @@ nolan run ./my-drama
 
 ```bash
 cp examples/settings.example.json ./settings.json
-# 编辑 settings.json 后，在当前终端配置 ARK_API_KEY。
+# 编辑 settings.json 后，在本人终端隐藏输入并保存方舟 API Key。
+nolan ark-login --no-launch
 nolan configure ./my-drama --file ./settings.json --budget 30
 ```
 
@@ -177,7 +182,7 @@ nolan configure ./my-drama --file ./settings.json --budget 30
 | `max_attempts` / `max_llm_calls` | `max_attempts` 限制每项资产（含声音试片）的累计生成尝试，以及同一版音轨和转录配置的字幕转录尝试；`max_llm_calls` 限制项目 GPT 调用次数。视频片段由每次明确人工返工授权一次新提交，不以 `max_attempts` 自动重试或阻止再次人工返工。 |
 | `creative_brief` | 额外创作要求，用于下一次规划；不会自行改写已批准方案。 |
 
-密钥只通过终端环境变量读取，不要放入小说、提示词、配置文件或 Git 仓库。ChatGPT 订阅不包含 OpenAI API 和火山媒体服务费用；即梦网页登录也不能代替 `ARK_API_KEY`。
+方舟 Key 优先从当前终端的 `ARK_API_KEY` 读取，否则自动读取本机 macOS 钥匙串；用 `nolan ark-login` 保存一次即可在重启后继续使用。其他服务凭据依各适配器配置，不要放入小说、提示词、配置文件或 Git 仓库。ChatGPT 订阅不包含 OpenAI API 和火山媒体服务费用；即梦网页登录也不能代替方舟凭据。钥匙串被锁定或拒绝访问时会提示具体原因，不会静默改存明文；详见[凭据说明](docs/credentials.md)。
 
 图片与视频须分别指定模型：`image_model` 使用已开通的 Seedream，`video_model` 使用已开通的 Seedance 2.x；同一方舟 API Key 可以在获得相应权限后调用两者。Seedream 5.0 flash/pro 的图片请求采用其支持的单图参数。已知的模型类型填反会在本地预检时报告，避免发送无效请求。模型 ID 与参数能力请以[官方图片接口](https://docs.volcengine.com/docs/ark/image-generation-api?lang=zh)为准。
 
@@ -203,7 +208,7 @@ nolan costs ./my-drama --json
 nolan costs ./my-drama --sync
 ```
 
-`--sync` 需要当前终端已有方舟凭据。它只向已有任务发出 GET 查询，不提交生成、不下载素材，也不批准资产或解除结果不明的任务。查不到用量时保留未知，不从视频时长、分辨率或本地文件数量反推“实际用量”。账单查询与任务用量查询是两回事：当前命令不会自动读取账户扣款账单。
+`--sync` 需要可读取的方舟凭据（当前环境变量或已保存的本机钥匙串记录）。它只向已有任务发出 GET 查询，不提交生成、不下载素材，也不批准资产或解除结果不明的任务。查不到用量时保留未知，不从视频时长、分辨率或本地文件数量反推“实际用量”。账单查询与任务用量查询是两回事：当前命令不会自动读取账户扣款账单。
 
 新调用会保存用量和价格依据。当前内置价格仅覆盖已核实的精确模型 `doubao-seedream-5-0-flash-260915` 与 `doubao-seedance-2-0-fast-260128` 的受支持规格；接入点别名、其他模型、第三方端点或无法核实的设置不会套用相似模型价格。公开价依据为 [火山方舟模型价格](https://docs.volcengine.com/docs/ark/model-pricing?lang=zh&redirect=1)，本轮核对日期为 2026-10-20。
 

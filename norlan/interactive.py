@@ -28,7 +28,7 @@ _MCP_TOOLS = (
     "project_status", "list_projects", "list_directory", "find_files", "read_novel", "create_project", "save_plan", "import_season",
     "run_production", "pause_production", "request_revision", "correct_captions",
     "set_voice_audition", "get_costs",
-    "open_review", "set_creative_brief", "propose_segments", "propose_asset_amendment",
+    "open_review", "set_creative_brief", "propose_segments", "propose_asset_amendment", "get_credentials_status",
 )
 _SERVICE_ENV = (
     "ARK_API_KEY", "OPENAI_API_KEY", "VOLC_ACCESS_KEY_ID", "VOLC_SECRET_ACCESS_KEY",
@@ -85,6 +85,10 @@ groups 必须按原顺序完整覆盖该尾部的全部 ID；保留不适合合�
 用 set_voice_audition 保存另选的有效原句，候选或已批准声音须先按用户明确意见申请返工。
 费用用 get_costs 查看或同步：已核对账单金额、按实际用量计算的标准价、预算占用分开说明；
 没有账单时不得把预留或标准价称为真实扣款。同步只查询已有任务，不触发视频生成。
+火山 API 凭据状态用 get_credentials_status 核对：环境变量优先，默认 ARK_API_KEY 可从 macOS 钥匙串自动读取。
+原生终端有意不继承服务密钥，不能据 shell 的空环境变量就断言制作未配置。缺少时请用户本人在本机运行
+nolan ark-login --resume 隐藏输入并安全保存一次，以后自动复用；不索要聊天里的密钥，不查找 shell 历史或凭据文件。
+钥匙串锁定或访问被拒绝时说明需要解锁/允许读取，不误报为密钥从未提供，不自动重复提交生成。
 保存失败时按工具返回的字段路径和修复建议修改候选方案，再提交；不要猜测 ID 格式或改动无关字段。
 制作状态、审批、预算、供应商提交和返修必须使用 Nolan MCP 工具；不能通过 shell、代码、HTTP、数据库或文件编辑
 伪造审批、提高预算、改 project.json/任务账本、绕过网页关卡或直接重发生成请求。一般文件工作可使用原生工具，

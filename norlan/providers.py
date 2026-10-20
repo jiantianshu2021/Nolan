@@ -165,7 +165,8 @@ def _atomic_bytes(path: Path, data: bytes) -> None:
 class ArkProvider:
     """Use Seedream and Seedance 2.x multimodal references, never web cookies.
 
-    Credentials are read from ARK_API_KEY (or api_key_env), not config files.
+    Credentials use the selected environment variable, then macOS Keychain for
+    the default ARK_API_KEY. Secret values never belong in project config.
     Model IDs must be selected by the operator; endpoint IDs are also accepted.
     Limits are conservative for Seedance 2.0 and also work with 2.5.
     """
@@ -204,9 +205,17 @@ class ArkProvider:
         return value
 
     def _key(self) -> str:
-        key = os.environ.get(str(self.config.get("api_key_env", "ARK_API_KEY")), "")
+        from .credentials import CredentialError, resolve_ark_key
+        name = str(self.config.get("api_key_env", "ARK_API_KEY"))
+        try:
+            key = resolve_ark_key(name)
+        except CredentialError as exc:
+            raise ProviderError(str(exc)) from None
         if not key:
-            raise ProviderError("未配置 ARK_API_KEY；请在本机环境变量中配置，勿写入项目。")
+            if name != "ARK_API_KEY":
+                raise ProviderError("未配置项目指定的火山凭据环境变量；请核对本机环境配置，不要在项目或聊天里填写密钥。")
+            raise ProviderError("未配置 ARK_API_KEY；请在本机终端运行 nolan ark-login，隐藏输入并保存到 macOS 钥匙串。"
+                                "以后启动自动读取，无需每次重新输入；勿在聊天或项目文件里填写密钥。")
         return key
 
     def _model(self, kind: str) -> str:
