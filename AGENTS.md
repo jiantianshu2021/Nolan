@@ -27,6 +27,13 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
 - GPT selects concise system broadcasts and their timing; retain full rules in
   the on-screen system UI and preserve character dialogue. Keep a single human
   approval for the complete final prompt; do not add a seconds-selection gate.
+- The prompt editor at the pre-generation confirmation step starts with the entire prepared
+  prompt. Its explicit Save and Generate action adopts the user's exact text
+  and authorizes one video, with current duration/provider/references. Never run
+  GPT planning/refinement, append old prompt rules or require another prompt
+  approval on this route. Archive original/corrected text with exact hashes;
+  stale inputs and unknown outcomes block without discarding the human text or
+  silently reverting to GPT. Ordinary video rework retains asset/storyboard gates.
 - Keep keys out of project state, logs, tests and version control.
 - Use argv for subprocesses, never shell commands from GPT output.
 - Keep original media immutable and decisions bound to version and file hash.

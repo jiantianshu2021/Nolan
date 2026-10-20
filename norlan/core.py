@@ -1485,6 +1485,11 @@ def reject_prompt(root, shot_id, candidate_id, sha256, feedback):
     return reject(root, shot_id, candidate_id, sha256, feedback)
 
 
+def edit_prompt_and_approve(root, shot_id, candidate_id, sha256, prompt):
+    from .prompt_gate import edit_and_approve
+    return edit_and_approve(root, shot_id, candidate_id, sha256, prompt)
+
+
 def submit_planning_feedback(root, shot_id, feedback, expected_version, analysis_signature):
     """Resolve a visible planning question with new human instructions only.
 

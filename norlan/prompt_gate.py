@@ -17,6 +17,35 @@ def _hash(value):
                                      separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
+MANUAL_PROMPT_LIMIT = 100000
+MANUAL_PROMPT_NOTE = "人工直接编辑的最终提示词，按原文提交；未由 GPT 重写或重新核对对白、切点。生成时长和参考素材沿用本次候选。"
+
+
+def _text_digest(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _manual_source(shot, marker, prompt):
+    fields = {"mode", "source_candidate_id", "source_request_hash", "source_prompt_sha256", "edited_prompt_sha256"}
+    if (not isinstance(marker, dict) or set(marker) != fields or marker.get("mode") != "exact_text"
+            or not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MANUAL_PROMPT_LIMIT or "\x00" in prompt
+            or marker.get("edited_prompt_sha256") != _text_digest(prompt)):
+        raise core.GateError("手动提示词记录与实际文本不符，未提交视频。")
+    source = next((item for item in reversed(shot.get("prompt_history", []))
+                   if item.get("id") == marker.get("source_candidate_id")
+                   and item.get("request_hash") == marker.get("source_request_hash")
+                   and item.get("status") == "superseded_by_manual_edit"), None)
+    if (not source or source.get("manual_prompt") or not isinstance(source.get("prompt"), str)
+            or marker.get("source_prompt_sha256") != _text_digest(source["prompt"])):
+        raise core.GateError("手动提示词的原始候选缺失或已变化，未提交视频。")
+    return source
+
+
+def _manual_refined(prompt, marker):
+    return {"prompt": prompt, "dialogue": "", "continuity_notes": MANUAL_PROMPT_NOTE,
+            "manual_prompt": copy.deepcopy(marker)}
+
+
 def _timing_text(value, label, maximum):
     if not isinstance(value, str) or not value.strip() or len(value) > maximum or "\x00" in value:
         raise core.GateError(f"时间安排的{label}须为非空文本，最多{maximum}字。")
@@ -208,7 +237,12 @@ def candidate_timeline_prompt(shot, refined):
 
 
 def specification(state, shot, prompt, manifest, refined=None):
-    broadcast = validate_broadcast_proposal(shot, refined or {}, state)
+    manual = (refined or {}).get("manual_prompt")
+    if manual is not None:
+        _manual_source(shot, manual, prompt)
+        if refined != _manual_refined(prompt, manual):
+            raise core.GateError("手动提示词不能夹带未经确认的自动时间表。")
+    broadcast = None if manual is not None else validate_broadcast_proposal(shot, refined or {}, state)
     bindings = []
     for identifier in shot["asset_ids"]:
         asset = core._find(state, "asset", identifier)
@@ -237,7 +271,9 @@ def specification(state, shot, prompt, manifest, refined=None):
     if updates:
         specification["future_continuity_updates"] = updates
         specification["future_continuity_binding"] = copy.deepcopy(shot["future_continuity_binding"])
-    proposal = validate_timing_proposal(shot, refined or {})
+    if manual is not None:
+        specification["manual_prompt"] = copy.deepcopy(manual)
+    proposal = None if manual is not None else validate_timing_proposal(shot, refined or {})
     if proposal is not None:
         specification["timing_proposal"] = proposal
         specification["timing_refinement"] = {key: copy.deepcopy(refined.get(key))
@@ -250,6 +286,18 @@ def specification(state, shot, prompt, manifest, refined=None):
 
 
 def _validate_candidate_timing(shot, candidate):
+    if candidate.get("manual_prompt") is not None:
+        marker = candidate["manual_prompt"]
+        source = _manual_source(shot, marker, candidate.get("prompt"))
+        _validate_candidate_timing(shot, source)
+        for key in ("version", "revision", "reference_manifest", "storyboard_revision", "future_continuity_updates"):
+            if candidate.get(key) != source.get(key):
+                raise core.GateError("手动提示词的素材或分镜绑定已变化，未提交视频。")
+        if (candidate.get("refined") != _manual_refined(candidate["prompt"], marker)
+                or candidate.get("dialogue") != "" or candidate.get("continuity_notes") != MANUAL_PROMPT_NOTE
+                or any(key in candidate for key in ("timing_proposal", "timing_summary", "effective_subshots", "broadcast_proposal"))):
+            raise core.GateError("手动提示词保留了冲突的自动检查元数据，未提交视频。")
+        return
     from .storyboard_revision import public
     try:
         redesign = public(shot)
@@ -386,6 +434,43 @@ def approve(root, shot_id, candidate_id, request_hash):
     return core.load_project(root)
 
 
+def edit_and_approve(root, shot_id, candidate_id, request_hash, prompt):
+    """One explicit UI submission adopts raw text and authorizes one video.
+
+    No LLM parses, rewrites, or appends to this prompt. The original candidate's
+    provider duration/references stay bound, while all stale GPT delivery claims
+    are archived with the original instead of attributed to the human text.
+    """
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MANUAL_PROMPT_LIMIT or "\x00" in prompt:
+        raise ValueError("请填写不超过 100000 字的完整提示词，不能包含空字符。")
+    with core.run_lock(root), core.transaction(root) as state:
+        if any(core.execution_unsettled(job) for job in state["jobs"].values()):
+            raise core.GateError("尚有调用正在执行或结果待核实，未提交新视频。")
+        shot = core._find(state, "shot", shot_id)
+        original = _bound(shot, candidate_id, request_hash)
+        _validate_inputs(root, state, shot, original)
+        stamp = core.now()
+        archived = {**copy.deepcopy(original), "status": "superseded_by_manual_edit", "superseded_at": stamp}
+        shot.setdefault("prompt_history", []).append(archived)
+        marker = {"mode": "exact_text", "source_candidate_id": candidate_id, "source_request_hash": request_hash,
+                  "source_prompt_sha256": _text_digest(original["prompt"]), "edited_prompt_sha256": _text_digest(prompt)}
+        candidate = copy.deepcopy(original)
+        for key in ("timing_proposal", "timing_summary", "effective_subshots", "broadcast_proposal"):
+            candidate.pop(key, None)
+        candidate.update(id="prompt-" + uuid.uuid4().hex[:12], status="approved", prompt=prompt,
+            dialogue="", continuity_notes=MANUAL_PROMPT_NOTE, refined=_manual_refined(prompt, marker),
+            manual_prompt=marker, created_at=stamp, approved_at=stamp)
+        candidate["request_hash"] = _hash(specification(state, shot, prompt, candidate["reference_manifest"], candidate["refined"]))
+        _validate_inputs(root, state, shot, candidate)
+        shot.update(status="prompt_approved", prompt_candidate=candidate, prompt_approval={
+            "candidate_id": candidate["id"], "request_hash": candidate["request_hash"],
+            "at": stamp, "decision": "generate", "source": "human_manual_edit"})
+        state.update(status="ready", last_error=None)
+        core.event(state, "human_edited_prompt", id=shot_id, candidate_id=candidate["id"],
+                   source_candidate_id=candidate_id, request_hash=candidate["request_hash"], version=candidate["version"])
+    return core.load_project(root)
+
+
 def reject(root, shot_id, candidate_id, request_hash, feedback):
     if not isinstance(feedback, str) or not feedback.strip() or len(feedback) > 12000:
         raise ValueError("请填写不超过12000字的提示词修改意见。")
@@ -420,7 +505,10 @@ def approved(root, shot):
     try:
         _validate_inputs(root, state, current, candidate)
     except core.GateError:
-        invalidate(root, current["id"])
+        # Keep manual text/consent intact on failure; a resume must not turn
+        # it into a new GPT rewrite. Changed inputs still cannot be submitted.
+        if not candidate.get("manual_prompt"):
+            invalidate(root, current["id"])
         raise
     return copy.deepcopy(candidate)
 

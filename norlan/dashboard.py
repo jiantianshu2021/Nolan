@@ -21,6 +21,7 @@ from .regroup import PUBLIC_ERRORS as SEGMENT_ERRORS
 
 MAX_BODY = 32_768
 MAX_POST_EDIT_BODY = 1_048_576
+MAX_PROMPT_EDIT_BODY = 1_048_576
 MAX_REFERENCE_BODY = 12 * 1024 * 1024
 MAX_MUSIC_BODY = 42 * 1024 * 1024
 INPUT_ERRORS = frozenset({
@@ -621,6 +622,27 @@ def _public_production_stop(state):
     return result
 
 
+def _public_manual_prompt(shot):
+    """Expose only the actual text bound to this version's manual consent."""
+    candidate, approval = shot.get("prompt_candidate"), shot.get("prompt_approval")
+    if not isinstance(candidate, dict) or not isinstance(approval, dict):
+        return None
+    marker, prompt = candidate.get("manual_prompt"), candidate.get("prompt")
+    expected_version = _version(shot.get("version")) + (shot.get("status") == "prompt_approved")
+    if (candidate.get("status") != "approved" or not isinstance(marker, dict)
+            or marker.get("mode") != "exact_text" or not isinstance(prompt, str)
+            or not prompt.strip() or len(prompt) > 100000 or "\x00" in prompt
+            or not isinstance(candidate.get("id"), str) or not candidate["id"]
+            or type(candidate.get("version")) is not int or candidate["version"] != expected_version
+            or not _valid_sha(candidate.get("request_hash"))
+            or approval.get("candidate_id") != candidate["id"]
+            or approval.get("request_hash") != candidate["request_hash"]
+            or approval.get("source") != "human_manual_edit" or approval.get("decision") != "generate"
+            or marker.get("edited_prompt_sha256") != hashlib.sha256(prompt.encode("utf-8")).hexdigest()):
+        return None
+    return prompt
+
+
 def _public_latest_episode_feedback(state, episode):
     """Use the append-only human decisions, not a stale episode-wide copy."""
     shots = {shot.get("id"): shot for shot in episode.get("shots", []) if isinstance(shot, dict)}
@@ -629,11 +651,15 @@ def _public_latest_episode_feedback(state, episode):
             continue
         action, identifier = record.get("action"), record.get("id")
         direct = identifier in shots
-        relevant = ((action in {"human_planning_feedback", "human_rejected_prompt"} and direct)
+        relevant = ((action in {"human_planning_feedback", "human_rejected_prompt", "human_edited_prompt"} and direct)
                     or (action == "human_rejected" and ((record.get("kind") == "shot" and direct)
                         or (record.get("kind") == "episode" and identifier == episode.get("id")))))
         if not relevant:
             continue
+        if action == "human_edited_prompt":
+            version = record.get("version")
+            label = f"（第{version}版）" if type(version) is int and version > 0 else ""
+            return f"已手动编辑完整提示词并确认直接生成{label}，以本版实际提交内容为准。"
         feedback = record.get("feedback")
         if action == "human_rejected_prompt" and not isinstance(feedback, str):
             # Older prompt decisions saved their actual text on the shot only.
@@ -1324,6 +1350,9 @@ def public_state(state: dict) -> dict:
         item["shots"] = []
         for shot in episode.get("shots", []):
             entry = _pick(shot, ("id", "status", "file", "prompt", "duration"))
+            manual_prompt = _public_manual_prompt(shot)
+            if manual_prompt is not None:
+                entry.update(prompt=manual_prompt, manual_prompt=True)
             if isinstance(shot.get("subshots"), list):
                 entry["subshots"] = [_pick(part, ("start", "end", "prompt"))
                                      for part in shot["subshots"] if isinstance(part, dict)]
@@ -1693,7 +1722,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._host_ok():
             return self._error(403, "仅允许本机访问。")
         path = urlsplit(self.path).path
-        if path not in {"/api/action", "/api/post-edit", "/api/asset-reference", "/api/music-upload"}:
+        if path not in {"/api/action", "/api/post-edit", "/api/prompt-edit", "/api/asset-reference", "/api/music-upload"}:
             return self._error(404, "未找到此操作。")
         context = self.server.context
         if not secrets.compare_digest(self.headers.get("X-Norlan-Token", "").encode("utf-8"), context.token.encode("ascii")):
@@ -1711,7 +1740,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._error(400, "请求长度无效。")
         limit = (MAX_REFERENCE_BODY if path == "/api/asset-reference" else
                  MAX_MUSIC_BODY if path == "/api/music-upload" else
-                 MAX_POST_EDIT_BODY if path == "/api/post-edit" else MAX_BODY)
+                 MAX_POST_EDIT_BODY if path == "/api/post-edit" else
+                 MAX_PROMPT_EDIT_BODY if path == "/api/prompt-edit" else MAX_BODY)
         if length <= 0 or length > limit:
             return self._error(413, "请求过大或为空。")
         try:
@@ -1721,7 +1751,26 @@ class _Handler(BaseHTTPRequestHandler):
             action = data.get("action")
             if path == "/api/post-edit" and action != "edit_postproduction":
                 return self._error(409, "此接口只接受字幕或配乐表格编辑。")
+            if path == "/api/prompt-edit" and action != "edit_prompt_and_generate":
+                return self._error(409, "此接口只接受完整提示词编辑。")
             with context.mutation_lock:
+                if path == "/api/prompt-edit" and action == "edit_prompt_and_generate":
+                    item_id, candidate_id, request_hash, prompt = (data.get(key) for key in
+                                                                 ("id", "candidate_id", "request_hash", "prompt"))
+                    if (set(data) != {"action", "id", "candidate_id", "request_hash", "prompt"}
+                            or not isinstance(item_id, str) or not 0 < len(item_id) <= 128
+                            or not isinstance(candidate_id, str) or not 0 < len(candidate_id) <= 128
+                            or not _valid_sha(request_hash) or not isinstance(prompt, str)
+                            or not prompt.strip() or len(prompt) > 100000 or "\x00" in prompt):
+                        raise ValueError
+                    if context.running or context.external_run_active():
+                        return self._error(409, "制作正在进行，请等待当前任务结束后再编辑提示词。")
+                    try:
+                        _core().edit_prompt_and_approve(context.project_dir, item_id, candidate_id, request_hash, prompt)
+                    except _core().GateError as exc:
+                        from .failures import sanitize_failure
+                        return self._error(409, sanitize_failure({"message": str(exc)})["message"])
+                    return self._json(200, context.state())
                 if path == "/api/action" and action == "set_video_review":
                     if set(data) != {"action", "enabled"} or type(data.get("enabled")) is not bool:
                         raise ValueError

@@ -217,6 +217,12 @@ def _shot_review_target(shot):
 def _review_shot_summary(shot):
     """Compare actual frames against this version's approved delivery draft."""
     refined = shot.get("refined_prompt")
+    if isinstance(refined, dict) and refined.get("manual_prompt"):
+        summary = task_shot_summary(shot)
+        for key in ("dialogue", "subshots", "storyboard_revision"):
+            summary.pop(key, None)
+        summary.update(prompt=refined["prompt"], continuity_notes=prompt_gate.MANUAL_PROMPT_NOTE)
+        return summary
     effective = prompt_gate.effective_shot(shot, refined if isinstance(refined, dict) else {})
     if isinstance(refined, dict) and (refined.get("timing_proposal") is not None
                                       or refined.get("broadcast_proposal") is not None):
@@ -1036,6 +1042,9 @@ def _shot(root, ep_id, shot_id, previous):
     active = s["jobs"].get(shot.get("job_id", ""))
     if active and (active.get("kind") != "video" or active.get("item_id") != shot_id):
         raise core.GateError("生成任务与当前片段不匹配，请先核对记录；未提交新任务。")
+    if (not active and shot.get("status") == "generating" and shot.get("prompt_approval")
+            and shot.get("prompt_candidate", {}).get("manual_prompt")):
+        raise core.GateError("手动生成记录尚无可恢复的任务编号；已保留原文和费用记录，未自动改写或重新提交。")
     if shot["status"] == "generation_failed" or (shot["status"] == "review_required" and not shot.get("file")
             and active and active.get("state") == "failed"):
         return _shot_generation_failed(root, shot_id)
@@ -1054,12 +1063,13 @@ def _shot(root, ep_id, shot_id, previous):
     approved_candidate = prompt_gate.approved(root, shot) if not recovering and shot.get("status") == "prompt_approved" else None
     if not recovering:
         _new_work_gate(s)
-        shot = _system_voice_reference(root, shot)
-        if core.resolve_completed_asset_feedback(root, shot_id):
-            shot = core._find(core.load_project(root), "shot", shot_id)
         _progress(root, ep_id, "shot_preparation", shot_id)
-        if not _revision_analysis(root, shot):
-            return False
+        if not (approved_candidate and approved_candidate.get("manual_prompt")):
+            shot = _system_voice_reference(root, shot)
+            if core.resolve_completed_asset_feedback(root, shot_id):
+                shot = core._find(core.load_project(root), "shot", shot_id)
+            if not _revision_analysis(root, shot):
+                return False
         # Revision routing may have staged a new camera schedule or applied an
         # approved asset amendment. Never refine from the stale pre-analysis copy.
         s = _gate(root)
@@ -1096,7 +1106,8 @@ def _shot(root, ep_id, shot_id, previous):
                     "context": context, "observations": [_rel(root, f) for f in observations]}
         actual_hash = prompt_gate._hash(prompt_gate.specification(core.load_project(root), shot, prompt, manifest, refined=refined))
         if actual_hash != candidate["request_hash"]:
-            prompt_gate.invalidate(root, shot_id)
+            if not candidate.get("manual_prompt"):
+                prompt_gate.invalidate(root, shot_id)
             raise core.GateError("实际生成素材与已确认提示词不一致，请重新准备提示词。")
         version = candidate["version"]
         _save_shot(root, shot_id, refined_prompt=refined, version=version, status="generating", generation_error=None,
@@ -1136,6 +1147,17 @@ def _shot(root, ep_id, shot_id, previous):
     except Exception:
         current = core.load_project(root)
         current_shot = core._find(current, "shot", shot_id)
+        candidate = current_shot.get("prompt_candidate", {})
+        if (candidate.get("manual_prompt") and current_shot.get("prompt_approval")
+                and not current_shot.get("job_id")
+                and not any(core.execution_unsettled(job) and job.get("kind") == "video"
+                            and job.get("item_id") == shot_id for job in current["jobs"].values())
+                and not any(attempt.get("revision", 0) == current_shot.get("revision", 0)
+                            for attempt in current_shot.get("attempts", []))):
+            # Local validation/budget can fail before any reservation or POST.
+            # Restore the still-unsubmitted consent instead of letting a resume
+            # interpret "generating, no job" as permission for a GPT rewrite.
+            _save_shot(root, shot_id, status="prompt_approved", version=candidate["version"] - 1)
         failed = current["jobs"].get(current_shot.get("job_id", ""), {})
         if failed.get("state") != "failed" or failed.get("accounting") == "unknown":
             raise
