@@ -103,6 +103,24 @@ assert.equal(card.children[1],draft);assert.equal(draft.value,'尚未提交的�
 assert.equal(calls.length,0);
 ''')
 
+    def test_title_tracks_viewed_route_and_updates_without_following_production(self):
+        self.run_dom(r'''
+state.title='第01集 项目创建时的旧标题';paintEpisodeNavigation(state);
+assert.equal($('title').textContent,'分集总览');assert.equal(document.title,'分集总览 · Nolan 审片室');
+navigateEpisodeRoute('#episode/ep02');
+assert.equal($('title').textContent,'第 2 集 · 合成第二集');assert.equal(document.title,'第 2 集 · 合成第二集 · Nolan 审片室');
+navigateEpisodeRoute('#episode/ep01');second.status='generating';state.dashboard.running=true;paintEpisodeNavigation(state);
+assert.equal($('title').textContent,'第 1 集 · 合成第一集');assert.equal(document.title,'第 1 集 · 合成第一集 · Nolan 审片室');
+first.title='本集新标题';paintEpisodeNavigation(state);
+assert.equal($('title').textContent,'第 1 集 · 本集新标题');assert.equal(document.title,'第 1 集 · 本集新标题 · Nolan 审片室');
+navigateEpisodeRoute('#assets');
+assert.equal($('title').textContent,'共用资产与策划');assert.equal(document.title,'共用资产与策划 · Nolan 审片室');
+navigateEpisodeRoute('#episode/'+encodeURIComponent(third.id));
+assert.equal($('title').textContent,'第 3 集 · 合成第三集');
+delete third.title;paintEpisodeNavigation(state);assert.equal(document.title,'第 3 集 · Nolan 审片室');
+assert.equal(calls.length,0,'updating page titles must not change production or approvals');
+''')
+
     def test_explicit_continue_opens_active_episode_and_runs_existing_safe_action(self):
         self.run_dom(r'''
 paintEpisodeNavigation(state);navigateEpisodeRoute('#episode/ep01');
@@ -230,7 +248,9 @@ for(const hash of ['#episode/%broken','#episode/not-present','#anything']){
  window.location.hash=hash;paintEpisodeNavigation(state);
  assert.equal($('episode-overview-panel').classList.contains('hidden'),false);
  assert.equal($('episode-detail-panel').classList.contains('hidden'),true);
+ assert.equal($('title').textContent,'分集总览');assert.equal(document.title,'分集总览 · Nolan 审片室');
 }
+state.episodes=[];paintEpisodeNavigation(state);assert.equal(document.title,'分集总览 · Nolan 审片室');
 assert.equal(calls.length,0);
 ''')
 
