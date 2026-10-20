@@ -34,6 +34,13 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   Keep prior exports and provenance.
 - Prefer nearby scripted dialogue for caption text, then verify against actual
   audio. Do not add unspoken lines or overwrite differing numbers from a script.
+- Automatic episode music uses source-hash-bound local acoustic analysis for
+  excerpt choices, a shared track loudness reference, and bounded ducking only
+  in verified speech windows. Check the rendered mix numerically and allow at
+  most two local corrections; never retry video/music generation or treat
+  acoustic metrics as human listening approval. Persist exhausted checks and
+  bind them to the final export, music, captions and source. Explicit manual
+  postproduction edits bypass fresh checks and adaptive changes.
 - Route segment feedback through the same revision planner for ordinary edits,
   local storyboarding and asset additions. A new storyboard may change only the
   target segment's internal shots and duration within provider limits. GPT

@@ -100,6 +100,7 @@ def request(root, eid, version, target, feedback):
             if target in {"music", "all"}:
                 pp.pop("manual_music_plan", None)
                 pp["music_feedback"] = feedback.strip()
+                pp["music_feedback_source"] = copy.deepcopy(pp.get("music", {}).get("cues", []))
                 pp.pop("music_key", None)
             core.event(state, "postproduction_revision_requested", id=eid, target=target, feedback=feedback.strip())
         state.update(status="ready", paused=False, last_error=None)
@@ -218,6 +219,14 @@ def _captions(root, ep, dry, brain_call, gate):
                 and core.digest(core.safe_path(root, stored["audio_file"])) == stored["audio_sha256"]):
             return stored["segments"]
         raise core.GateError("原字幕音轨记录已变化，请先恢复当前字幕；没有重新识别或检查。")
+    if pp.get("revision_target") == "music" and stored.get("status") == "ready":
+        # A music-only revision reuses the independently verified captions.
+        # No ASR, GPT spelling pass or alignment repair is needed for a remix.
+        if (stored.get("audio_file") and stored.get("audio_sha256")
+                and core.digest(core.safe_path(root, stored["audio_file"])) == stored["audio_sha256"]
+                and report_matches(stored.get("sync_check"), stored.get("segments"),
+                    audio_sha256=stored["audio_sha256"], source_key=pp["source_key"])):
+            return stored["segments"]
     if not manual_mode:
         brain_config = production_brain_config(state["settings"]["brain"])
         if brain_config.get("provider", "codex") != "codex" or brain_config.get("billing") != "subscription":
@@ -308,6 +317,9 @@ def _music(root, ep, duration, captions, brain_call, gate, soundtrack):
     state = gate(root)
     pp = _episode(root, ep["id"]).get("postproduction", {})
     music = pp.get("music", {})
+    if pp.get("music_feedback") and not isinstance(pp.get("music_feedback_source"), list):
+        pp["music_feedback_source"] = copy.deepcopy(music.get("cues", []))
+        _save(root, ep["id"], music_feedback_source=pp["music_feedback_source"])
     manual = pp.get("manual_music_plan")
     if (isinstance(manual, dict) and manual.get("source_key") == pp.get("source_key")
             and type(manual.get("revision")) is int and manual["revision"] <= pp.get("revision", 0)):
@@ -315,17 +327,21 @@ def _music(root, ep, duration, captions, brain_call, gate, soundtrack):
                 {"summary": manual.get("summary"), "cues": manual.get("cues")})):
             raise core.GateError("手动配乐与明确保存的内容不一致，请在表格重新确认；没有自动编排或采用改动。")
         validated = library_api.validate_cue_plan(manual, state["music_library"], duration, project=root)
-        key = _hash({"manual_plan": validated, "source_key": pp["source_key"], "policy": 1})
+        normalize = music.get("render_policy", {}).get("version") == 2
+        key = _hash({"manual_plan": validated, "source_key": pp["source_key"], "policy": 2,
+                     "normalize": normalize})
         if pp.get("music_key") == key and music.get("status") == "ready":
             bed = core.safe_path(root, music["file"])
             if core.digest(bed) == music["sha256"] and music.get("fingerprint") == validated["fingerprint"]:
                 return bed
         _save(root, ep["id"], status="mixing_manual_music")
         out = Path(root) / "exports" / f"{ep['id']}-music-{key[:16]}.wav"
-        result = library_api.render_music_bed(validated, state["music_library"], duration, out, project=root)
+        result = library_api.render_music_bed(validated, state["music_library"], duration, out,
+                                            project=root, normalize=normalize)
         _save(root, ep["id"], music_key=key, music={"status": "ready", "can_generate": False,
             "summary": validated["summary"], "cues": validated["cues"], "file": _rel(root, out),
-            "sha256": result["sha256"], "duration": duration, "fingerprint": result["fingerprint"], "manual": True})
+            "sha256": result["sha256"], "duration": duration, "fingerprint": result["fingerprint"], "manual": True,
+            "render_policy": result.get("render_policy", {}), "analysis": copy.deepcopy(music.get("analysis", {}))})
         return out
     # A subtitle-only request keeps the existing approved arrangement, including
     # when unrelated new tracks await audition. Validate its exact source bytes
@@ -401,16 +417,43 @@ def _music(root, ep, duration, captions, brain_call, gate, soundtrack):
     context = {"episode": {"id": ep["id"], "title": ep["title"], "summary": ep.get("summary", "")[:800]},
         "duration": duration, "timeline": timeline, "music_prompt": ep.get("music_prompt", "")[:2200],
         "speech_windows": [{"start": s["start"], "end": s["end"]} for s in captions],
-        "catalog": catalog[:12], "previous": previous, "feedback": pp.get("music_feedback", "")[:2000]}
+        "catalog": catalog[:6], "previous": previous, "feedback": pp.get("music_feedback", "")}
     preferred = [tid for tid in _episode(root, ep["id"]).get("postproduction", {}).get("preferred_music_ids", [])
                  if any(t["id"] == tid for t in catalog)]
     if preferred:
         context["preferred_track_ids"] = preferred[-6:]
     previous_ids = [cue["track_id"] for cue in (previous or {}).get("ending_cues", [])]
+    retained = list(dict.fromkeys(preferred[-6:] + [c["track_id"] for c in
+        (pp.get("music_feedback_source") or []) if any(t["id"] == c.get("track_id") for t in catalog)]))[:6]
     context["catalog"] = library_api.select_catalog(catalog,
         ep.get("summary", "")[:1000] + "\n" + ep.get("music_prompt", "")[:2200] + "\n" + pp.get("music_feedback", "")[:2000],
-        preferred_ids=preferred[-6:], previous_ids=previous_ids)
-    key = _hash({"context": context, "policy": 1})
+        preferred_ids=retained, previous_ids=previous_ids, limit=6)
+    from .music_analysis import catalog_analysis, POLICY_VERSION
+    _save(root, ep["id"], status="analyzing_music")
+    for track in context["catalog"]:
+        gate(root)
+        item = library_api._find(library, track["id"], track["version"])
+        measured = catalog_analysis(
+            item, library_api._track_path(item, Path(root)),
+            cache_dir=Path(root) / "cache" / "music-analysis")
+        track["audio_analysis"] = {"regions": measured["regions"]}
+        # Keep the model input local to this episode and a compact shortlist.
+        track["prompt"] = track.get("prompt", "")[:200]
+    context["mixing_policy"] = {"normalization_target_lufs": -18, "duck_max_reduction_db": 6,
+        "gain_reference": "gain_db是统一响度后基准的衰减；通常-3至-10，不沿用旧的-20至-12。",
+        "selection": "根据实测候选区域的强度、可用长度和边界选source_start，不默认从0开始；声学特征不是已试听的情绪/乐句结论。"}
+    # Feedback may ask to retain a known arrangement while improving excerpts.
+    if pp.get("music_feedback"):
+        reference = pp.get("music_feedback_source")
+        if not isinstance(reference, list):
+            # Migrate a pre-policy pending revision once, before its first GPT
+            # call. Current execution outputs must never change their own key.
+            reference = copy.deepcopy(music.get("cues", []))
+            _save(root, ep["id"], music_feedback_source=reference)
+        context["current_cues_reference"] = [{k: c[k] for k in
+            ("track_id", "start", "end", "source_start") if k in c} for c in reference]
+    context = _bound_music_context(context, retained)
+    key = _hash({"context": context, "policy": 2, "analysis_policy": POLICY_VERSION})
     music = pp.get("music", {})
     if pp.get("music_key") == key and music.get("status") == "ready":
         try:
@@ -430,11 +473,40 @@ def _music(root, ep, duration, captions, brain_call, gate, soundtrack):
         raise core.GateError("GPT未采用本集新确认的音乐，请在配乐意见中明确如何使用后重新编排；未产生新音乐费用")
     validated = library_api.validate_cue_plan(plan, library, duration, project=root)
     out = Path(root) / "exports" / f"{ep['id']}-music-{key[:16]}.wav"
-    result = library_api.render_music_bed(validated, library, duration, out, project=root)
+    result = library_api.render_music_bed(validated, library, duration, out, project=root, normalize=True)
     _save(root, ep["id"], music_key=key, music={"status": "ready", "can_generate": can_generate,
         "summary": validated["summary"], "cues": validated["cues"], "file": _rel(root, out),
-        "sha256": result["sha256"], "duration": duration, "fingerprint": result["fingerprint"]})
+        "sha256": result["sha256"], "duration": duration, "fingerprint": result["fingerprint"],
+        "render_policy": result.get("render_policy", {}),
+        "analysis": {"status": "completed", "policy_version": POLICY_VERSION,
+            "tracks_analyzed": len(context["catalog"]), "cues_analyzed": len(validated["cues"]),
+            "summary": "已分析实际音乐的能量变化与可截区域，GPT据此选段；原曲统一到-18 LUFS参考，峰值受限时保留差异。"}})
     return out
+
+
+def _bound_music_context(context, preferred_ids):
+    """Keep full current feedback, a compact timeline and necessary candidates.
+
+    Large libraries, waveform envelopes, history and prior reports never enter
+    a selection request. Preserve every explicitly preferred track in the
+    shortlist while trimming optional catalog entries before the 20k hard cap.
+    """
+    context = copy.deepcopy(context)
+    required = set(preferred_ids)
+    catalog = context["catalog"]
+    while len(json.dumps(context, ensure_ascii=False)) > 16000 and len(catalog) > max(3, len(required)):
+        removable = next((i for i in range(len(catalog) - 1, -1, -1) if catalog[i]["id"] not in required), None)
+        if removable is None:
+            break
+        catalog.pop(removable)
+    if len(json.dumps(context, ensure_ascii=False)) > 18000:
+        for row in context.get("timeline", []):
+            row["action"] = row.get("action", "")[:120]
+        for track in catalog:
+            track["prompt"] = track.get("prompt", "")[:120]
+    if len(json.dumps(context, ensure_ascii=False)) > 20000:
+        raise core.GateError("本集音乐必要上下文仍超出限制，已保留视频、字幕和配乐，未提交GPT。")
+    return context
 
 
 def finish(root, ep, *, brain_call, gate, soundtrack):
@@ -467,7 +539,7 @@ def _finish(root, ep, *, brain_call, gate, soundtrack):
             _retire(core._find(current, "episode", ep["id"]))
     if pp.get("source_key") != source_key:
         _save(root, ep["id"], subtitle_key=None, subtitle_proofread_key=None, music_key=None, subtitle_feedback_source=None,
-              manual_music_plan=None, manual_subtitles=None, subtitles={}, music={},
+              manual_music_plan=None, manual_subtitles=None, music_feedback_source=None, subtitles={}, music={},
               source_key=source_key, source_manifest=source)
     _save(root, ep["id"], enabled=True, ready=True, final_ready=False, error=None,
           status="assembling", missing_configuration=[], revision=pp.get("revision", 0))
@@ -492,8 +564,53 @@ def _finish(root, ep, *, brain_call, gate, soundtrack):
         out = out.with_name(out.stem + "-" + source_key[:12] + out.suffix)
         if out.exists():
             raise core.GateError("后期输出文件已存在，请核实原导出结果；没有覆盖任何视频")
+    mixing = _episode(root, ep["id"])["postproduction"]
+    music_mix = None
+    if mixing.get("music", {}).get("render_policy", {}).get("version") == 2:
+        manual = mixing.get("revision_target") in {"manual_music", "manual_subtitles"}
+        music_mix = {"policy_version": 1, "speech_windows": [
+            {"start": c["start"], "end": c["end"]} for c in captions],
+            "cues": mixing["music"]["cues"], "duck_db": 6, "adaptive": not manual, "audit": not manual,
+            "binding": {"source_key": source_key, "dry_sha256": mixing["dry_sha256"],
+                "subtitle_content_hash": _hash(captions), "music_key": mixing["music_key"],
+                "source_analysis_used": True}}
+        if manual:
+            previous_mix = mixing.get("music_mix_check", {})
+            if previous_mix.get("binding", {}).get("source_key") != source_key:
+                raise core.GateError("原混音基准与本集视频不一致，不能在手动调整时重置音乐；已有成片已保留。")
+            artifacts = {}
+            for name, sha_key in (("prepared_music_file", "prepared_music_sha256"),
+                                  ("automation_file", "automation_sha256")):
+                if not previous_mix.get(name):
+                    raise core.GateError("原混音基准文件缺失，不能在手动调整时改变已有音量；请先恢复本集配乐。")
+                artifact = core.safe_path(root, previous_mix[name])
+                if core.digest(artifact) != previous_mix.get(sha_key):
+                    raise core.GateError("原混音基准文件已变化，手动调整未重新检查或改写音乐。")
+                artifacts[name] = artifact
+            if (mixing.get("revision_target") == "manual_subtitles"
+                    and previous_mix.get("bed_sha256") == mixing["music"]["sha256"]):
+                music_mix["reuse_prepared_music"] = {
+                    "file": str(artifacts["prepared_music_file"]), "sha256": previous_mix["prepared_music_sha256"],
+                    "automation_file": str(artifacts["automation_file"]),
+                    "automation_sha256": previous_mix["automation_sha256"]}
+            else:
+                music_mix["baseline_automation"] = json.loads(artifacts["automation_file"].read_text(encoding="utf-8"))
+        if not manual:
+            previous_mix = mixing.get("music_mix_check", {})
+            if (previous_mix.get("binding") == music_mix["binding"]
+                    and previous_mix.get("bed_sha256") == mixing["music"]["sha256"]):
+                music_mix["repair_attempt"] = previous_mix.get("repair_attempts", 0)
+                music_mix["local_corrections_db"] = previous_mix.get("local_corrections_db", {})
+
+            def mix_progress(report):
+                gate(root)
+                _save(root, ep["id"], status="repairing_music_mix" if report.get("status") == "repairing" else "checking_music_mix",
+                      music_mix_check=copy.deepcopy(report))
+
+            music_mix["on_progress"] = mix_progress
     result = media.compose([core.safe_path(root, sh["file"]) for sh in ep["shots"]], out,
-                           subtitles=captions, music=music, music_gain=1.0)
+                           subtitles=captions, music=music, music_gain=1.0, **(
+                               {"music_mix": music_mix} if music_mix else {}))
     if captions and not result.get("burned_subtitles"):
         raise core.GateError("字幕未能烧录：请安装带libass字幕滤镜的FFmpeg和中文字体；SRT和视频已保留")
     post = _episode(root, ep["id"])["postproduction"]
@@ -507,12 +624,25 @@ def _finish(root, ep, *, brain_call, gate, soundtrack):
         if source != [{"id": sh["id"], "version": sh["version"], "sha256": sh["sha256"]} for sh in current["shots"]] or any(not core.human_approved_shot(sh) for sh in current["shots"]):
             raise core.GateError("本集片段已变更，保留此次导出，需重新生成后期")
         pp = current["postproduction"]
+        mix_report = result.get("music_mix")
+        if music_mix:
+            if not isinstance(mix_report, dict):
+                raise core.GateError("本集混音检查记录缺失，已保留导出，请检查后再审批。")
+            mix_report.update(normalization_target_lufs=-18, source_analysis_used=True,
+                              checked_at=core.now())
+            for key in ("prepared_music_file", "automation_file"):
+                if mix_report.get(key):
+                    mix_report[key] = _rel(root, mix_report[key])
+            pp["music_mix_check"] = copy.deepcopy(mix_report)
+        else:
+            pp.pop("music_mix_check", None)
         from .subtitle_sync import report_matches, manual_report_matches
         sync_passed = (report_matches(pp["subtitles"]["sync_check"], captions,
             audio_sha256=pp["subtitles"]["audio_sha256"], source_key=source_key)
             or manual_report_matches(pp["subtitles"]["sync_check"], captions,
                 audio_sha256=pp["subtitles"]["audio_sha256"], source_key=source_key))
-        pp.update(status="awaiting_final_approval" if sync_passed else "subtitle_sync_needs_attention",
+        mix_passed = not music_mix or mix_report.get("status") in {"passed", "manual"}
+        pp.update(status=("awaiting_final_approval" if mix_passed else "music_mix_needs_attention") if sync_passed else "subtitle_sync_needs_attention",
                   manual_preview=not sync_passed, final_ready=True, final_file=_rel(root, out),
                   final_sha256=core.digest(out), final_version=version, missing_configuration=[])
         pp["music"].update(credits_file=_rel(root, credits["file"]), credits_sha256=credits["sha256"])
@@ -528,12 +658,13 @@ def _finish(root, ep, *, brain_call, gate, soundtrack):
                 "postproduction": {"source_key": source_key, "subtitle_key": pp["subtitle_key"],
                     "music_key": pp["music_key"], "music_sha256": pp["music"]["sha256"],
                     "music_fingerprint": pp["music"]["fingerprint"],
+                    **({"music_mix_hash": _hash(mix_report)} if music_mix else {}),
                     "subtitle_content_hash": _hash(captions),
                     "subtitle_sync_hash": _hash(pp["subtitles"]["sync_check"]),
                     "credits_sha256": credits["sha256"],
                     "srt_sha256": core.digest(result["subtitles"]) if result.get("subtitles") else None,
                     "revision": pp.get("revision", 0)}})
-        state.update(status="awaiting_episode_review" if sync_passed else "awaiting_postproduction", last_error=None)
+        state.update(status="awaiting_episode_review" if sync_passed and mix_passed else "awaiting_postproduction", last_error=None)
     return True
 
 
@@ -561,6 +692,24 @@ def check_final(root, state, ep):
         raise core.GateError("字幕同步检查记录与当前音轨或字幕不一致，请重新检查后再批准。")
     if not pp.get("final_ready") or pp.get("final_sha256") != ep.get("sha256") or pp.get("final_version") != ep["version"]:
         raise core.GateError("本集后期尚未完成或导出版本已变化")
+    if pp.get("music", {}).get("render_policy", {}).get("version") == 2:
+        mix = pp.get("music_mix_check", {})
+        if mix.get("status") not in {"passed", "manual"}:
+            raise core.GateError("配乐混音数值检查仍有疑点，请查看报告后提交配乐意见或手动调整，再试听确认。")
+        if (manifest.get("music_mix_hash") != _hash(mix)
+                or mix.get("final_sha256") != ep.get("sha256")
+                or mix.get("bed_sha256") != pp["music"].get("sha256")
+                or mix.get("binding", {}).get("source_key") != _hash(source)
+                or mix.get("binding", {}).get("dry_sha256") != pp.get("dry_sha256")
+                or mix.get("binding", {}).get("subtitle_content_hash") != _hash(sub.get("segments"))
+                or mix.get("binding", {}).get("music_key") != pp.get("music_key")):
+            raise core.GateError("配乐检查记录与本版视频、音乐或字幕不一致，请重新处理本集配乐。")
+        if mix.get("status") == "manual" and pp.get("revision_target") not in {"manual_music", "manual_subtitles"}:
+            raise core.GateError("没有对应的手动调整记录，不能将自动混音检查改为人工采用。")
+        for name, sha_key in (("prepared_music_file", "prepared_music_sha256"),
+                              ("automation_file", "automation_sha256")):
+            if not mix.get(name) or core.digest(core.safe_path(root, mix[name])) != mix.get(sha_key):
+                raise core.GateError("本集混音基准文件缺失或已改变，请恢复当前版本后再审批。")
     if (pp.get("subtitles", {}).get("status") not in {"ready", "manual"} or pp.get("music", {}).get("status") != "ready"
             or not pp.get("music", {}).get("cues")):
         raise core.GateError("本集字幕或音乐编排尚未就绪")

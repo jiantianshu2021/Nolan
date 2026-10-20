@@ -83,6 +83,122 @@ class PostproductionProjectionTests(unittest.TestCase):
                          (episode["file"], episode["version"], episode["sha256"]))
         self.assertEqual(progress.episode_progress(state, episode)["percent"], 100)
 
+    def test_music_reports_publish_bounded_safe_summary_without_audio_evidence(self):
+        state = synthetic_state()
+        post = state["episodes"][0]["postproduction"]
+        post["music"]["analysis"] = {"status": "analyzed", "policy_version": "music-acoustic-v1",
+            "summary": "已分析实际音频", "tracks_analyzed": 6, "cues_analyzed": 13,
+            "windows": [{"file": "/private/audio.wav"}], "raw": "PRIVATE-MUSIC-ANALYSIS"}
+        post["music_mix_check"] = {"status": "passed", "policy_version": "music-acoustic-v1",
+            "summary": "数值检查通过 token=sk-abcdefghijklmno", "repair_attempts": 1,
+            "normalization_target_lufs": -18, "duck_max_reduction_db": 5,
+            "source_analysis_used": True, "checked_at": "2026-10-20T00:00:00Z",
+            "file_sha256": "PRIVATE-MIX-HASH", "evidence": {"file": "/private/stem.wav"},
+            "issues": [{"start": 1.5, "end": 3.5, "message": "合成测试疑点", "raw": "PRIVATE-ISSUE"},
+                       {"start": float("nan"), "end": float("inf"), "message": "无效时间"},
+                       {"start": True, "end": 3, "message": "布尔值不是时间"}]}
+        before = copy.deepcopy(state)
+        public = dashboard.public_state(state)
+        safe = public["episodes"][0]["postproduction"]
+        self.assertEqual(safe["music"]["analysis"], {"status": "analyzed", "policy_version": "music-acoustic-v1",
+            "summary": "已分析实际音频", "tracks_analyzed": 6, "cues_analyzed": 13})
+        self.assertEqual(safe["music_mix_check"]["repair_attempts"], 1)
+        self.assertEqual(safe["music_mix_check"]["normalization_target_lufs"], -18)
+        self.assertEqual(safe["music_mix_check"]["duck_max_reduction_db"], 5)
+        self.assertTrue(safe["music_mix_check"]["source_analysis_used"])
+        self.assertEqual(safe["music_mix_check"]["issues"][0], {"start": 1.5, "end": 3.5, "message": "合成测试疑点"})
+        self.assertTrue(all("start" not in issue for issue in safe["music_mix_check"]["issues"][1:]))
+        self.assertNotIn("PRIVATE-", json.dumps(public))
+        self.assertNotIn("sk-abcdefghijklmno", json.dumps(public))
+        self.assertEqual(state, before)
+
+    def test_music_report_invalid_and_oversized_values_are_not_passed_to_browser(self):
+        state = synthetic_state()
+        post = state["episodes"][0]["postproduction"]
+        post["music"]["analysis"] = {"summary": "长" * 3000, "tracks_analyzed": True, "cues_analyzed": -1}
+        post["music_mix_check"] = {"status": "private-state", "summary": "长" * 3000,
+            "repair_attempts": True, "normalization_target_lufs": float("nan"),
+            "duck_max_reduction_db": float("inf"), "source_analysis_used": "true",
+            "issues": [{"message": "长" * 3000}] * 300}
+        safe = dashboard.public_state(state)["episodes"][0]["postproduction"]
+        self.assertEqual(safe["music_mix_check"]["status"], "needs_attention")
+        self.assertLessEqual(len(safe["music_mix_check"]["summary"]), 401)
+        self.assertEqual(len(safe["music_mix_check"]["issues"]), 100)
+        self.assertTrue({"repair_attempts", "normalization_target_lufs", "duck_max_reduction_db", "source_analysis_used"}.isdisjoint(safe["music_mix_check"]))
+        self.assertTrue({"tracks_analyzed", "cues_analyzed"}.isdisjoint(safe["music"]["analysis"]))
+
+    def test_old_music_state_without_reports_stays_compatible(self):
+        safe = dashboard.public_state(synthetic_state())["episodes"][0]["postproduction"]
+        self.assertNotIn("music_mix_check", safe)
+        self.assertNotIn("analysis", safe["music"])
+
+    def test_new_mix_report_must_match_current_export_to_open_final_human_gate(self):
+        from norlan.core import _json_digest
+        state = synthetic_state()
+        episode = state["episodes"][0]
+        episode.update(status="awaiting_review", version=1, file="exports/E1-v1.mp4", sha256="c" * 64)
+        post = episode["postproduction"]
+        post.update(status="awaiting_final_approval", final_ready=True,
+            final_file=episode["file"], final_version=1, final_sha256=episode["sha256"])
+        for status in ("passed", "manual"):
+            with self.subTest(status=status):
+                report = {"status": status, "summary": "合成绑定报告", "final_sha256": episode["sha256"]}
+                post["music_mix_check"] = report
+                episode["render_manifest"] = {"postproduction": {"music_mix_hash": _json_digest(report)}}
+                public = self.expose_verified(state)["episodes"][0]["postproduction"]
+                self.assertTrue(public["final_ready"])
+                report["summary"] = "导出后的改动"
+                public = dashboard.public_state(state)["episodes"][0]["postproduction"]
+                self.assertTrue(public["final_available"])
+                self.assertFalse(public["final_ready"])
+                self.assertEqual(public["music_mix_check"]["status"], "needs_attention")
+                self.assertIn("不一致", public["music_mix_check"]["summary"])
+                report["final_sha256"] = "d" * 64
+                episode["render_manifest"]["postproduction"]["music_mix_hash"] = _json_digest(report)
+                self.assertFalse(dashboard.public_state(state)["episodes"][0]["postproduction"]["final_ready"])
+
+    def test_failed_or_missing_new_mix_check_retains_current_preview_without_approval(self):
+        from norlan.core import _json_digest
+        state = synthetic_state()
+        episode = state["episodes"][0]
+        episode.update(status="awaiting_review", version=1, file="exports/E1-v1.mp4", sha256="c" * 64)
+        post = episode["postproduction"]
+        report = {"status": "needs_attention", "summary": "合成音乐过轻", "final_sha256": episode["sha256"]}
+        post.update(status="music_mix_needs_attention", final_ready=True,
+            final_file=episode["file"], final_version=1, final_sha256=episode["sha256"], music_mix_check=report)
+        episode["render_manifest"] = {"postproduction": {"music_mix_hash": _json_digest(report)}}
+        public = self.expose_verified(state)["episodes"][0]["postproduction"]
+        self.assertTrue(public["final_available"])
+        self.assertFalse(public["final_ready"])
+        self.assertIn("过轻", public["music_mix_check"]["summary"])
+        del post["music_mix_check"]
+        public = dashboard.public_state(state)["episodes"][0]["postproduction"]
+        self.assertTrue(public["final_available"])
+        self.assertFalse(public["final_ready"])
+        self.assertIn("缺失", public["music_mix_check"]["summary"])
+
+    def test_active_mix_progress_is_not_checked_against_retired_export_manifest(self):
+        from norlan.core import _json_digest
+        state = synthetic_state()
+        episode = state["episodes"][0]
+        old_report = {"status": "passed", "final_sha256": "c" * 64}
+        episode.update(status="postproduction", version=1, file="exports/E1-v1.mp4", sha256="c" * 64,
+            render_manifest={"postproduction": {"music_mix_hash": _json_digest(old_report)}})
+        post = episode["postproduction"]
+        post.update(final_ready=False, final_file=episode["file"], final_version=1,
+            final_sha256=episode["sha256"])
+        for status in ("checking", "repairing"):
+            with self.subTest(status=status):
+                post.update(status="checking_music_mix", music_mix_check={"status": status,
+                    "policy_version": 1, "summary": "新混音正在处理", "binding": {"music_key": "new-source-key"}})
+                safe = dashboard.public_state(state)["episodes"][0]["postproduction"]
+                self.assertFalse(safe["final_available"])
+                self.assertFalse(safe["final_ready"])
+                self.assertEqual(safe["music_mix_check"]["status"], status)
+                self.assertEqual(safe["music_mix_check"]["summary"], "新混音正在处理")
+                self.assertEqual(safe["music_mix_check"]["policy_version"], "1")
+                self.assertNotIn("binding", safe["music_mix_check"])
+
     def test_completed_legacy_postproduction_exposes_existing_final_without_mutation(self):
         state = synthetic_state()
         episode = state["episodes"][0]
@@ -303,7 +419,7 @@ class PostproductionRenderingTests(unittest.TestCase):
     def test_panel_is_after_rough_cut_and_human_final_gate_requires_completed_post(self):
         html = Path(dashboard.__file__).with_name("dashboard.html").read_text()
         sources = []
-        for name in ("el", "mediaURL", "appendPrompt", "episodeCard", "postproductionFeedback", "musicTrack", "postproductionEditor", "subtitleSyncReport", "postproductionPanel"):
+        for name in ("el", "mediaURL", "appendPrompt", "episodeCard", "postproductionFeedback", "musicTrack", "postproductionEditor", "subtitleSyncReport", "musicMixReport", "postproductionPanel"):
             match = re.search(r"(?:async )?function " + name + r"\(", html)
             next_match = re.search(r"\n(?:async )?function ", html[match.start() + 1:])
             end = match.start() + 1 + next_match.start() if next_match else len(html)
@@ -326,6 +442,9 @@ assert.equal(nodes.find(n=>n.tag==='button'&&n.textContent==='生成一首新音
 const feedback=nodes.find(n=>n.tag==='textarea'&&n.dataset.feedbackFor==='post:E1:subtitles');feedback.value='合成字幕修改';
 const subtitleSection=nodes.find(n=>n.className==='postproduction-step');walk(subtitleSection).find(n=>n.tag==='button'&&n.textContent==='提交意见并重新合成').listeners.click();assert.equal(actions.at(-1)[0].action,'postproduction');assert.equal(actions.at(-1)[0].target,'subtitles');
 episode.file='exports/E1-v1.mp4';Object.assign(episode.postproduction,{final_available:true,final_ready:true,final_file:episode.file,final_version:1,subtitles:{sync_check:{status:"passed"}}});card=episodeCard(episode,0);assert.equal(walk(card).some(n=>n.tag==='button'&&n.textContent==='通过本集，完成制作'),true);
+episode.postproduction.music.analysis={summary:'合成分析摘要',tracks_analyzed:6,cues_analyzed:13};episode.postproduction.music_mix_check={status:'passed',summary:'合成混音数值通过',normalization_target_lufs:-18,duck_max_reduction_db:5,source_analysis_used:true,repair_attempts:1,issues:[]};card=episodeCard(episode,0);const mix=walk(card).find(n=>n.className==='music-mix-report');assert.ok(mix);assert.equal(mix.tag,'details');assert.equal(mix.open,undefined);assert.equal(mix.children[0].textContent,'配乐检查报告 · 数值检查通过，待你试听');assert.ok(walk(mix).some(n=>n.textContent.includes('数字检查用于发现')));assert.ok(walk(mix).some(n=>n.textContent.includes('已分析实际音频：6 首，选段 13 处')));assert.ok(walk(mix).some(n=>n.textContent.includes('压低上限：5 dB')));assert.equal(actions.some(row=>row[0].action==='approve'),false);
+episode.postproduction.music_mix_check={status:'manual',summary:'合成手动采用',normalization_target_lufs:-18,repair_attempts:0};const manualMix=musicMixReport(episode);assert.ok(walk(manualMix).some(n=>n.textContent.includes('未再自动分析选段、复检或改音量')));assert.equal(walk(manualMix).some(n=>n.textContent.includes('音源响度基准')),false);
+episode.postproduction.music_mix_check={status:'needs_attention',issues:[{start:1,end:3,message:'合成过轻时段'}]};card=episodeCard(episode,0);assert.ok(walk(card).some(n=>n.textContent.includes('配乐数字检查仍有疑点')));assert.ok(walk(card).some(n=>n.textContent==='合成过轻时段'));delete episode.postproduction.music.analysis;delete episode.postproduction.music_mix_check;
 episode.postproduction.ready=false;const locked=postproductionPanel(episode);assert.equal(walk(locked).some(n=>n.tag==='button'),false);assert.equal(walk(locked).some(n=>n.textContent.includes('等待本集所有片段通过审批')),true);
 `,context);
 '''

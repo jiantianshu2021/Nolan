@@ -433,6 +433,7 @@ def _write_subtitles(entries: list[dict], target: Path, duration: float) -> None
 def compose(
     clips: list[Path], output: Path, subtitles: list[dict] | None = None,
     music: Path | None = None, *, burn_subtitles: bool = True, music_gain: float = 0.18,
+    music_mix: dict | None = None,
 ) -> dict:
     """Normalize and join clips in order, preserving sound and filling silence.
 
@@ -441,6 +442,9 @@ def compose(
     existing soundtrack. If that soundtrack contains music, it cannot isolate
     dialogue; the result requires a human listening pass. Global subtitle times
     must already have been aligned to speech; this function does no recognition.
+    An explicit ``music_mix`` policy instead uses the supplied verified speech
+    windows for bounded ducking. Automatic policies measure and locally repair
+    the music stem at most twice; manual policies only render the user's edits.
     """
     if not clips:
         raise MediaError("至少需要一个已生成镜头才能合成。")
@@ -453,6 +457,8 @@ def compose(
     music_path = _local(music) if music is not None else None
     if music_path == output:
         raise MediaError("合成输出不能覆盖配乐原件。")
+    if music_mix is not None and (not isinstance(music_mix, dict) or music_path is None):
+        raise MediaError("对白配乐混音策略必须附带本地配乐文件。")
     metadata = [probe(path) for path in paths]
     if any(not item["has_video"] or item["duration"] <= 0 for item in metadata):
         raise MediaError("每个镜头都必须包含有效的视频流和时长。")
@@ -470,8 +476,11 @@ def compose(
         warnings.append("未检测到字幕滤镜或字体；已保留 SRT，视频未烧录字幕。")
     if music_path is None:
         warnings.append("没有导入配乐；保留镜头原声，静音镜头填充静音。")
+    elif music_mix is not None:
+        warnings.append("配乐只按给定对白时间有限压低，未自动分离视频原声；最终听感仍须本人试听。")
     elif any(item["has_audio"] for item in metadata):
         warnings.append("配乐按镜头原生混合音轨压低；无法自动分离其中已有的音乐与对白。")
+    mix_report = None
     with tempfile.TemporaryDirectory(prefix=".norlan-compose-", dir=output.parent) as raw:
         temporary = Path(raw)
         normalized: list[Path] = []
@@ -506,19 +515,99 @@ def compose(
             cursor += actual
             normalized.append(target)
         duration = cursor
+        mix_plan = None
+        prepared_music = music_path
+        native_reference = None
+        if music_mix is not None:
+            from . import music_mix as mixer
+            if music_mix.get("policy_version", mixer.POLICY_VERSION) != mixer.POLICY_VERSION:
+                raise MediaError("当前配乐混音策略版本不受支持。")
+            adaptive = music_mix.get("adaptive", True)
+            audit = music_mix.get("audit", adaptive)
+            if not isinstance(adaptive, bool) or not isinstance(audit, bool) or (audit and not adaptive):
+                raise MediaError("配乐手动模式不能运行自动检查或修改。")
+            native_reference = temporary / "native-reference.wav"
+            native_args, native_graph, native_labels = [], [], []
+            for index, (target, segment) in enumerate(zip(normalized, timeline)):
+                native_args += ["-i", str(target)]
+                native_graph.append(
+                    f"[{index}:a:0]atrim=duration={segment['duration']:.9f},asetpts=PTS-STARTPTS[n{index}]")
+                native_labels.append(f"[n{index}]")
+            native_graph.append("".join(native_labels) +
+                                f"concat=n={len(normalized)}:v=0:a=1," + _LOUDNORM + "[reference]")
+            _ffmpeg([*native_args, "-filter_complex", ";".join(native_graph), "-map", "[reference]",
+                     "-t", f"{duration:.9f}", "-c:a", "pcm_f32le", str(native_reference)])
+            prepared_music = temporary / "prepared-music.wav"
+            corrections = dict(music_mix.get("local_corrections_db", {}))
+            attempt = music_mix.get("repair_attempt", 0)
+            on_progress = music_mix.get("on_progress")
+            if on_progress is not None and not callable(on_progress):
+                raise MediaError("配乐混音进度接收器无效。")
+            def notify_mix(status, *, issues=None, summary=None):
+                if on_progress is not None:
+                    on_progress({"status": status, "repair_attempts": attempt,
+                        "local_corrections_db": corrections.copy(),
+                        "binding": music_mix.get("binding", {}),
+                        "bed_sha256": _sha256(music_path), "issues": issues or [],
+                        "summary": summary or "正在本地测量配乐与原声，不调用生成服务。"})
+            if adaptive and audit:
+                notify_mix("checking")
+            while True:
+                reuse = music_mix.get("reuse_prepared_music")
+                if reuse is not None:
+                    if adaptive or audit:
+                        raise MediaError("直接复用配乐工作轨只用于手动字幕修改，不运行自动检查。")
+                    mix_plan = mixer.reuse_prepared(native_reference, music_path, reuse,
+                        duration=duration, cues=music_mix.get("cues", []), binding=music_mix.get("binding", {}))
+                    prepared_music = Path(mix_plan["output"])
+                else:
+                    mix_plan = mixer.prepare_mix(
+                        native_reference, music_path, prepared_music, duration=duration,
+                        cues=music_mix.get("cues", []), speech_windows=music_mix.get("speech_windows", []),
+                        duck_db=music_mix.get("duck_db", mixer.MAX_DUCK_DB), adaptive=adaptive,
+                        binding=music_mix.get("binding", {}), repair_attempt=attempt,
+                        local_corrections_db=corrections, input_gain=music_gain,
+                        baseline_automation=music_mix.get("baseline_automation"))
+                measurement = mix_plan.get("measurement") or {}
+                if adaptive and audit:
+                    notify_mix("checking", issues=measurement.get("issues", []))
+                suggestions = measurement.get("repair_suggestions", {})
+                if not (adaptive and audit and suggestions and attempt < mixer.MAX_REPAIRS):
+                    break
+                new_corrections = {**corrections}
+                for key, correction in suggestions.items():
+                    new_corrections[key] = max(-mixer.MAX_REPAIR_DB, min(mixer.MAX_REPAIR_DB,
+                        new_corrections.get(key, 0) + correction))
+                if new_corrections == corrections:
+                    break
+                corrections, attempt = new_corrections, attempt + 1
+                notify_mix("repairing", issues=measurement.get("issues", []),
+                           summary=f"正在进行第 {attempt}/2 轮有界本地配乐修正；保留原视频和原曲。")
         args: list[str] = []
         graph: list[str] = []
         inputs = ""
         for index, (target, segment) in enumerate(zip(normalized, timeline)):
             args += ["-i", str(target)]
-            graph += [
-                f"[{index}:v:0]setpts=PTS-STARTPTS[v{index}]",
-                f"[{index}:a:0]atrim=duration={segment['duration']:.9f},asetpts=PTS-STARTPTS[a{index}]",
-            ]
-            inputs += f"[v{index}][a{index}]"
-        graph.append(f"{inputs}concat=n={len(normalized)}:v=1:a=1[video][native]")
-        graph.append(f"[native]{_LOUDNORM}[norm]")
-        if music_path:
+            graph.append(f"[{index}:v:0]setpts=PTS-STARTPTS[v{index}]")
+            if music_mix is None:
+                graph.append(f"[{index}:a:0]atrim=duration={segment['duration']:.9f},asetpts=PTS-STARTPTS[a{index}]")
+                inputs += f"[v{index}][a{index}]"
+            else:
+                inputs += f"[v{index}]"
+        if music_mix is not None:
+            # Use the exact reference measured above; never normalize the dry
+            # cut a second time or let unrelated environment energy drive duck.
+            graph.append(f"{inputs}concat=n={len(normalized)}:v=1:a=0[video]")
+        else:
+            graph.append(f"{inputs}concat=n={len(normalized)}:v=1:a=1[video][native]")
+            graph.append(f"[native]{_LOUDNORM}[norm]")
+        if music_path and music_mix is not None:
+            args += ["-protocol_whitelist", "file,pipe", "-i", str(prepared_music),
+                     "-protocol_whitelist", "file,pipe", "-i", str(native_reference)]
+            graph += [f"[{len(normalized) + 1}:a:0]anull[voice]",
+                      f"[{len(normalized)}:a:0]apad,atrim=duration={duration:.9f},asetpts=PTS-STARTPTS[ducked]",
+                      "[voice][ducked]amix=inputs=2:duration=first:normalize=0," + _LOUDNORM + "[audio]"]
+        elif music_path:
             args += ["-protocol_whitelist", "file,pipe", "-i", str(music_path)]
             fade = min(0.6, duration / 4)
             graph += [
@@ -551,10 +640,46 @@ def compose(
         result_metadata = probe(temporary / "episode.mp4")
         if not result_metadata["has_video"] or not result_metadata["has_audio"]:
             raise MediaError("合成结果缺少预期的视频或音频流。")
+        if mix_plan is not None:
+            from . import music_mix as mixer
+            if music_mix.get("audit", music_mix.get("adaptive", True)):
+                mix_report = mixer.audit_mix(native_reference, prepared_music,
+                                             temporary / "episode.mp4", plan=mix_plan)
+            else:
+                from datetime import datetime, timezone
+                mix_report = {key: mix_plan[key] for key in
+                              ("policy_version", "normalization_target_lufs", "duck_max_reduction_db",
+                               "native_sha256", "bed_sha256", "prepared_music_sha256",
+                               "speech_windows_sha256", "cue_plan_sha256", "binding")}
+                mix_report.update(status="manual", repair_attempts=0, issues=[],
+                    checked_at=datetime.now(timezone.utc).isoformat(),
+                    source_analysis_used=bool(mix_plan["binding"].get("source_analysis_used", False)),
+                    final_sha256=_sha256(temporary / "episode.mp4"),
+                    summary="按你的配乐参数直接生成试听版本，未运行自动检查或调整；等待本人最终审批。")
+            # Keep the exact heard stem and the pre-duck auto/repair baseline.
+            # A later subtitle-only edit can reuse it, and a manual music edit
+            # changes only its explicit parameters rather than losing +9 dB of
+            # previous automation. Original clips and approved music stay intact.
+            stem_output = output.with_suffix(".music.wav")
+            automation_output = output.with_suffix(".music-automation.json")
+            if any(path in {*paths, music_path, output} for path in (stem_output, automation_output)):
+                raise MediaError("配乐工作轨或自动化侧车不能覆盖原素材。")
+            staged_stem, staged_automation = temporary / "published-music.wav", temporary / "music-automation.json"
+            shutil.copyfile(prepared_music, staged_stem)
+            if _sha256(staged_stem) != mix_plan["prepared_music_sha256"]:
+                raise MediaError("配乐工作轨在保存过程中发生改变，未发布结果。")
+            staged_automation.write_text(json.dumps(mix_plan["automation"], ensure_ascii=False,
+                sort_keys=True, allow_nan=False, separators=(",", ":")), encoding="utf-8")
+            os.replace(staged_stem, stem_output)
+            os.replace(staged_automation, automation_output)
+            mix_report.update(prepared_music_file=str(stem_output),
+                automation_file=str(automation_output), automation_sha256=_sha256(automation_output),
+                local_corrections_db=mix_plan["local_corrections_db"],
+                reused_prepared_music=bool(mix_plan.get("reused_prepared_music")))
         os.replace(temporary / "episode.mp4", output)
         if srt_output:
             os.replace(temporary / "captions.srt", srt_output)
-    return {
+    result = {
         "output": str(output), "duration": result_metadata["duration"],
         "subtitles": str(srt_output) if srt_output else None,
         "burned_subtitles": burned, "sha256": _sha256(output), "timeline": timeline,
@@ -565,3 +690,6 @@ def compose(
         "audio_note": "单次响度归一化目标为 -16 LUFS、-1.5 dBTP；最终听感、台词清晰度及声线一致性须听审。",
         "subtitle_note": "字幕时间戳来自调用方；本模块不识别语音，也不证明字幕与台词一致。" if subtitles else "无字幕。",
     }
+    if mix_report is not None:
+        result["music_mix"] = mix_report
+    return result

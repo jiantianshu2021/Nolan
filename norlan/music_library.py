@@ -366,7 +366,7 @@ def validate_cue_plan(plan: dict, library: dict, duration: float,
 
 
 def render_music_bed(plan: dict, library: dict, duration: float, output: Path,
-                     *, project: Path | None = None) -> dict:
+                     *, project: Path | None = None, normalize: bool = False) -> dict:
     """Render the explicit cue plan as an episode-length stereo WAV.
 
     Deliberate gaps remain silent. Existing artifacts are reused only when their
@@ -381,12 +381,25 @@ def render_music_bed(plan: dict, library: dict, duration: float, output: Path,
     output.parent.mkdir(parents=True, exist_ok=True)
     manifest_path = output.with_suffix(".manifest.json")
     sources = [_find(library, cue["track_id"]) for cue in plan["cues"]]
+    # One immutable normalization reference per approved track, shared by all
+    # its cues. Never independently level adjacent excerpts and create a jump.
+    normalization = {}
+    if normalize:
+        from .music_analysis import normalization_filter
+        for track in sources:
+            if track["id"] not in normalization:
+                normalization[track["id"]] = normalization_filter(
+                    _track_path(track, project), 0, track["duration"],
+                    cache_dir=Path(project) / "cache" / "music-analysis" if project else output.parent / ".music-analysis",
+                    target_lufs=-18, peak_dbfs=-2)
+    render_policy = {"version": 2 if normalize else 1, "normalization": normalization}
     if output in [_track_path(track, project) for track in sources]:
         raise MusicLibraryError("配乐合成不能覆盖音乐原件。")
     if output.exists() or manifest_path.exists():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if (manifest["fingerprint"] == plan["fingerprint"] and output.is_file()
+                    and manifest.get("render_policy", {"version": 1, "normalization": {}}) == render_policy
                     and manifest["sha256"] == _digest(output)):
                 actual = media.probe(output)
                 if actual["has_audio"] and abs(actual["duration"] - duration) <= 0.001:
@@ -411,9 +424,11 @@ def render_music_bed(plan: dict, library: dict, duration: float, output: Path,
             if cue["fade_out"]:
                 fades.append(f"afade=t=out:st={length-cue['fade_out']:.9f}:d={cue['fade_out']:.9f}")
             fade_filters = "".join(value + "," for value in fades)
+            norm_filter = normalization.get(track["id"], {}).get("filter", "anull")
             graph.append(
                 f"[{index}:a:0]atrim=start={cue['source_start']:.9f}:duration={length:.9f},"
                 "asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,"
+                f"{norm_filter},"
                 f"volume={cue['gain_db']:.9f}dB,"
                 f"{fade_filters}"
                 f"adelay={round(cue['start']*48000)}S:all=1[cue{index}]"
@@ -433,6 +448,7 @@ def render_music_bed(plan: dict, library: dict, duration: float, output: Path,
         result = {
             "output": str(output), "duration": metadata["duration"], "sha256": _digest(candidate),
             "fingerprint": plan["fingerprint"], "cue_plan": plan,
+            "render_policy": render_policy,
             "music_present": bool(plan["cues"]),
             "warnings": ["音乐按已确认素材编排；剧情适配、对白可懂度及衔接听感仍须本人听审。"],
         }

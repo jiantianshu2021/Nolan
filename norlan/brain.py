@@ -1087,15 +1087,26 @@ previous_corrected_text_reference_only 如存在，只是旧校对文字参考�
         if len(json.dumps(context, ensure_ascii=False)) > 20000:
             raise BrainError("本集配乐上下文过长；尚未提交请求。")
         return self._call("""为已锁定实际时长的本集安排配乐。只能选择 catalog 内已人工试听批准的音乐。
-你没有听过音频，metadata/prompt 是创作意图，不是已核实的听觉事实。以实际时间轴、对白窗口、
+你没有听过音频，metadata/prompt 是创作意图，不是已核实的听觉事实。catalog.audio_analysis来自本地实际音频的声学分析，
+只说明能量强弱、变化、可用时长及低能量边界，不证明乐句、高潮、情绪或节拍已经被听审。
+根据这些实测候选区域与剧情共同选择source_start：轻情绪选择较平缓区域，行动/高潮可选较高能量区域；
+避免静音前奏、淡出尾部和过短区域。不能一律从原曲0秒取样，也不要一律选最响的位置。
+同一首音乐连续使用、仅因对白分多条cue时，source_start保持连续，避免每条重新从头播放或跳接。
+候选区域如不足所需长度，可在实测有效音乐范围内合理延伸，始终服从源音乐真实时长；不凭空声称精准卡拍。
+以实际时间轴、对白窗口、
 本集剧情节奏和 music_prompt 编排；对白密集处降低音量，重要台词/反转可留白。禁止添加人声或旁白。
-输出全局秒数 cue：track_id、start/end、source_start、gain_db（建议-20至-12）、fade_in/out。
+catalog是已批准曲库的本次精简候选，不代表其他旧曲未经批准；未列入的旧曲只能称“不在本次候选列表”。
+输出全局秒数 cue：track_id、start/end、source_start、gain_db、fade_in/out。
+本地先把每首原曲统一到-18 LUFS参考（峰值限制优先），gain_db是在该基准上进一步降低。
+gain_db通常-3至-10；一般对白段约-6至-10、无对白约-3至-6，本地会依据实测原声与音乐做有界平衡。
+另有对白窗口内最多6dB平滑压低，勿重复沿用旧-20至-12的过低音量。环境声/动作音效不会单独触发无限压低。
 preferred_track_ids如存在，至少安排其中一首本集新批准音乐；不能忽略用户刚确认的替换曲目。
 每条 cue 必须在本集和源音乐真实时长内，淡入淡出不超过cue时长；交叉淡化可适度重叠。
 短音乐可显式安排多条cue复用，但只在乐句/情绪合理处接续，不任意机械循环。130秒本集照常编排，
 不受音乐服务单次120秒限制，不改视频时长。结尾自然收束/留悬念；有 previous 时参考上一集尾部的
 已批准曲目与结束方式。feedback只修改本集音乐编排，不改视频/对白/字幕。至少安排一条音乐cue。
-summary简述选曲和衔接理由，具体听觉效果最终由用户看带字幕配乐的整集审批。""", context, MUSIC_CUE_SCHEMA)
+current_cues_reference如存在是本集旧编排，按feedback保留明确要求的曲目/位置，并重新选择合适的源片段；旧音量不是新基准。
+summary简述选曲、实测选段依据、留白和衔接理由，具体听觉效果最终由用户看带字幕配乐的整集审批。""", context, MUSIC_CUE_SCHEMA)
 
     def correct_subtitles(self, segments: list[dict], feedback: str) -> list[dict]:
         """Revise only requested caption text, retaining the actual ASR timing."""

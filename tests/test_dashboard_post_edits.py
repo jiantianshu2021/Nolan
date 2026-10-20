@@ -265,6 +265,16 @@ assert.deepEqual(JSON.parse(JSON.stringify(actions[0].edits[0])),{index:0,start:
 assert.ok(walk(editor).some(node=>node.textContent.includes('不再识别、校对或同步复检')));
 ''')
 
+    def test_music_original_excerpt_range_follows_draft_duration_without_changing_source_identity(self):
+        self.run_dom(r'''
+const editor=postproductionEditor(episode,'music'),items=rows(editor),original=walk(items[0]).find(node=>node.className==='muted music-source-window');
+assert.equal(original.textContent,'原曲截取：00:01.0–00:05.0（共 4.0 秒）');
+field(items[0],'end').value='3';field(items[0],'end').listeners.input();assert.equal(original.textContent,'原曲截取：00:01.0–00:04.0（共 3.0 秒）');
+assert.ok(walk(editor).some(node=>node.textContent.includes('以统一后的音源为准')));
+assert.ok(walk(editor).some(node=>node.textContent.includes('不再自动复检、改音量或调用 GPT')));
+await save(editor).listeners.click();assert.equal(actions.length,1);assert.equal(actions[0].edits[0].end,3);assert.equal('source_start' in actions[0].edits[0],false);assert.equal(episode.postproduction.music.cues[0].source_start,1);
+''')
+
     def test_drafts_survive_same_version_refresh_but_reset_on_new_revision_or_export(self):
         self.run_dom(r'''
 let editor=postproductionEditor(episode,'music');let range=field(rows(editor)[0],'gain_db');range.value='-32';range.listeners.input();

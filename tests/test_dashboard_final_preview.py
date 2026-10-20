@@ -15,7 +15,7 @@ class FinalPreviewRenderingTests(unittest.TestCase):
         html = Path(dashboard.__file__).with_name("dashboard.html").read_text()
         sources = []
         for name in ("el", "mediaURL", "appendPrompt", "episodeCard", "postproductionFeedback",
-                     "musicTrack", "postproductionEditor", "subtitleSyncReport", "postproductionPanel", "paintPostproductionStatus"):
+                     "musicTrack", "postproductionEditor", "subtitleSyncReport", "musicMixReport", "postproductionPanel", "paintPostproductionStatus"):
             match = re.search(r"(?:async )?function " + name + r"\(", html)
             following = re.search(r"\n(?:async )?function ", html[match.start() + 1:])
             end = match.start() + 1 + following.start() if following else len(html)
@@ -78,6 +78,16 @@ preview.querySelector('.final-approval').querySelector('button').listeners.click
 assert.equal(actions.at(-1)[0].action,'approve');assert.equal(actions.at(-1)[0].kind,'episode');assert.equal(actions.at(-1)[0].version,4);
 assert.equal(card.querySelector('.episode-video-rework').tag,'details');
 assert.equal(Boolean(card.querySelector('.episode-video-rework').open),false,'video rework is a separate collapsed action');
+''')
+
+    def test_music_attention_retains_final_preview_and_continue_opens_report_without_remixing(self):
+        self.run_dom(r'''
+episode.postproduction.final_ready=false;episode.postproduction.status='music_mix_needs_attention';episode.postproduction.music_mix_check={status:'needs_attention',summary:'合成过轻疑点',issues:[{start:2,end:4,message:'合成片段需试听'}]};
+const card=episodeCard(episode,0),post=card.querySelector('.postproduction'),report=card.querySelector('.music-mix-report');assert.equal(report.id,'music-mix-report-E1');nodes.set(report.id,report);
+assert.equal(post.querySelector('.postproduction-final-video').src,'/media/exports/E1-v4.mp4');assert.equal(card.querySelectorAll('.final-approval').length,0);assert.ok(card.querySelector('.music-mix-approval-blocked'));assert.equal(card.querySelector('.subtitle-sync-approval-blocked'),null);
+paintPostproductionStatus(state);assert.equal(nodes.get('status').textContent,'配乐混音需要试听处理');assert.equal(nodes.get('run').textContent,'查看配乐检查报告');
+nodes.get('run').listeners.click();assert.equal(report.open,true);assert.equal(report.scrolls.length,1);assert.equal(actions.length,0);
+const button=walk(post).find(node=>node.tag==='button'&&node.textContent==='查看配乐检查报告');assert.ok(button);button.listeners.click();assert.equal(report.scrolls.length,2);assert.equal(actions.length,0);
 ''')
 
     def test_subtitle_feedback_includes_audio_realignment_and_keeps_human_final_review(self):

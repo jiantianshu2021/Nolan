@@ -1349,6 +1349,12 @@ def _episode(root, ep_id):
             # Old exports or stale evidence must enter local postproduction
             # again instead of trapping Continue behind a legacy ready flag.
             post_ready = False
+        if ep.get("postproduction", {}).get("music_mix_check", {}).get("status") == "needs_attention":
+            # A completed, bounded local check cannot become an infinite remix
+            # loop when Continue/restart is pressed. New feedback/manual edits
+            # retire the final preview explicitly before another render.
+            _set(root, status="awaiting_postproduction")
+            return
     if (ep["status"] == "awaiting_review" and all(core.human_approved_shot(shot) for shot in ep["shots"])
             and post_ready):
         _set(root, status="awaiting_episode_review")

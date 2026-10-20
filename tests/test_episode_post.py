@@ -189,6 +189,53 @@ class EpisodePostTests(unittest.TestCase):
         self.assertNotIn("approved_at", ep)
         self.soundtrack.assert_not_called()
         episode_post.check_final(self.root, core.load_project(self.root), ep)
+        post = ep["postproduction"]
+        self.assertEqual(post["music"]["render_policy"]["version"], 2)
+        self.assertEqual(post["music_mix_check"]["status"], "passed")
+        self.assertEqual(post["music_mix_check"]["final_sha256"], ep["sha256"])
+        catalog = self.calls("arrange_music")[0].args[2]["catalog"]
+        self.assertTrue(catalog[0]["audio_analysis"]["regions"])
+        self.assertNotIn("envelope", catalog[0]["audio_analysis"])
+
+    def test_new_mix_evidence_is_bound_to_export_and_cannot_be_relabelled_manual(self):
+        self.import_music(approve=True)
+        self.assertTrue(self.finish())
+        original = core.load_project(self.root)
+        for mutate in (
+                lambda p: p["music_mix_check"].update(final_sha256="0" * 64),
+                lambda p: p["music_mix_check"].update(status="manual"),
+                lambda p: p["music_mix_check"].update(status="needs_attention"),
+                lambda p: p.pop("music_mix_check")):
+            state = copy.deepcopy(original)
+            ep = state["episodes"][0]
+            mutate(ep["postproduction"])
+            with self.subTest(report=ep["postproduction"].get("music_mix_check", {}).get("status")):
+                with self.assertRaises(core.GateError):
+                    episode_post.check_final(self.root, state, ep)
+
+    def test_interrupted_music_revision_reuses_fixed_feedback_snapshot_and_plan(self):
+        self.import_music(approve=True)
+        self.assertTrue(self.finish())
+        original = self.episode()
+        episode_post.request(self.root, original["id"], original["version"], "music", "换原曲中的另一个片段")
+
+        def revised_brain(root, method, *args, **kwargs):
+            result = self.brain_response(root, method, *args, **kwargs)
+            if method == "arrange_music":
+                result["cues"][0]["source_start"] = 1.
+            return result
+
+        self.brain.side_effect = revised_brain
+        with patch.object(media, "compose", side_effect=media.MediaError("synthetic interruption before final export")):
+            with self.assertRaises(media.MediaError):
+                self.finish()
+        interrupted = self.episode()["postproduction"]
+        self.assertEqual(interrupted["music"]["cues"][0]["source_start"], 1.)
+        self.assertEqual(interrupted["music_feedback_source"][0]["source_start"], 0.)
+        self.assertTrue(self.finish())
+        self.assertEqual(len(self.calls("arrange_music")), 2,
+                         "resuming an arranged revision must not ask GPT again")
+        self.assertEqual(self.episode()["postproduction"]["music_key"], interrupted["music_key"])
 
     def test_subtitle_only_revision_keeps_videos_and_music_and_requires_new_approval(self):
         self.import_music(approve=True)
@@ -213,6 +260,8 @@ class EpisodePostTests(unittest.TestCase):
         self.assertTrue(self.finish())
         original = self.episode()
         original_shots = self.shots()
+        asr_calls = self.asr.transcribe.call_count
+        checker_calls = self.verifier.verify.call_count
         episode_post.request(self.root, original["id"], original["version"], "music", "背景再轻一点")
         self.assertTrue(self.finish())
         updated = self.episode()
@@ -222,6 +271,8 @@ class EpisodePostTests(unittest.TestCase):
         self.assertEqual(len(self.calls("arrange_music")), 2)
         self.assertEqual(self.calls("arrange_music")[-1].args[2]["feedback"], "背景再轻一点")
         self.assertEqual(updated["status"], "awaiting_review")
+        self.assertEqual(self.asr.transcribe.call_count, asr_calls)
+        self.assertEqual(self.verifier.verify.call_count, checker_calls)
 
     def test_timing_revision_uses_new_audio_windows_not_old_cues_and_keeps_music(self):
         self.import_music(approve=True)
@@ -426,6 +477,10 @@ class EpisodePostTests(unittest.TestCase):
         apply_edits(self.root, original["id"], original["version"], original["postproduction"].get("revision", 0), "subtitles", edits)
         self.assertTrue(self.finish())
         updated = self.episode()
+        self.assertTrue(updated["postproduction"]["music_mix_check"]["reused_prepared_music"])
+        self.assertEqual(updated["postproduction"]["music_mix_check"]["prepared_music_sha256"],
+                         original["postproduction"]["music_mix_check"]["prepared_music_sha256"],
+                         "editing captions must retain the previously balanced music exactly")
         self.assertEqual(updated["render_manifest"]["subtitles"],
             [{"start": round(c["start"], 6), "end": round(c["end"], 6), "text": c["text"]} for c in edits])
         self.assertEqual(updated["postproduction"]["music"]["sha256"], original["postproduction"]["music"]["sha256"])

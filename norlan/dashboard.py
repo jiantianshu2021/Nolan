@@ -827,6 +827,67 @@ def _public_subtitle_sync_report(report, *, current=None):
     return safe_report
 
 
+def _public_music_analysis(value: object) -> dict | None:
+    """Expose a compact analysis summary, never waveform/cache/provider evidence."""
+    if not isinstance(value, dict):
+        return None
+    from .failures import sanitize_failure
+    result = {}
+    status = value.get("status")
+    if status in {"pending", "analyzing", "analyzed", "ready", "completed", "manual", "needs_attention"}:
+        result["status"] = status
+    for key in ("policy_version", "summary"):
+        text = value.get(key)
+        if isinstance(text, str) and text:
+            result[key] = sanitize_failure({"message": text[:1200]})["message"]
+    for key in ("tracks_analyzed", "cues_analyzed"):
+        count = value.get(key)
+        if type(count) is int and 0 <= count <= 10000:
+            result[key] = count
+    return result
+
+
+def _public_music_mix_report(value: object, *, current: bool | None = None) -> dict | None:
+    """Keep the UI diagnostic bounded and separate from a human listening decision."""
+    if not isinstance(value, dict):
+        return None
+    from .failures import sanitize_failure
+    status = value.get("status")
+    result = {"status": status if status in {"checking", "repairing", "passed", "manual", "needs_attention"}
+              else "needs_attention", "issues": []}
+    for key in ("policy_version", "summary", "checked_at"):
+        text = value.get(key)
+        if key == "policy_version" and type(text) is int and 0 <= text <= 1000:
+            text = str(text)
+        if isinstance(text, str) and text:
+            result[key] = sanitize_failure({"message": text[:1200]})["message"]
+    if current is False and result["status"] in {"passed", "manual"}:
+        result.update(status="needs_attention", summary="配乐检查记录与当前成片不一致，请重新处理本集配乐；已有视频和导出保留。")
+    attempts = value.get("repair_attempts")
+    if type(attempts) is int and 0 <= attempts <= 2:
+        result["repair_attempts"] = attempts
+    for key, lower, upper in (("normalization_target_lufs", -60, 0), ("duck_max_reduction_db", 0, 30)):
+        number = value.get(key)
+        if type(number) in {int, float} and math.isfinite(number) and lower <= number <= upper:
+            result[key] = round(number, 2)
+    if type(value.get("source_analysis_used")) is bool:
+        result["source_analysis_used"] = value["source_analysis_used"]
+    issues = value.get("issues")
+    for issue in issues[:100] if isinstance(issues, list) else []:
+        if not isinstance(issue, dict):
+            continue
+        message = issue.get("message")
+        if not isinstance(message, str) or not message:
+            continue
+        item = {"message": sanitize_failure({"message": message[:1200]})["message"]}
+        start, end = issue.get("start"), issue.get("end")
+        if (type(start) in {int, float} and type(end) in {int, float}
+                and math.isfinite(start) and math.isfinite(end) and 0 <= start < end <= 3600):
+            item.update(start=round(start, 3), end=round(end, 3))
+        result["issues"].append(item)
+    return result
+
+
 def _public_postproduction(state: dict, episode: dict) -> dict:
     """Only the editing plan and bounded human-facing diagnostics reach the page."""
     from .failures import sanitize_failure
@@ -854,7 +915,7 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
                      and Path(final_file).suffix.lower() in {".mp4", ".m4v", ".mov", ".webm"})
     result["final_available"] = bool(result["enabled"] and result["ready"]
         and value.get("final_ready") is True
-        and (value.get("status") in {"awaiting_final_approval", "approved"}
+        and (value.get("status") in {"awaiting_final_approval", "approved", "music_mix_needs_attention"}
              or (result["manual_preview"] and value.get("status") == "subtitle_sync_needs_attention"))
         and episode.get("status") in {"awaiting_review", "approved"}
         and final_path_ok and final_file == episode.get("file")
@@ -869,7 +930,23 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
                             audio_sha256=subtitles["audio_sha256"], source_key=value["source_key"])
              or manual_report_matches(subtitles.get("sync_check"), subtitles.get("segments", []),
                                       audio_sha256=subtitles["audio_sha256"], source_key=value["source_key"])))
-    result["final_ready"] = result["final_available"] and sync_current
+    # New mix reports are tied to the exact exported version. Legacy exports
+    # remain viewable; an unbound/stale new report never opens approval.
+    manifest = episode.get("render_manifest", {})
+    manifest = manifest.get("postproduction", {}) if isinstance(manifest, dict) else {}
+    mix_hash = manifest.get("music_mix_hash") if isinstance(manifest, dict) else None
+    mix_report = value.get("music_mix_check")
+    mix_current = None
+    if mix_hash is not None and result["final_available"]:
+        from .core import _json_digest
+        try:
+            mix_current = (isinstance(mix_report, dict) and _valid_sha(mix_hash)
+                           and mix_report.get("final_sha256") == episode.get("sha256")
+                           and _json_digest(mix_report) == mix_hash)
+        except (TypeError, ValueError):
+            mix_current = False
+    mix_passed = mix_current is None or (mix_current and mix_report.get("status") in {"passed", "manual"})
+    result["final_ready"] = result["final_available"] and sync_current and mix_passed
     if result["final_available"]:
         result.update(final_file=final_file, final_version=final_version, final_sha256=final_sha256)
     result["missing_configuration"] = [sanitize_failure({"message": text})["message"] for text in value.get("missing_configuration", [])
@@ -910,7 +987,15 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
         else:
             item["cues"] = [_pick(cue, ("track_id", "start", "end", "source_start", "gain_db", "fade_in", "fade_out", "reason"))
                             for cue in source.get("cues", []) if isinstance(cue, dict)][:500]
+            analysis = _public_music_analysis(source.get("analysis"))
+            if analysis is not None:
+                item["analysis"] = analysis
         result[section] = item
+    music_mix_check = _public_music_mix_report(mix_report, current=mix_current)
+    if music_mix_check is None and mix_current is False:
+        music_mix_check = {"status": "needs_attention", "summary": "本集混音检查记录缺失，请重新处理本集配乐；已有视频和导出保留。", "issues": []}
+    if music_mix_check is not None:
+        result["music_mix_check"] = music_mix_check
     if value.get("error"):
         result["error"] = sanitize_failure({"message": str(value["error"])})["message"]
     if result["enabled"]:
