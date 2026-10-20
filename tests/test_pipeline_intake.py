@@ -129,6 +129,7 @@ class PipelineIntakeTests(unittest.TestCase):
         reserve.assert_not_called()
 
     def test_human_retry_moves_failed_clip_to_history_before_next_refinement(self):
+        core.set_video_review_enabled(self.root, True)
         with fake_media():
             choose_gpt_assets(self.root)
             state = run_confirming_prompts(self.root)

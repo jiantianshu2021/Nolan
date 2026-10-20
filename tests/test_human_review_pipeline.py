@@ -17,6 +17,7 @@ class HumanReviewPipelineTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.enterContext(fake_media())
         core.create_project(self.root, "合成人审测试，不调用真实服务。")
+        core.set_video_review_enabled(self.root, True)
         core.install_plan(self.root, pipeline.demo_plan())
         core.approve(self.root, "plan", "plan", 1)
         choose_gpt_assets(self.root)

@@ -24,6 +24,25 @@ class GateError(ValueError):
     """A resumable production gate, not permission to skip it."""
 
 
+class VideoReviewDisabled(GateError):
+    """The operator disabled a new advisory request before submission."""
+
+
+def video_review_enabled(state):
+    # Missing or malformed legacy values never opt the operator into calls.
+    return state.get("settings", {}).get("gpt_video_review_enabled") is True
+
+
+def set_video_review_enabled(root, enabled):
+    """Persist a live preference only; do not run, cancel or approve any work."""
+    if type(enabled) is not bool:
+        raise ValueError("GPT 视频审查开关必须为布尔值。")
+    with transaction(root) as state:
+        state["settings"]["gpt_video_review_enabled"] = enabled
+        event(state, "video_review_setting_changed", enabled=enabled)
+    return load_project(root)
+
+
 _PLAN_ERRORS = {
     "title_required": ("规划缺少标题。", "填写非空字符串 title。"),
     "ratio_invalid": ("不支持的画面比例。", "ratio 使用 16:9、9:16、1:1、4:3、3:4 或 21:9。"),
@@ -213,6 +232,7 @@ def create_project(root, novel: str, mode="demo", title="Nolan 漫剧"):
             "subtitles": {"mode": "local" if mode == "live" else "none", "call_cap": 0},
             "postproduction": {"enabled": mode == "live"},
             "creative_brief": "", "require_voice_reference": True,
+            "gpt_video_review_enabled": False,
         },
         "budget": {"limit": 0, "currency": "CNY", "spent": 0, "reserved": 0,
                    "unknown": 0, "approved": mode == "demo",
@@ -1527,8 +1547,10 @@ def configure(root, settings=None, limit=None, currency=None):
     with transaction(root) as s:
         s["settings"].setdefault("postproduction", {"enabled": False})
         if settings:
-            if set(settings) - set(s["settings"]):
+            if set(settings) - set(s["settings"]) - {"gpt_video_review_enabled"}:
                 raise ValueError("未知配置字段")
+            if "gpt_video_review_enabled" in settings and type(settings["gpt_video_review_enabled"]) is not bool:
+                raise ValueError("GPT 视频审查开关必须为布尔值。")
             secret_words = {"api_key", "token", "secret", "access_key", "secret_key", "password"}
             def check(v):
                 if isinstance(v, dict):
@@ -1553,6 +1575,8 @@ def configure(root, settings=None, limit=None, currency=None):
                 raise ValueError("本集后期开关必须为布尔值")
             if type(s["settings"]["ark"].get("video_watermark", False)) is not bool:
                 raise ValueError("视频水印开关 video_watermark 必须为布尔值")
+            if type(s["settings"].get("gpt_video_review_enabled", False)) is not bool:
+                raise ValueError("GPT 视频审查开关必须为布尔值。")
         _totals(s)
         if currency:
             if currency not in {"CNY", "USD"}:
@@ -1612,9 +1636,11 @@ def _validate_advisory_target(root, state, kind, item_id, target):
     return copy.deepcopy(target)
 
 
-def reserve(root, job_id, kind, item_id, amount, *, pricing=None, advisory_target=None):
+def reserve(root, job_id, kind, item_id, amount, *, pricing=None, advisory_target=None, require_video_review=False):
     """Persist BEFORE calling provider. Unknown outcomes stay charged/reserved."""
     with transaction(root) as s:
+        if require_video_review and kind == "llm" and item_id == "review" and not video_review_enabled(s):
+            raise VideoReviewDisabled("GPT 视频审查已关闭，未提交新的审查请求。")
         if job_id in s["jobs"]:
             raise GateError("调用已登记，必须恢复原调用，不能重复提交")
         if s["paused"]:

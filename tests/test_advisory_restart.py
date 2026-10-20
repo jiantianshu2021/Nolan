@@ -16,6 +16,7 @@ class AdvisoryRestartTests(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         self.enterContext(fake_media())
         core.create_project(self.root, "合成审查恢复测试小说。", "demo")
+        core.set_video_review_enabled(self.root, True)
         core.install_plan(self.root, pipeline.demo_plan())
         core.approve(self.root, "plan", "plan", 1)
         choose_gpt_assets(self.root)

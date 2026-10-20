@@ -467,6 +467,15 @@ def _public_shot_report(record, version):
     return result
 
 
+def _public_review_skipped(record):
+    value = record.get("review_skipped")
+    if (not isinstance(value, dict) or value.get("reason") != "disabled"
+            or not _valid_sha(record.get("sha256")) or value.get("sha256") != record["sha256"]
+            or type(value.get("version")) is not int or value["version"] != record.get("version", 0)):
+        return None
+    return _pick(value, ("reason", "version", "sha256", "at"))
+
+
 def _public_planning_block(shot):
     """Only show cached blockers still bound to this exact human revision."""
     if shot.get("status") != "planned" or shot.get("file") or shot.get("job_id"):
@@ -654,7 +663,12 @@ def _public_rough_cuts(episode):
                     current = calculated == record["key"]
                     if current:
                         public_manifest = [{"id": shot["id"], "version": _version(shot.get("version"))} for shot in originals]
-        item = {"key": record["key"], "file": record["file"], **_public_timestamps(record)}
+        item = {"key": record["key"], "file": record["file"], "version": record.get("version", 0), **_public_timestamps(record)}
+        if _valid_sha(record.get("sha256")):
+            item["sha256"] = record["sha256"]
+        skipped = _public_review_skipped(record)
+        if skipped:
+            item["review_skipped"] = skipped
         item.update(shot_count=count if type(count) is int and 0 < count <= len(shots) else 0,
                     current=current, legacy=legacy, shots=public_manifest)
         # A cut is immutable, but approval can change after it was rendered.
@@ -1109,6 +1123,8 @@ def _public_episode_navigation(episodes: list[dict], season_source: dict | None 
 def public_state(state: dict) -> dict:
     """Keep credentials, source novel, provider responses and settings off the UI API."""
     result = _pick(state, ("id", "title", "mode", "status", "paused", "created_at", "updated_at"))
+    from .core import video_review_enabled
+    result["video_review"] = {"enabled": video_review_enabled(state)}
     from .core import is_nonblocking_advisory_unknown
     result["pending_advisory_count"] = sum(is_nonblocking_advisory_unknown(job)
                                             for job in state.get("jobs", {}).values() if isinstance(job, dict))
@@ -1275,6 +1291,11 @@ def public_state(state: dict) -> dict:
             if not _current_shot_artifact(shot):
                 entry.pop("file", None)
             else:
+                if _valid_sha(shot.get("sha256")):
+                    entry["sha256"] = shot["sha256"]
+                skipped = _public_review_skipped(shot)
+                if skipped:
+                    entry["review_skipped"] = skipped
                 report = _public_shot_report(shot, entry["version"])
                 if report:
                     entry["review"] = report
@@ -1630,6 +1651,11 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/post-edit" and action != "edit_postproduction":
                 return self._error(409, "此接口只接受字幕或配乐表格编辑。")
             with context.mutation_lock:
+                if path == "/api/action" and action == "set_video_review":
+                    if set(data) != {"action", "enabled"} or type(data.get("enabled")) is not bool:
+                        raise ValueError
+                    _core().set_video_review_enabled(context.project_dir, data["enabled"])
+                    return self._json(200, context.state())
                 if path == "/api/post-edit" and action == "edit_postproduction":
                     if context.running or context.external_run_active():
                         return self._error(409, "制作正在进行，请等待当前任务结束后再调整后期。")

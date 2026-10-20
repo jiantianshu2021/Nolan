@@ -205,6 +205,7 @@ class GenerationFailureTests(unittest.TestCase):
         self.api.submit_video.assert_called_once()
 
     def test_successful_new_version_never_inherits_previous_failed_jobs_diagnosis(self):
+        core.set_video_review_enabled(self.root, True)
         self.fail_submission()
         first_job = copy.deepcopy(self.job())
         shot = self.shot()

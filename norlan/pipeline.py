@@ -90,7 +90,8 @@ def _brain(root, method, *args, **kwargs):
         nonlocal submitted
         if submitted:
             raise core.GateError("同一次 GPT 工作不能重复提交；请先核实原调用。")
-        core.reserve(root, job_id, "llm", method, amount, advisory_target=target)
+        core.reserve(root, job_id, "llm", method, amount, advisory_target=target,
+                     require_video_review=method == "review")
         submitted = True
 
     client = Brain(config)
@@ -160,6 +161,28 @@ def _unavailable_review(message="GPT 审查中断，报告不可用。请自行�
     return {"verdict": "uncertain", "issues": [message], "observed_end_state": "未核实", "repair_prompt": "",
             "scope": "sampled_frames_only", "report_unavailable": True, "review_interrupted": True,
             "advisory": True, "audio_checked": False, "whole_video_checked": False}
+
+
+def _review_skip(record):
+    return {"reason": "disabled", "version": record.get("version", 0),
+            "sha256": record["sha256"], "at": core.now()}
+
+
+def _skip_shot_review(root, shot_id):
+    with core.transaction(root) as state:
+        shot = core._find(state, "shot", shot_id)
+        shot.update(status="review_required", review_skipped=_review_skip(shot))
+        state["status"] = "review_required"
+        core.event(state, "video_review_skipped", id=shot_id, version=shot["version"], sha256=shot["sha256"])
+
+
+def _skip_cut_review(root, episode_id, cut):
+    with core.transaction(root) as state:
+        episode = core._find(state, "episode", episode_id)
+        current = next(item for item in episode.get("rough_cuts", [])
+                       if item.get("key") == cut["key"] and item.get("sha256") == cut["sha256"])
+        current["review_skipped"] = _review_skip(current)
+        core.event(state, "cut_review_skipped", id=episode_id, key=cut["key"], sha256=cut["sha256"])
 
 
 def _cached_review(state, target):
@@ -235,7 +258,13 @@ def _recover_advisory_reports(root, state):
                     or job.get("state") != "completed" or not job.get("output")):
                 raise core.GateError("审查中断后的原视频任务尚未核实，不能直接转入人工审批；请先恢复原任务。")
             core._check_shot_artifact(root, state, shot)
-            review = _cached_review(state, _shot_review_target(shot)) or _unavailable_review()
+            review = _cached_review(state, _shot_review_target(shot))
+            if review is None and not core.video_review_enabled(state):
+                shot.update(status="review_required", review_skipped=_review_skip(shot))
+                recovered["shots"].append(shot["id"])
+                core.event(state, "video_review_skipped", id=shot["id"], version=shot["version"], recovered=True)
+                continue
+            review = review or _unavailable_review()
             review.update(version=shot["version"], sha256=shot["sha256"])
             shot.update(review=review, status="review_required")
             recovered["shots"].append(shot["id"])
@@ -243,6 +272,9 @@ def _recover_advisory_reports(root, state):
                        from_cache=bool(review.get("recovered_from_cache")))
         hint = episode.get("progress_stage", {})
         for cut in episode.get("rough_cuts", []):
+            if (cut.get("review_skipped", {}).get("reason") == "disabled"
+                    and cut["review_skipped"].get("sha256") == cut.get("sha256")):
+                continue
             if any(review.get("key") == cut.get("key") and review.get("sha256") == cut.get("sha256")
                    for review in episode.get("reviews", [])):
                 continue
@@ -262,7 +294,13 @@ def _recover_advisory_reports(root, state):
             for item in prefix:
                 core._check_shot_artifact(root, state, item)
             core._check_artifact(root, cut)
-            review = _cached_review(state, target) or _unavailable_review("GPT 拼接审查中断，报告不可用。请自行播放累计拼接检查衔接。")
+            review = _cached_review(state, target)
+            if review is None and not core.video_review_enabled(state):
+                cut["review_skipped"] = _review_skip(cut)
+                recovered["rough_cuts"].append(cut["key"])
+                core.event(state, "cut_review_skipped", id=episode["id"], key=cut["key"], recovered=True)
+                continue
+            review = review or _unavailable_review("GPT 拼接审查中断，报告不可用。请自行播放累计拼接检查衔接。")
             review.update(key=cut["key"], file=cut["file"], sha256=cut["sha256"])
             episode.setdefault("reviews", []).append(review)
             recovered["rough_cuts"].append(cut["key"])
@@ -1083,6 +1121,9 @@ def _shot(root, ep_id, shot_id, previous):
     # Human approval needs the seam in motion, not just a standalone clip.
     # This local preview is published before the advisory GPT call completes.
     _refresh_candidate_preview(root, ep_id)
+    if not core.video_review_enabled(core.load_project(root)):
+        _skip_shot_review(root, shot_id)
+        return False
     # Review the seam too: prior tail + current sampled frames, tied to hashes.
     review_images = observations + [Path(f) for f in evidence["frames"]]
     has_prior_frame = any(item.get("role") in {"previous_actual_tail", "previous_official_tail", "previous_observation_tail"}
@@ -1104,6 +1145,9 @@ def _shot(root, ep_id, shot_id, previous):
         review = ({"verdict": "pass", "issues": [], "observed_end_state": "Synthetic demo only",
                    "repair_prompt": "", "scope": "synthetic smoke test"} if s["mode"] == "demo"
                   else _brain(root, "review", review_context, review_images))
+    except core.VideoReviewDisabled:
+        _skip_shot_review(root, shot_id)
+        return False
     except Exception:
         # A failed report must not hide a paid-for candidate or cause another
         # video/report request on every resume. The user can review the video.
@@ -1393,6 +1437,12 @@ def _episode(root, ep_id):
             batch_key = rough_cut["key"]
             if any(r.get("key") == batch_key for r in fresh["reviews"]):
                 continue
+            if (rough_cut.get("review_skipped", {}).get("reason") == "disabled"
+                    and rough_cut["review_skipped"].get("sha256") == rough_cut["sha256"]):
+                continue
+            if not core.video_review_enabled(core.load_project(root)):
+                _skip_cut_review(root, ep_id, rough_cut)
+                continue
             path = core.safe_path(root, rough_cut["file"])
             ev = media.extract_evidence(path, Path(root) / "evidence" / f"rough-{ep_id}-{batch_key[:16]}")
             _progress(root, ep_id, "batch_review", original["id"])
@@ -1403,6 +1453,9 @@ def _episode(root, ep_id):
                               "advisory_target": _cut_review_target(ep_id, rough_cut),
                               "scope": "分段粗剪抽帧检查；听觉未评估，运动过程未完整评估。",
                               "evidence": _relative_evidence(root, ev)}, [Path(f) for f in ev["frames"]]))
+            except core.VideoReviewDisabled:
+                _skip_cut_review(root, ep_id, rough_cut)
+                continue
             except Exception:
                 if core.load_project(root)["paused"]:
                     raise

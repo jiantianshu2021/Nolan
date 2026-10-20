@@ -16,6 +16,7 @@ class CandidatePreviewTests(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         self.enterContext(fake_media())
         core.create_project(self.root, "离线候选累计预览测试，不调用真实服务。")
+        core.set_video_review_enabled(self.root, True)
         plan = pipeline.demo_plan()
         plan["episodes"] = [plan["episodes"][0]]
         template = plan["episodes"][0]["shots"][0]

@@ -13,6 +13,7 @@ class AdvisoryPersistenceTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
         core.create_project(self.root, "合成缓存恢复测试。")
+        core.set_video_review_enabled(self.root, True)
         core.install_plan(self.root, pipeline.demo_plan())
         core.configure(self.root, {"caps": {"llm": 2}}, limit=100)
         path = self.root / "media/E001/E001-S001-v1.mp4"

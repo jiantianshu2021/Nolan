@@ -16,6 +16,7 @@ class RoughCutTests(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         self.enterContext(fake_media())
         core.create_project(self.root, "离线累计粗剪测试。")
+        core.set_video_review_enabled(self.root, True)
         plan = pipeline.demo_plan()
         template = plan["episodes"][0]["shots"][0]
         plan["episodes"] = [plan["episodes"][0]]

@@ -286,6 +286,7 @@ class OfficialContinuityTests(unittest.TestCase):
         self.api.video_artifacts.assert_not_called()
 
     def test_missing_observation_tail_is_not_claimed_in_gpt_review_scope(self):
+        core.set_video_review_enabled(self.root, True)
         first = self.approve_first()
         self.set_video_override()
         (self.root / first["evidence"]["tail_frame"]).unlink()

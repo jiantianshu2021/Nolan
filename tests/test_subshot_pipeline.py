@@ -112,6 +112,7 @@ class SubshotPipelineTests(unittest.TestCase):
                 "sampling_note": "只是计划点采样，不代表已检测实际切镜。"}
 
     def test_three_subshots_are_one_task_with_locked_timeline_dialogue_and_references(self):
+        core.set_video_review_enabled(self.root, True)
         self.assertFalse(confirming_shot(self.root, "E001", "E001-S001", self.previous))
         self.provider.submit_video.assert_called_once()
         prompt, duration, images = self.provider.submit_video.call_args.args

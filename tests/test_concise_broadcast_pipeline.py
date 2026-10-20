@@ -15,6 +15,7 @@ class ConciseBroadcastPipelineTests(unittest.TestCase):
 
     def setUp(self):
         fixtures.PromptGateTests.setUp(self)
+        core.set_video_review_enabled(self.root, True)
         self.readback = []
         definitions = fixtures.PromptGateTests.amendment(self)["additions"]
         with core.transaction(self.root) as state:

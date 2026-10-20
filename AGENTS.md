@@ -6,6 +6,11 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
 - GPT video reviews are advisory only. Every new video version waits for the
   user's decision. Only explicit human rework requests authorize another video
   submission; resuming a task or a failed report never does.
+- GPT video reviews default off, including projects without the setting. The
+  local UI switch affects future segment and rough-cut advisory submissions,
+  never human gates, local evidence/stitching or subtitle checks. Keep existing
+  reports; enabling does not backfill skipped versions. Check the setting again
+  at reservation, while allowing an already submitted review to finish.
 - Each next episode is blocked until the preceding final render is approved.
 - Importing a season preserves existing episodes, assets, budget, approvals and
   source/novel.txt. Store immutable per-episode source hashes and retain original
