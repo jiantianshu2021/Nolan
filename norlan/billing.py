@@ -14,6 +14,14 @@ ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 PRICE_SOURCE = "https://docs.volcengine.com/docs/ark/model-pricing?lang=zh&redirect=1"
 PRICE_CHECKED_AT = "2026-10-20"
 IMAGE_MODEL = "doubao-seedream-5-0-flash-260915"
+IMAGE_RATES = {
+    IMAGE_MODEL: 0.12,
+    "doubao-seedream-5-0-260128": 0.22,
+    "doubao-seedream-5-0-lite-260128": 0.22,
+    "doubao-seedream-4-5-251128": 0.25,
+    "doubao-seedream-4-0-250828": 0.20,
+}
+_PRO_IMAGE_MODEL = "doubao-seedream-5-0-pro-260628"
 VIDEO_MODEL = "doubao-seedance-2-0-fast-260128"
 # Exact release IDs, public on-demand rates in CNY / million completion tokens.
 # Each pair is (without input video, with input video). The enterprise promotions
@@ -94,8 +102,18 @@ def price_snapshot(config, kind, *, has_video_input=False):
             or not isinstance(base_url, str) or base_url.rstrip("/") != ARK_BASE_URL
             or not isinstance(has_video_input, bool)):
         return snapshot
-    if kind == "image" and model == IMAGE_MODEL and not has_video_input:
-        snapshot.update(unit="generated_images", rate=0.12)
+    if kind == "image" and not has_video_input:
+        if model in IMAGE_RATES:
+            snapshot.update(unit="generated_images", rate=IMAGE_RATES[model])
+        elif model == _PRO_IMAGE_MODEL:
+            if resolution in {"1K", "1.5K", "2K"}:
+                pixels = 2_610_000 if resolution in {"1K", "1.5K"} else 4_624_220
+            else:
+                match = re.fullmatch(r"([1-9][0-9]{0,5})x([1-9][0-9]{0,5})", resolution)
+                pixels = int(match[1]) * int(match[2]) if match else None
+            if pixels is not None and 921_600 <= pixels <= 4_624_220:
+                snapshot.update(unit="generated_images", rate=0.30 if pixels <= 2_610_000 else 0.60,
+                                input_rate=0.02, input_images_free=1)
     elif video and model in VIDEO_RATES and resolution in VIDEO_RATES[model]:
         # Seedance 1.0 cannot accept video input, even though its fixed rate has
         # no input-video tier. Such a contradictory configuration is unpriced.
@@ -169,7 +187,7 @@ def usage_record(result, snapshot):
             or currency != "CNY" or snapshot.get("service_tier") != "default"
             or returned_tier != "default" or rate is None):
         return record
-    if unit == "generated_images" and model == IMAGE_MODEL:
+    if unit == "generated_images" and (model in IMAGE_RATES or model == _PRO_IMAGE_MODEL):
         field, divisor = "generated_images", Decimal(1)
     elif (unit == "million_completion_tokens" and model in VIDEO_RATES
           and snapshot.get("resolution") in VIDEO_RATES[model]):
@@ -194,7 +212,20 @@ def usage_record(result, snapshot):
         return record
     with localcontext() as context:
         context.prec = max(28, len(str(quantity)) + len(rate.as_tuple().digits) + 8)
-        cost = _amount(Decimal(quantity) * rate / divisor)
+        total = Decimal(quantity) * rate / divisor
+        if model == _PRO_IMAGE_MODEL:
+            # Pro charges additional input images. Do not infer provider usage
+            # from planned reference counts or label an output-only subtotal as
+            # the cost of the entire call. Missing evidence remains pending.
+            input_rate = _number(snapshot.get("input_rate"))
+            free = _integer(snapshot.get("input_images_free"))
+            inputs = usage.get("input_images")
+            if input_rate is None or free is None or inputs is None:
+                return record
+            if provider_status in {"failed", "cancelled", "expired"}:
+                return record
+            total += Decimal(max(0, inputs - free)) * input_rate
+        cost = _amount(total)
     if cost is not None:
         record.update(usage_cost=cost, status="usage_priced")
     return record
@@ -242,5 +273,5 @@ def _zero_usage_evidence(billing):
         return False
     if isinstance(billing.get("model"), str) and billing["model"] in VIDEO_RATES:
         return _integer(usage.get("completion_tokens")) == 0
-    return (billing.get("model") == IMAGE_MODEL and _integer(usage.get("generated_images")) == 0
+    return (billing.get("model") in {*IMAGE_RATES, _PRO_IMAGE_MODEL} and _integer(usage.get("generated_images")) == 0
             and billing.get("provider_status") in {"failed", "cancelled", "expired"})

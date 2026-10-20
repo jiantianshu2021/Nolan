@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from norlan import core, future_continuity, pipeline, storyboard_revision
 import test_prompt_gate as fixtures
+from test_pipeline import run_confirming_asset_prompts
 
 
 REAL_BRAIN = pipeline._brain
@@ -181,7 +182,9 @@ class FutureContinuityPipelineTests(unittest.TestCase):
         core.apply_asset_amendment(self.root, amendment["id"], "approve")
         self.assertEqual(pipeline.run(self.root)["status"], "awaiting_asset_input")
         fixtures.choose_gpt_assets(self.root)
-        self.assertEqual(pipeline.run(self.root)["status"], "awaiting_assets")
+        self.assertEqual(pipeline.run(self.root)["status"], "awaiting_asset_prompt_approval")
+        self.fixture.api.submit_video.assert_not_called()
+        self.assertEqual(run_confirming_asset_prompts(self.root)["status"], "awaiting_assets")
         self.assertEqual(self.shot(neighbor=True), self.before["episodes"][0]["shots"][1])
         voice = core._find(core.load_project(self.root), "asset", "system-voice")
         core.approve(self.root, "asset", voice["id"], voice["version"])

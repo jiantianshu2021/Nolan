@@ -143,8 +143,8 @@ delete voice.file;voice.status='planned';content=walk(assetCard(voice));assert.e
 paintAssetAmendments({dashboard:{running:false},asset_amendments:[{id:'add-voice',status:'candidate',target_shot_id:'S1',additions:[voice],shot_updates:[]}]});
 const additions=walk(nodes.get('asset-amendments'));assert.equal(additions.filter(n=>n.tag==='strong'&&n.textContent==='系统女性播报声音 · 声音').length,1);assert.equal(additions.some(n=>n.textContent.includes('画外声音，不入画')),true);assert.equal(additions.some(n=>n.tag==='button'&&n.textContent==='确认画外声源定义'),false);
 assert.equal(additions.some(n=>n.textContent.includes('系统播报用途')),false);assert.equal(additions.some(n=>n.textContent.includes('只播报系统提示。')),false,'amendment also hides internal source prose');
-state.assets=[{...voice,input_editable:true,input_required:false}];updateInputControls();assert.equal(nodes.get('generate-assets').textContent,'生成声音试听');assert.equal(nodes.get('generate-assets').disabled,false);
-state.assets.push({id:'hero',kind:'character',input_editable:true,input_required:false});updateInputControls();assert.equal(nodes.get('generate-assets').textContent,'按以上选择生成资产');
+state.assets=[{...voice,input_editable:true,input_required:false}];updateInputControls();assert.equal(nodes.get('generate-assets').textContent,'准备声音试听提示词');assert.equal(nodes.get('generate-assets').disabled,false);
+state.assets.push({id:'hero',kind:'character',input_editable:true,input_required:false});updateInputControls();assert.equal(nodes.get('generate-assets').textContent,'准备资产提示词');
 assert.equal(decisions.length,1,'labels and rendering must never submit generation or approval');
 `,context);
 '''

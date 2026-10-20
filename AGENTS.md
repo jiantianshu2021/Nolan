@@ -38,6 +38,14 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   to generate media. Existing asset-direction, asset and video-prompt approvals
   still apply. Reuse completed planning caches after interruption; unknown calls
   never authorize a repeat. Episode navigation must not approve or regenerate.
+- Every new live image asset and voice audition must stop at a complete,
+  version/hash/reference-bound prompt candidate. Only the human dashboard
+  confirmation selects the per-request model and authorizes one generation.
+  Asset-direction/description choices, asset-amendment approvals and Continue
+  do not authorize media. Adopt manual prompt text exactly; never rewrite it.
+  Check budget, credentials and local voice transport before advancing version;
+  a local refusal keeps the same consent. Recover submitted jobs by original
+  ID/configuration; do not backfill consent for existing media.
 - Reserve cost before a paid POST. Unknown submission outcomes must not be
   retried. Persist the provider ID before polling or downloading.
 - Do not claim sampled frames establish audio, lip-sync or full-motion quality.

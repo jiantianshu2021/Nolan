@@ -133,6 +133,12 @@ def _video_config(state, kind, item_id, job=None):
     from .video_models import effective_config
     shot = core._find(state, "shot", item_id) if kind == "video" else None
     config = effective_config(state, shot)
+    if kind == "voice" and not job:
+        asset = core._find(state, "asset", item_id)
+        saved = asset.get("generation_request", {}).get("generation_config", {})
+        config.update({key: saved[key] for key in
+                       ("video_model", "ratio", "resolution", "generate_audio", "video_watermark")
+                       if key in saved})
     if job:
         saved = job.get("video_request")
         if isinstance(saved, dict):
@@ -537,7 +543,7 @@ def _poll_video(root, job_id, output):
 
 
 def _prepare_video_transport(root, provider, kind, item_id, prompt, duration, references, audio_references,
-                             previous_video=None):
+                             previous_video=None, source_manifest_override=None):
     """Create traceable local copies and check the whole request before reserving."""
     # Test/demo or other adapters without a real class implementation keep
     # their existing path; a dynamically generated Mock method is not an API.
@@ -551,7 +557,8 @@ def _prepare_video_transport(root, provider, kind, item_id, prompt, duration, re
         raise ProviderError(str(exc)) from None
     state = core.load_project(root)
     obj = core._find(state, "asset" if kind == "voice" else "shot", item_id)
-    source_manifest = obj.get("reference_manifest", {}) if kind == "video" and obj.get("prompt_approval") else None
+    source_manifest = source_manifest_override or (obj.get("reference_manifest", {}) if kind == "video" and obj.get("prompt_approval") else
+                       obj.get("generation_request", {}).get("reference_manifest") if kind == "voice" else None)
     for key, paths, prepared, info_key in (("images", references, images, "image_references"),
                                           ("audio", audio_references, audio, "audio_references")):
         rows = manifest.get(key, [])
@@ -644,6 +651,8 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
         if kind == "voice":
             current["jobs"][job_id]["audition_profile"] = copy.deepcopy(obj.get("audition_profile", {}))
             current["jobs"][job_id]["duration"] = duration
+            if obj.get("generation_request"):
+                current["jobs"][job_id]["asset_generation"] = copy.deepcopy(obj["generation_request"])
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     if s["mode"] == "demo":
         media.synthetic_clip(output, prompt, duration, index=len(s["jobs"]))
@@ -731,6 +740,7 @@ def _assets(root):
     core.normalize_voice_sources(root, already_locked=True)
     s = _gate(root)
     from .asset_inputs import pending_assets, reference_paths, compose_prompt
+    from . import asset_prompt_gate, asset_models
     waiting_for_input = bool(pending_assets(s))
     for original in s["assets"]:
         s = _gate(root)
@@ -761,16 +771,51 @@ def _assets(root):
             if total_attempts >= s["settings"]["max_attempts"]:
                 raise core.GateError("资产已达到尝试上限；请调整方案或显式提高上限：" + asset["id"])
             references = reference_paths(root, asset)
-            if asset["kind"] == "voice" and s["mode"] == "live":
-                character = core._find(s, "asset", asset["character_id"])
-                core._check_artifact(root, character)
-                asset = _select_audition(root, asset, character)
+            consent = None
+            if s["mode"] == "live":
+                consent = asset_prompt_gate.approved(root, asset["id"])
+                prepared = consent or asset_prompt_gate.current(root, asset["id"])
+                if prepared is None:
+                    if asset["kind"] == "voice":
+                        character = core._find(s, "asset", asset["character_id"])
+                        core._check_artifact(root, character)
+                        asset = _select_audition(root, asset, character)
+                        images = [] if character.get("voice_only") is True else [core.safe_path(root, character["file"])]
+                        voice_asset = {**asset, "prompt": compose_prompt(asset), "voice_only": character.get("voice_only") is True}
+                        final_prompt, duration = build_audition_prompt(voice_asset), audition_duration(asset)
+                    else:
+                        images, duration = references, None
+                        final_prompt = compose_prompt(asset, s["plan"].get("style", ""))
+                    asset_prompt_gate.prepare(root, asset["id"], final_prompt, images, duration=duration)
+                if consent is None:
+                    continue
+                references = [core.safe_path(root, file) for file in consent["reference_manifest"]["images"]]
+                amount = asset_models.reserve_amount(s, asset, model=consent["model"],
+                    duration=consent.get("duration"), candidate=consent)
+                if not s["budget"]["approved"] or amount <= 0:
+                    raise core.GateError("请先设置预算和媒体调用价格上限")
+                if amount > s["budget"]["available"] + 0.0000001:
+                    raise core.GateError("剩余预算不足，任务未提交；已确认的资产提示词和目标版本保留。")
+                # Credentials are checked after consent, before advancing the
+                # output version. Continue cannot turn a draft into a POST.
+                provider = _ark(root, consent["generation_config"])
+                provider.preflight("video" if asset["kind"] == "voice" else "image")
+                if asset["kind"] == "voice":
+                    validate_inputs = getattr(provider, "validate_video_inputs", None)
+                    if callable(validate_inputs):
+                        validate_inputs(consent["duration"], references, [], None)
+                    _prepare_video_transport(root, provider, "voice", asset["id"], consent["prompt"],
+                        consent["duration"], references, [], source_manifest_override=consent["reference_manifest"])
             version = asset["version"] + 1
             with core.transaction(root) as current:
                 a = core._find(current, "asset", asset["id"])
                 if a.get("file"):
-                    a["history"].append({k: a[k] for k in ("file", "sha256", "version")})
+                    a["history"].append({k: copy.deepcopy(a[k]) for k in
+                        ("file", "sha256", "version", "generation_model", "generation_request", "audio_file", "audio_sha256") if k in a})
                 a.update(version=version, status="generating")
+                if consent is not None:
+                    a["generation_request"] = copy.deepcopy(consent)
+                    a["generation_model"] = consent["model"]
                 a.pop("job_id", None)
                 a.pop("generation_error", None)
                 asset = copy.deepcopy(a)
@@ -780,7 +825,8 @@ def _assets(root):
         out.parent.mkdir(parents=True, exist_ok=True)
         if recovering and active_job.get("output") and core.safe_path(root, active_job["output"]) != out.resolve():
             raise core.GateError("恢复素材任务的输出路径与候选版本不符，不会覆盖旧素材")
-        prompt = compose_prompt(asset, s['plan'].get('style', ''))
+        request = asset.get("generation_request", {}) if s["mode"] == "live" else {}
+        prompt = request.get("prompt") or compose_prompt(asset, s['plan'].get('style', ''))
         if asset["kind"] == "voice":
             character = next((a for a in s["assets"] if a["id"] == asset.get("character_id") and a["kind"] == "character"), None)
             if character is None or not core.asset_ready(character):
@@ -789,8 +835,8 @@ def _assets(root):
             images = [] if character.get("voice_only") is True else [core.safe_path(root, character["file"])]
             voice_asset = {**asset, "prompt": compose_prompt(asset), "voice_only": character.get("voice_only") is True}
             voice_prompt = asset.get("audition_prompt", "已提交声音试片，仅恢复原任务") if recovering else (
-                "DEMO / SYNTHETIC PLACEHOLDER voice audition" if s["mode"] == "demo" else build_audition_prompt(voice_asset))
-            duration = 5 if recovering or s["mode"] == "demo" else audition_duration(asset)
+                "DEMO / SYNTHETIC PLACEHOLDER voice audition" if s["mode"] == "demo" else request["prompt"])
+            duration = 5 if recovering or s["mode"] == "demo" else request["duration"]
             if not recovering:
                 _save_asset(root, asset["id"], audition_profile=audition_profile(voice_asset), audition_prompt=voice_prompt)
             try:
@@ -809,18 +855,21 @@ def _assets(root):
                 raise core.GateError("试音没有声音轨，不能批准为声音参考")
             _save_asset(root, asset["id"], audio_file=ev["audio"], audio_sha256=ev["audio_sha256"], evidence=ev)
         elif not recovering:
-            provider = _ark(root) if s["mode"] == "live" else None
+            provider = _ark(root, request.get("generation_config", {})) if s["mode"] == "live" else None
             if provider:
                 provider.preflight("image")
             job_id = f"image-{asset['id']}-{uuid.uuid4().hex[:8]}"
-            amount = 0 if s["mode"] == "demo" else s["settings"]["caps"]["image"]
-            pricing = price_snapshot({**s["settings"]["ark"], "currency": s["budget"]["currency"]}, "image")
+            amount = 0 if s["mode"] == "demo" else asset_models.reserve_amount(s, asset, model=request["model"])
+            pricing = price_snapshot({**s["settings"]["ark"], **request.get("generation_config", {}),
+                "currency": s["budget"]["currency"], "input_images": len(references)}, "image")
             core.reserve(root, job_id, "image", asset["id"], amount, pricing=pricing if s["mode"] == "live" else None)
             with core.transaction(root) as current:
                 a = core._find(current, "asset", asset["id"])
                 a["job_id"] = job_id
                 a.setdefault("attempts", []).append({"job_id": job_id, "time": core.now()})
                 current["jobs"][job_id]["input_references"] = copy.deepcopy(a.get("creation_input", {}).get("references", []))
+                if request:
+                    current["jobs"][job_id]["asset_generation"] = copy.deepcopy(request)
             try:
                 if s["mode"] == "demo":
                     media.synthetic_asset(out, asset["id"] + " / DEMO", "#2563eb" if asset["kind"] == "character" else "#059669")
@@ -842,6 +891,9 @@ def _assets(root):
     s = core.load_project(root)
     if pending_assets(s):
         _set(root, status="awaiting_asset_input")
+        return False
+    if any(a.get("status") == "awaiting_asset_prompt_approval" for a in s["assets"]):
+        _set(root, status="awaiting_asset_prompt_approval")
         return False
     if any(not core.asset_ready(a) for a in s["assets"]):
         _set(root, status="awaiting_assets")

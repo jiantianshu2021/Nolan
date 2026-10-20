@@ -1329,6 +1329,17 @@ def public_state(state: dict) -> dict:
         item["creation_input"]["references"] = [_pick(ref, ("id", "file", "mime", "bytes")) for ref in data.get("references", [])]
         item["input_editable"] = not has_started(state, asset) and not (asset.get("kind") == "character" and asset.get("voice_only") is True)
         item["input_required"] = item["input_editable"] and not confirmed(asset)
+        if asset.get("status") in {"awaiting_asset_prompt_approval", "asset_prompt_approved"}:
+            candidate = asset.get("generation_prompt", {})
+            if isinstance(candidate, dict) and candidate.get("id") and _valid_sha(candidate.get("request_hash")):
+                item["generation_prompt"] = _pick(candidate, (
+                    "id", "sha256", "request_hash", "prompt", "duration", "target_version", "model", "status"))
+                manifest = candidate.get("reference_manifest", {})
+                item["generation_prompt"]["reference_manifest"] = {
+                    "images": list(manifest.get("images", [])), "audio": []}
+                from .asset_models import options
+                item["generation_models"] = options(state, asset, duration=candidate.get("duration"))
+                item["selected_generation_model"] = candidate.get("model", "")
         if asset.get("status") == "generation_failed":
             item.pop("file", None)
             item.pop("audio_file", None)
@@ -1852,7 +1863,7 @@ class _Handler(BaseHTTPRequestHandler):
             action = data.get("action")
             if path == "/api/post-edit" and action != "edit_postproduction":
                 return self._error(409, "此接口只接受字幕或配乐表格编辑。")
-            if path == "/api/prompt-edit" and action != "edit_prompt_and_generate":
+            if path == "/api/prompt-edit" and action not in {"edit_prompt_and_generate", "asset_prompt_approve"}:
                 return self._error(409, "此接口只接受完整提示词编辑。")
             with context.mutation_lock:
                 if path == "/api/prompt-edit" and action == "edit_prompt_and_generate":
@@ -1971,6 +1982,8 @@ class _Handler(BaseHTTPRequestHandler):
                         _core().add_asset_reference(context.project_dir, item_id, version, revision, data.get("data_url"))
                     elif action == "asset_input":
                         _core().set_asset_input(context.project_dir, item_id, version, revision, data.get("mode"), data.get("description", ""))
+                        if _core().load_project(context.project_dir).get("mode") == "live":
+                            context.launch()
                     else:
                         _core().remove_asset_reference(context.project_dir, item_id, version, revision, data.get("reference_id"))
                     return self._json(200, context.state())
@@ -1979,7 +1992,30 @@ class _Handler(BaseHTTPRequestHandler):
                     if type(version) is not int or version < 1:
                         raise ValueError
                     _core().set_remaining_asset_inputs_gpt(context.project_dir, version)
+                    if _core().load_project(context.project_dir).get("mode") == "live":
+                        context.launch()
                     return self._json(200, context.state())
+                if action == "asset_prompt_approve":
+                    item_id, candidate_id, request_hash = (data.get(key) for key in ("id", "candidate_id", "sha256"))
+                    model, prompt = data.get("model"), data.get("prompt")
+                    if (set(data) - {"action", "id", "candidate_id", "sha256", "model", "prompt"}
+                            or not isinstance(item_id, str) or not 0 < len(item_id) <= 128
+                            or not isinstance(candidate_id, str) or not 0 < len(candidate_id) <= 128
+                            or not _valid_sha(request_hash) or not isinstance(model, str)
+                            or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", model)
+                            or ("prompt" in data and (not isinstance(prompt, str) or not prompt.strip()
+                                                      or len(prompt) > 100000 or "\x00" in prompt))):
+                        raise ValueError
+                    if context.running or context.external_run_active():
+                        return self._error(409, "制作正在进行，请等待当前任务结束后再确认资产提示词。")
+                    try:
+                        _core().approve_asset_prompt(context.project_dir, item_id, candidate_id, request_hash,
+                                                     model=model, prompt=prompt)
+                    except (_core().GateError, ValueError) as exc:
+                        from .failures import sanitize_failure
+                        return self._error(409, sanitize_failure({"message": str(exc)})["message"])
+                    context.launch()
+                    return self._json(202, context.state())
                 if action == "segment_plan":
                     from .regroup import decide_segments
                     item_id, proposal_id, approve = data.get("id"), data.get("proposal_id"), data.get("approve")

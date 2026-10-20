@@ -167,6 +167,8 @@ def episode_progress(state, episode, *, now=None):
         return finish("awaiting_previous_episode", "等待前集成片通过人工审批", waiting=True)
     if state.get("status") == "awaiting_asset_input":
         return finish("awaiting_asset_input", "等待选择资产创作方式", waiting=True)
+    if any(asset.get("status") == "awaiting_asset_prompt_approval" for asset in public_assets):
+        return finish("awaiting_asset_prompt_approval", "等待你确认资产完整提示词和本次生成模型", waiting=True)
     if any(asset.get("status") == "generation_failed" for asset in public_assets):
         return finish("asset_generation_failed", "资产生成失败；请查看具体原因并明确提出重试意见", waiting=True)
     if any(not asset_ready(asset) for asset in public_assets):

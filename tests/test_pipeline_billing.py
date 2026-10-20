@@ -70,8 +70,13 @@ class PipelineBillingTests(unittest.TestCase):
 
         with patch.object(ArkProvider, "_request", return_value=(raw, "synthetic-image-request")) as request, \
              patch.object(ArkProvider, "download", side_effect=fail_download):
-            with self.assertRaises(ProviderError):
-                pipeline._assets(self.root)
+            # Enter through the real asset consent gate; the fixture explicitly
+            # confirms its saved synthetic prompt before the one paid POST mock.
+            self.assertFalse(pipeline._assets(self.root))
+            request.assert_not_called()
+            state = fixtures.run_confirming_asset_prompts(self.root)
+            self.assertEqual(state["status"], "blocked")
+            self.assertIn("Synthetic download failed", state["last_error"])
             after = core.load_project(self.root)
             job = self.live_jobs(after)[0]
             self.assertEqual(job["accounting"], "unknown")

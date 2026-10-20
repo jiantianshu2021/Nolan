@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from norlan import core, pipeline, prompt_gate
-from test_pipeline import choose_gpt_assets, fake_media, write
+from test_pipeline import choose_gpt_assets, fake_media, run_confirming_asset_prompts, write
 
 
 class PromptGateTests(unittest.TestCase):
@@ -193,7 +193,10 @@ class PromptGateTests(unittest.TestCase):
         self.assertEqual(source["status"], "internal")
         self.assertNotIn("approved_at", source)
         choose_gpt_assets(self.root)
-        self.assertEqual(pipeline.run(self.root)["status"], "awaiting_assets")
+        self.assertEqual(pipeline.run(self.root)["status"], "awaiting_asset_prompt_approval")
+        self.api.submit_video.assert_not_called()
+        self.assertEqual(core._find(core.load_project(self.root), "asset", "system-voice")["version"], 0)
+        self.assertEqual(run_confirming_asset_prompts(self.root)["status"], "awaiting_assets")
         self.api.submit_video.assert_called_once()  # voice audition only
         self.assertEqual(self.api.submit_video.call_args.args[2], [])
         self.assertIn("不出现任何人物", self.api.submit_video.call_args.args[0])

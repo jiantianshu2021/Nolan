@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from norlan import core, pipeline, prompt_gate, storyboard_revision
 import test_prompt_gate as fixtures
+from test_pipeline import run_confirming_asset_prompts
 
 
 def redesign(duration=10):
@@ -132,7 +133,10 @@ class StoryboardRevisionPipelineTests(unittest.TestCase):
         core.apply_asset_amendment(self.root, amendment["id"], "approve")
         self.assertEqual(pipeline.run(self.root)["status"], "awaiting_asset_input")
         fixtures.choose_gpt_assets(self.root)
-        self.assertEqual(pipeline.run(self.root)["status"], "awaiting_assets")
+        self.assertEqual(pipeline.run(self.root)["status"], "awaiting_asset_prompt_approval")
+        self.fixture.api.submit_video.assert_not_called()
+        self.assertNotIn("subshots", self.shot())
+        self.assertEqual(run_confirming_asset_prompts(self.root)["status"], "awaiting_assets")
         self.assertNotIn("subshots", self.shot())
         voice = core._find(core.load_project(self.root), "asset", "system-voice")
         core.approve(self.root, "asset", voice["id"], voice["version"])

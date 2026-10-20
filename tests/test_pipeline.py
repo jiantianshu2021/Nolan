@@ -26,6 +26,21 @@ def choose_gpt_assets(root):
                              input_state(asset)["revision"], "gpt", "")
 
 
+def run_confirming_asset_prompts(root):
+    """Synthetic human consent only for fixtures exercising later stages."""
+    from norlan import asset_prompt_gate
+    for _ in range(40):
+        state = pipeline.run(root)
+        pending = [asset for asset in state["assets"]
+                   if asset.get("status") == "awaiting_asset_prompt_approval"]
+        if state.get("status") != "awaiting_asset_prompt_approval" or not pending:
+            return state
+        for asset in pending:
+            candidate = asset["generation_prompt"]
+            asset_prompt_gate.approve(root, asset["id"], candidate["id"], candidate["request_hash"])
+    raise AssertionError("Synthetic fixture exceeded asset prompt consent loop")
+
+
 def run_confirming_prompts(root):
     """Explicit synthetic human consent for fixtures testing downstream behavior.
 
@@ -34,7 +49,7 @@ def run_confirming_prompts(root):
     Prompt-gate tests call ``pipeline.run`` directly to inspect the consent stop.
     """
     for _ in range(20):
-        state = pipeline.run(root)
+        state = run_confirming_asset_prompts(root)
         if state.get("mode") != "live" or state.get("status") != "awaiting_prompt_approval":
             return state
         pending = [shot for episode in state["episodes"] for shot in episode["shots"]

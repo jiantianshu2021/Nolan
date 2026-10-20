@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from norlan import core, pipeline
+from test_pipeline import run_confirming_asset_prompts
 
 
 LINE = "还要一百万违约金。厂章给我，我再去谈。"
@@ -76,6 +77,18 @@ class VoicePipelineTests(unittest.TestCase):
         self.assertFalse(pipeline._assets(self.root))
         self.selector.assert_called_once()
         self.assertEqual(self.selector.call_args.args[1:3], ("select_voice_audition", NOVEL))
+        self.assertEqual(self.voice()["status"], "awaiting_asset_prompt_approval")
+        self.video.assert_not_called()
+        self.provider.assert_not_called()
+        # The fixture acts as the person confirming this exact saved prompt.
+        # Only the local preflight adapter is permitted; generation remains
+        # synthetic through fake_video, and no real provider can be reached.
+        api = Mock(spec=["preflight"])
+        self.provider.side_effect = None
+        self.provider.return_value = api
+        state = run_confirming_asset_prompts(self.root)
+        self.assertEqual(state["status"], "awaiting_assets", state.get("last_error"))
+        api.preflight.assert_called_once_with("video")
         args = self.video.call_args.args
         self.assertEqual(args[1:3], ("voice", "voice"))
         self.assertEqual(args[4], 6)
@@ -96,7 +109,7 @@ class VoicePipelineTests(unittest.TestCase):
         pipeline._assets(self.root)
         self.selector.assert_called_once()
         self.video.assert_called_once()
-        self.provider.assert_not_called()
+        self.provider.assert_called_once()
 
     def test_empty_selection_gates_without_generation_reservation_or_version_change(self):
         self.selector.return_value = {"audition_text": "", "audition_source": "",
@@ -146,6 +159,15 @@ class VoicePipelineTests(unittest.TestCase):
             core._find(state, "asset", "voice").update(SELECTION)
         self.assertFalse(pipeline._assets(self.root))
         self.selector.assert_not_called()
+        self.assertEqual(self.voice()["status"], "awaiting_asset_prompt_approval")
+        self.video.assert_not_called()
+        self.provider.assert_not_called()
+        api = Mock(spec=["preflight"])
+        self.provider.side_effect = None
+        self.provider.return_value = api
+        state = run_confirming_asset_prompts(self.root)
+        self.assertEqual(state["status"], "awaiting_assets", state.get("last_error"))
+        api.preflight.assert_called_once_with("video")
         self.video.assert_called_once()
         self.assertEqual(self.video.call_args.args[4], 6)
 

@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from norlan import asset_inputs, core, pipeline
 from norlan.providers import ProviderError
-from test_pipeline import choose_gpt_assets, fake_media, write
+from test_pipeline import choose_gpt_assets, fake_media, run_confirming_asset_prompts, write
 
 
 class AssetGenerationFailureTests(unittest.TestCase):
@@ -65,7 +65,9 @@ class AssetGenerationFailureTests(unittest.TestCase):
         identifier = self.add_asset(kind)
         call = self.provider.submit_video if kind == "voice" else self.provider.generate_image
         call.side_effect = self.definite_failure()
-        state = pipeline.run(self.root)
+        # Explicit synthetic human consent for the new asset prompt gate;
+        # subsequent plain Continue calls below must never authorize retries.
+        state = run_confirming_asset_prompts(self.root)
         asset = core._find(state, "asset", identifier)
         self.assertEqual(state["status"], "asset_generation_failed")
         self.assertEqual(asset["status"], "generation_failed")
@@ -100,7 +102,7 @@ class AssetGenerationFailureTests(unittest.TestCase):
         self.assertEqual(requested["failure_history"][-1]["job_id"], failed["job_id"])
         self.assertEqual(state["jobs"][failed["job_id"]], old_job)
         call.side_effect = None
-        state = pipeline.run(self.root)
+        state = run_confirming_asset_prompts(self.root)
         self.assertEqual(state["status"], "awaiting_assets")
         current = core._find(state, "asset", identifier)
         self.assertEqual((current["status"], current["version"]), ("candidate", 2))
@@ -118,7 +120,7 @@ class AssetGenerationFailureTests(unittest.TestCase):
         failed = core._find(state, "asset", identifier)
         core.reject(self.root, "asset", identifier, failed["version"], "保留道具定义，只重试一次")
         call.side_effect = lambda prompt, target, **kwargs: (write(target, b"SYNTHETIC RETRIED IMAGE") and {})
-        state = pipeline.run(self.root)
+        state = run_confirming_asset_prompts(self.root)
         self.assertEqual((core._find(state, "asset", identifier)["status"], call.call_count), ("candidate", 2))
         pipeline.run(self.root)
         self.assertEqual(call.call_count, 2)
@@ -134,7 +136,7 @@ class AssetGenerationFailureTests(unittest.TestCase):
         self.assertNotIn("job_id", core._find(state, "asset", identifier))
         core.set_paused(self.root, False)
         call.side_effect = None
-        self.assertEqual(pipeline.run(self.root)["status"], "awaiting_assets")
+        self.assertEqual(run_confirming_asset_prompts(self.root)["status"], "awaiting_assets")
         self.assertEqual(call.call_count, 2)
 
     def test_unknown_or_inflight_failure_can_neither_be_rejected_nor_retried(self):

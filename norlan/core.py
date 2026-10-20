@@ -524,7 +524,7 @@ def _editable_asset_input(state, asset_id, asset_version, input_revision):
     if (isinstance(input_revision, bool) or not isinstance(input_revision, int)
             or input_revision != data["revision"]):
         raise GateError("资产输入已更新，请刷新网页后重新确认。")
-    if has_started(state, asset) or asset.get("status") != "planned":
+    if has_started(state, asset) or asset.get("status") not in {"planned", "awaiting_asset_prompt_approval", "asset_prompt_approved"}:
         raise GateError("该资产已开始生成，初始描述和参考图不能再修改；请通过资产返工提出修改意见。")
     if any(execution_unsettled(job) for job in state["jobs"].values()):
         raise GateError("尚有在途或结果不明的调用，请等待落盘或完成对账后再修改资产输入。")
@@ -544,7 +544,7 @@ def set_remaining_asset_inputs_gpt(root, plan_version):
         for asset in state["assets"]:
             if is_internal_voice_source(asset):
                 continue
-            if has_started(state, asset) or asset.get("status") != "planned":
+            if has_started(state, asset) or asset.get("status") not in {"planned", "awaiting_asset_prompt_approval", "asset_prompt_approved"}:
                 continue
             data = input_state(asset)
             if (data.get("mode") not in {None, ""} or data.get("description")
@@ -583,6 +583,7 @@ def set_asset_input(root, asset_id, asset_version, input_revision, mode, descrip
         candidate = {**asset, "creation_input": data}
         reference_paths(root, candidate)
         asset["creation_input"] = data
+        asset["status"] = "planned"
         event(state, "human_asset_input_confirmed", id=asset_id, asset_version=asset_version,
               input_revision=data["revision"], mode=mode,
               reference_hashes=[ref["sha256"] for ref in references])
@@ -621,6 +622,7 @@ def add_asset_reference(root, asset_id, asset_version, input_revision, data_url)
                                            "mime": mime, "bytes": len(content)})
                 data.update(confirmed=False, revision=data["revision"] + 1)
                 asset["creation_input"] = data
+                asset["status"] = "planned"
                 event(state, "asset_reference_added", id=asset_id, reference_id=reference_id,
                       sha256=sha256, input_revision=data["revision"])
         except BaseException:
@@ -641,6 +643,7 @@ def remove_asset_reference(root, asset_id, asset_version, input_revision, refere
         data["references"] = [ref for ref in data["references"] if ref["id"] != reference_id]
         data.update(confirmed=False, revision=data["revision"] + 1)
         asset["creation_input"] = data
+        asset["status"] = "planned"
         event(state, "asset_reference_removed", id=asset_id, reference_id=reference_id,
               input_revision=data["revision"])
     return load_project(root)
@@ -1473,6 +1476,12 @@ def activate_asset_amendment(root, amendment_id):
         state["last_error"] = None
         event(state, "asset_amendment_activated", id=amendment_id, shot_id=target["id"], revision=target.get("revision", 0))
     return True
+
+
+def approve_asset_prompt(root, asset_id, candidate_id, sha256, model=None, prompt=None):
+    """A web human decision; approval authorizes only this asset's next request."""
+    from .asset_prompt_gate import approve
+    return approve(root, asset_id, candidate_id, sha256, model=model, prompt=prompt)
 
 
 def approve_prompt(root, shot_id, candidate_id, sha256, video_model=None):

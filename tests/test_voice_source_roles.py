@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from norlan import core, pipeline
-from test_pipeline import choose_gpt_assets, fake_media, run_with_shot_approvals, write
+from test_pipeline import choose_gpt_assets, fake_media, run_confirming_asset_prompts, run_with_shot_approvals, write
 
 
 class VoiceSourceRoleTests(unittest.TestCase):
@@ -87,6 +87,9 @@ class VoiceSourceRoleTests(unittest.TestCase):
         with patch.object(pipeline, "_ark", return_value=api), patch.object(pipeline, "_brain", return_value={
                 "prompt": "合成画面，由系统女声播报。", "dialogue": self.line, "continuity_notes": "合成说明"}):
             state = pipeline.run(self.root)
+            self.assertEqual(state["status"], "awaiting_asset_prompt_approval")
+            api.submit_video.assert_not_called()
+            state = run_confirming_asset_prompts(self.root)
             self.assertEqual(state["status"], "awaiting_assets")
             self.assertEqual(core._find(state, "asset", "system-voice")["status"], "candidate")
             self.assertEqual(core._find(state, "asset", "system-source")["status"], "internal")
