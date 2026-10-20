@@ -48,8 +48,9 @@ class MCPTests(unittest.TestCase):
             self.assertEqual(self.initialize(protocol)["result"]["protocolVersion"], protocol)
         self.assertEqual(self.initialize("future")["result"]["protocolVersion"], "2025-06-18")
         tools = self.server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})["result"]["tools"]
-        self.assertEqual(len(tools), 16)
+        self.assertEqual(len(tools), 18)
         self.assertIn("import_season", {tool["name"] for tool in tools})
+        self.assertTrue({"list_directory", "find_files"} <= {tool["name"] for tool in tools})
         self.assertTrue(all(t["inputSchema"]["additionalProperties"] is False for t in tools))
         self.assertEqual(self.server.handle({"jsonrpc": "2.0", "id": 4, "method": "ping"})["result"], {})
         self.assertIsNone(self.server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
@@ -87,8 +88,25 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         responses = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([response["id"] for response in responses], [1, 2])
-        self.assertEqual(len(responses[1]["result"]["tools"]), 16)
+        self.assertEqual(len(responses[1]["result"]["tools"]), 18)
         self.assertEqual(result.stderr, "")
+
+    def test_module_stdio_entrypoint_passes_explicit_workdir(self):
+        creative = self.workspace.parent / "终端创作目录"
+        creative.mkdir()
+        messages = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "synthetic", "version": "1"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_projects", "arguments": {}}},
+        ]
+        result = subprocess.run([sys.executable, "-m", "norlan.mcp_server", "--workspace", str(self.workspace), "--workdir", str(creative)],
+                                input="".join(json.dumps(message) + "\n" for message in messages),
+                                text=True, capture_output=True, timeout=10,
+                                cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        response = json.loads(result.stdout.splitlines()[1])["result"]
+        self.assertEqual(self.value(response)["creation_directory"], str(creative))
 
     def test_unknown_and_privileged_tools_are_not_exposed(self):
         self.create()
@@ -319,6 +337,106 @@ class MCPTests(unittest.TestCase):
         self.assertTrue(self.call("read_novel", source_path=str(source))["isError"])
         self.assertTrue(self.call("read_novel", source_path=str(source.with_suffix(".json")))["isError"])
         self.assertTrue(self.call("read_novel", source_path="novel.md")["isError"])
+
+    def test_local_directory_discovery_and_directory_novel_guidance(self):
+        folder = self.workspace.parent / "御剑飞行"
+        folder.mkdir()
+        nested = folder / "剧本改编"
+        nested.mkdir()
+        source = nested / "第01集.md"
+        source.write_text("合成剧本原文", encoding="utf-8")
+        listed = self.value(self.call("list_directory", path=str(folder)))
+        self.assertEqual(listed["entries"][0]["path"], str(nested))
+        found = self.value(self.call("find_files", path=str(folder), pattern="*.md"))
+        self.assertEqual(found["entries"][0]["path"], str(source))
+        self.assertEqual(self.value(self.call("read_novel", source_path=found["entries"][0]["path"]))["novel_text"], "合成剧本原文")
+        error = self.call("read_novel", source_path=str(folder))
+        self.assertTrue(error["isError"])
+        self.assertIn("list_directory", error["content"][0]["text"])
+        self.assertIn("find_files", error["content"][0]["text"])
+        for name in ("list_directory", "find_files"):
+            self.assertTrue(mcp_server.TOOL_MAP[name]["annotations"]["readOnlyHint"])
+        self.assertEqual(self.server.workers, {})
+        self.assertEqual(list(self.server.projects.iterdir()), [])
+
+    def test_novel_does_not_read_credential_text_or_symlinks(self):
+        source = self.workspace.parent / "credentials.txt"
+        source.write_text("synthetic-private-never-read", encoding="utf-8")
+        ordinary = self.workspace.parent / "script.md"
+        ordinary.symlink_to(source)
+        for path in (source, ordinary):
+            response = self.call("read_novel", source_path=str(path))
+            self.assertTrue(response["isError"])
+            self.assertNotIn("synthetic-private-never-read", str(response))
+
+    def test_explicit_creative_directory_can_create_direct_child_and_resume(self):
+        creative = self.workspace.parent / "桌面创作"
+        creative.mkdir()
+        script = creative / "剧本.txt"
+        script.write_text("合成独立新项目剧本", encoding="utf-8")
+        selected = mcp_server.MCPServer(self.workspace, workdir=creative)
+        self.addCleanup(selected.close)
+        listed = selected.call_tool("list_projects", {})
+        self.assertEqual(listed["projects_directory"], str(self.server.projects))
+        self.assertEqual(listed["creation_directory"], str(creative))
+        root = creative / "Nolan-制作"
+        state = selected.call_tool("create_project", {"project": str(root), "source_path": str(script)})
+        self.assertEqual(state["project"], str(root))
+        self.assertFalse(state["budget"]["approved"])
+        self.assertEqual(state["plan"]["status"], "pending")
+        self.assertEqual(script.read_text(), "合成独立新项目剧本")
+        self.assertFalse((creative / "project.json").exists())
+        self.assertFalse((self.server.projects / root.name).exists())
+        projects = selected.call_tool("list_projects", {})["projects"]
+        self.assertEqual([item["project"] for item in projects], [str(root)])
+        resumed = mcp_server.MCPServer(self.workspace, workdir=creative)
+        self.addCleanup(resumed.close)
+        self.assertEqual(resumed.call_tool("project_status", {"project": str(root)})["id"], state["id"])
+
+    def test_explicit_empty_creative_directory_can_be_the_project(self):
+        creative = self.workspace.parent / "空创作目录"
+        creative.mkdir()
+        selected = mcp_server.MCPServer(self.workspace, workdir=creative)
+        self.addCleanup(selected.close)
+        selected.call_tool("create_project", {"project": str(creative), "novel_text": "合成原文"})
+        self.assertEqual((creative / "source/novel.txt").read_text(), "合成原文")
+        self.assertEqual([item["project"] for item in selected.call_tool("list_projects", {})["projects"]], [str(creative)])
+
+    def test_creative_directory_rejects_overwrite_deeper_paths_and_symlink_escape(self):
+        creative = self.workspace.parent / "创作目录"
+        creative.mkdir()
+        keep = creative / "剧本.md"
+        keep.write_text("合成不可覆盖", encoding="utf-8")
+        selected = mcp_server.MCPServer(self.workspace, workdir=creative)
+        self.addCleanup(selected.close)
+        outside = self.workspace.parent / "outside"
+        outside.mkdir()
+        (creative / "linked").symlink_to(outside, target_is_directory=True)
+        (creative / "managed-link").symlink_to(self.server.projects, target_is_directory=True)
+        for root in (creative, outside / "new", creative / "deep/new", creative / "linked/new", creative / "linked", creative / "managed-link/new"):
+            with self.subTest(root=root), self.assertRaises(mcp_server.ToolError):
+                selected.call_tool("create_project", {"project": str(root), "novel_text": "合成"})
+        self.assertEqual(keep.read_text(), "合成不可覆盖")
+        self.assertEqual(list(outside.iterdir()), [])
+        with self.assertRaises(mcp_server.ToolError):
+            mcp_server.MCPServer(self.workspace, workdir=creative / "linked")
+
+    def test_creative_listing_does_not_recursively_scan_or_move_old_projects(self):
+        self.create()
+        before = (self.root / "project.json").read_bytes()
+        creative = self.workspace.parent / "创作目录"
+        creative.mkdir()
+        nested = creative / "资料/深层项目"
+        core.create_project(nested, "合成深层项目")
+        unrelated = self.workspace.parent / "其他项目"
+        core.create_project(unrelated, "合成其他项目")
+        (creative / "linked-project").symlink_to(unrelated, target_is_directory=True)
+        selected = mcp_server.MCPServer(self.workspace, project=unrelated, workdir=creative)
+        self.addCleanup(selected.close)
+        listed = selected.call_tool("list_projects", {})
+        self.assertEqual({item["project"] for item in listed["projects"]}, {str(self.root), str(unrelated)})
+        self.assertEqual((self.root / "project.json").read_bytes(), before)
+        self.assertTrue(self.root.exists())
 
     def test_source_path_creation_preserves_original(self):
         source = self.workspace.parent / "original.txt"

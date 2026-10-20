@@ -2,6 +2,16 @@
 
 Use Chinese for user-facing copy. Keep provider/model choices explicit.
 
+- Interactive Nolan uses native Codex file/terminal/image tools with
+  workspace-write and on-request approvals. A user-selected working directory
+  may contain source files; create production projects in independent empty
+  child folders and retain existing projects/media. Keep subscription/API homes
+  separate, share login only through the existing auth link, and never inherit
+  provider credentials into shell tools or import global hooks/MCP config.
+  Ordinary files can be edited with native tools; production approvals, budget,
+  provider submissions and ledger changes use Nolan's MCP flow. Never claim the
+  desktop app's browser/plugins are automatically available in the CLI.
+
 - Never auto-approve a person, scene, voice, plan, video segment or episode.
 - GPT video reviews are advisory only. Every new video version waits for the
   user's decision. Only explicit human rework requests authorize another video

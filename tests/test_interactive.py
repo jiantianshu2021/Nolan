@@ -13,7 +13,7 @@ from norlan.segments import SEGMENT_PLAN_RULES
 class InteractiveTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.original = self.root / "original-codex"
         self.original.mkdir()
         (self.original / "config.toml").write_text(
@@ -75,14 +75,19 @@ class InteractiveTests(unittest.TestCase):
         self.assertNotIn("--last", argv)
         self.assertNotIn("DEMO", config["developer_instructions"])
         self.assertIn(SEGMENT_PLAN_RULES, config["developer_instructions"])
-        for name in ("shell_tool", "unified_exec", "apps", "plugins", "hooks", "browser_use", "computer_use"):
+        for name in ("apps", "plugins", "hooks", "browser_use", "computer_use"):
             self.assertFalse(config["features"][name])
+        for name in ("shell_tool", "unified_exec", "view_image"):
+            self.assertTrue(config["features"][name])
         self.assertTrue(config["features"]["code_mode"])
         self.assertTrue(config["features"]["code_mode_host"])
-        self.assertEqual(config["sandbox_mode"], "read-only")
-        self.assertEqual(config["approval_policy"], "never")
-        self.assertEqual(config["project_doc_max_bytes"], 0)
-        self.assertTrue(config["features"]["skip_host_skill_discovery"])
+        self.assertEqual(config["sandbox_mode"], "workspace-write")
+        self.assertEqual(config["approval_policy"], "on-request")
+        self.assertEqual(config["approvals_reviewer"], "user")
+        self.assertEqual(config["project_doc_max_bytes"], 32768)
+        self.assertFalse(config["features"]["skip_host_skill_discovery"])
+        self.assertTrue(config["skills"]["include_instructions"])
+        self.assertTrue(config["skills"]["bundled"]["enabled"])
         self.assertNotIn("approve", config["mcp_servers"]["norlan"]["enabled_tools"])
         self.assertNotIn("budget", config["mcp_servers"]["norlan"]["enabled_tools"])
         self.assertIn("propose_segments", config["mcp_servers"]["norlan"]["enabled_tools"])
@@ -121,6 +126,7 @@ class InteractiveTests(unittest.TestCase):
         argv, env = prepare_launch(resume=True, connection={"provider": "chatgpt"})
         self.assertEqual(argv[1], "resume")
         self.assertIn("--last", argv)
+        self.assertIn("--all", argv)
         self.assertNotIn("--ephemeral", argv)
         self.assertEqual(self.config(env)["history"]["persistence"], "save-all")
         argv, env = prepare_launch(prompt="讨论这个故事，不开始制作", connection={"provider": "chatgpt"})
@@ -128,14 +134,16 @@ class InteractiveTests(unittest.TestCase):
         with self.assertRaises(BrainError):
             prepare_launch(resume=True, prompt="a new message", connection={"provider": "chatgpt"})
 
-    def test_selected_project_is_only_data_and_does_not_become_cwd(self):
+    def test_explicit_selected_project_is_native_workdir_and_stays_mcp_selected(self):
         project = self.root / "小说项目"
         project.mkdir()
         (project / "project.json").write_text("{}")
         argv, env = prepare_launch(project, connection={"provider": "chatgpt"})
-        self.assertNotEqual(Path(argv[argv.index("--cd") + 1]), project)
+        self.assertEqual(Path(argv[argv.index("--cd") + 1]), project)
         self.assertIn(str(project), self.config(env)["developer_instructions"])
-        self.assertEqual(self.config(env)["mcp_servers"]["norlan"]["args"][-2:], ["--project", str(project.resolve())])
+        arguments = self.config(env)["mcp_servers"]["norlan"]["args"]
+        self.assertEqual(arguments[arguments.index("--project") + 1], str(project.resolve()))
+        self.assertEqual(arguments[arguments.index("--workdir") + 1], str(project.resolve()))
         with self.assertRaises(BrainError):
             prepare_launch(self.root / "missing", connection={"provider": "chatgpt"})
 
@@ -202,10 +210,91 @@ class InteractiveTests(unittest.TestCase):
         config = self.config(env)
         self.assertTrue(config["features"]["code_mode_host"])
         self.assertTrue(config["features"]["code_mode"])
-        self.assertFalse(config["features"]["shell_tool"])
-        self.assertFalse(config["features"]["unified_exec"])
-        self.assertEqual(config["sandbox_mode"], "read-only")
+        self.assertTrue(config["features"]["shell_tool"])
+        self.assertTrue(config["features"]["unified_exec"])
+        self.assertEqual(config["sandbox_mode"], "workspace-write")
         self.assertEqual(set(config["mcp_servers"]), {"norlan"})
+
+    def test_explicit_workdir_is_writable_without_adopting_or_modifying_source_folder(self):
+        directory = self.root / "御剑飞行"
+        directory.mkdir()
+        script = directory / "剧本.md"
+        script.write_text("合成测试剧本，不调用模型。")
+        argv, env = prepare_launch(workdir=directory, connection={"provider": "chatgpt"})
+        self.assertEqual(Path(argv[argv.index("--cd") + 1]), directory)
+        arguments = self.config(env)["mcp_servers"]["norlan"]["args"]
+        self.assertEqual(arguments[arguments.index("--workdir") + 1], str(directory))
+        self.assertFalse((directory / ".norlan-managed").exists())
+        self.assertEqual(list(directory.iterdir()), [script])
+        self.assertIn("--add-dir", argv)
+        self.assertIn("不能通过 shell", self.config(env)["developer_instructions"])
+        self.assertIn("list_directory", self.config(env)["mcp_servers"]["norlan"]["enabled_tools"])
+
+    def test_resume_retains_user_workdir_without_granting_entire_home(self):
+        directory = self.root / "chosen"
+        directory.mkdir()
+        prepare_launch(workdir=directory, connection={"provider": "chatgpt"})
+        argv, env = prepare_launch(resume=True, connection={"provider": "chatgpt"})
+        self.assertEqual(Path(argv[argv.index("--cd") + 1]), directory)
+        self.assertNotEqual(Path(argv[argv.index("--cd") + 1]), Path.home())
+        self.assertNotIn("danger-full-access", argv)
+        self.assertEqual(self.config(env)["sandbox_mode"], "workspace-write")
+
+    def test_shell_has_tools_path_but_not_service_keys(self):
+        with patch.dict(os.environ, {"ARK_API_KEY": "synthetic-ark-secret", "OPENAI_API_KEY": "synthetic-openai-secret",
+                                    "VOLC_SECRET_ACCESS_KEY": "synthetic-volc-secret"}):
+            _, env = prepare_launch(connection={"provider": "chatgpt"})
+        config = self.config(env)
+        shell = config["shell_environment_policy"]
+        self.assertEqual(shell["inherit"], "none")
+        self.assertEqual(shell["set"]["PATH"], env["PATH"])
+        self.assertEqual(shell["set"]["HOME"], env["HOME"])
+        for key in ("ARK_API_KEY", "OPENAI_API_KEY", "VOLC_SECRET_ACCESS_KEY", "SECRET_UNRELATED"):
+            self.assertNotIn(key, shell["set"])
+        self.assertNotIn("synthetic-ark-secret", (Path(env["CODEX_HOME"]) / "config.toml").read_text())
+
+    def test_new_managed_session_replaces_previous_workdir_before_resume(self):
+        directory = self.root / "old-folder"
+        directory.mkdir()
+        prepare_launch(workdir=directory, connection={"provider": "chatgpt"})
+        new, _ = prepare_launch(connection={"provider": "chatgpt"})
+        resumed, _ = prepare_launch(resume=True, connection={"provider": "chatgpt"})
+        self.assertEqual(new[new.index("--cd") + 1], resumed[resumed.index("--cd") + 1])
+        self.assertNotEqual(Path(resumed[resumed.index("--cd") + 1]), directory)
+
+    def test_first_launch_additional_write_root_already_exists(self):
+        argv, _ = prepare_launch(connection={"provider": "chatgpt"})
+        for index, flag in enumerate(argv):
+            if flag == "--add-dir":
+                self.assertTrue(Path(argv[index + 1]).is_dir())
+
+    def test_existing_video_skill_is_discovered_without_importing_other_source_skills(self):
+        skill = self.original / "skills" / "deepwhite-short-drama-video-prompts"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("synthetic existing skill fixture")
+        unrelated = self.original / "skills" / "unrelated"
+        unrelated.mkdir()
+        (unrelated / "SKILL.md").write_text("must not import")
+        _, env = prepare_launch(connection={"provider": "chatgpt"})
+        target = Path(env["CODEX_HOME"]) / "skills" / skill.name
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(target.resolve(), skill)
+        self.assertFalse((target.parent / unrelated.name).exists())
+        prepare_launch(connection={"provider": "chatgpt"})
+        self.assertEqual(target.resolve(), skill)
+
+    def test_bad_workdir_and_linked_resume_record_do_not_broaden_access(self):
+        for value in (self.root / "missing", "", 5):
+            with self.assertRaises(BrainError):
+                prepare_launch(workdir=value, connection={"provider": "chatgpt"})
+        linked = self.root / "linked"
+        linked.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaises(BrainError):
+            prepare_launch(workdir=linked, connection={"provider": "chatgpt"})
+        home = native_home("chatgpt")
+        (home / "working-directory.json").symlink_to(self.original / "auth.json")
+        with self.assertRaises(BrainError):
+            prepare_launch(resume=True, connection={"provider": "chatgpt"})
 
 
 if __name__ == "__main__":
