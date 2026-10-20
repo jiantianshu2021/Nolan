@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .regroup import PUBLIC_ERRORS as SEGMENT_ERRORS
 
@@ -1679,27 +1679,38 @@ class _Context:
             raise RuntimeError("费用同步未能启动，请稍后重试。") from None
         return True
 
-    def launch(self) -> bool:
+    def ensure_launchable(self, state, excluding_asset_id=None) -> None:
+        """Check workflow blockers without saving consent or starting work."""
         from .core import is_internal_voice_source
+        # Multiple known failures must remain repairable one card at a time.
+        # A repaired failure may save consent while launch waits for the others;
+        # the submit response explicitly distinguishes saved from started.
+        repairing_failure = excluding_asset_id is not None and any(
+            asset.get("id") == excluding_asset_id and asset.get("status") == "generation_failed"
+            for asset in state.get("assets", []))
+        if not repairing_failure and any(asset.get("id") != excluding_asset_id and asset.get("status") == "generation_failed"
+               and not is_internal_voice_source(asset) for asset in state.get("assets", [])):
+            raise ValueError("请先查看其他资产的失败原因，并在对应卡片修改提示词后重试。"
+                             if excluding_asset_id else "请先查看资产失败原因，并明确提出重试意见。")
+        if any(isinstance(episode.get("segment_proposal"), dict)
+               and episode["segment_proposal"].get("status") == "candidate"
+               for episode in state.get("episodes", [])):
+            raise ValueError("请先批准新的分段方案，或选择保留原分段，再继续制作。")
+        if any(isinstance(value, dict) and value.get("status") == "candidate"
+               for value in state.get("asset_amendments", [])):
+            raise ValueError("请先确认或取消新增资产方案。")
+        if any(shot.get("status") == "awaiting_prompt_approval"
+               for episode in state.get("episodes", []) for shot in episode.get("shots", [])):
+            raise ValueError("请在片段下确认提示词后再生成。")
+        if _current_planning_block(state):
+            raise ValueError("请在当前片段填写调整意见，重新准备提示词；尚未提交视频生成。")
+
+    def launch(self) -> bool:
         with self.lock:
             if self.running:
                 return False
             state = _core().load_project(self.project_dir)
-            if any(asset.get("status") == "generation_failed" and not is_internal_voice_source(asset)
-                   for asset in state.get("assets", [])):
-                raise ValueError("请先查看资产失败原因，并明确提出重试意见。")
-            if any(isinstance(episode.get("segment_proposal"), dict)
-                   and episode["segment_proposal"].get("status") == "candidate"
-                   for episode in state.get("episodes", [])):
-                raise ValueError("请先批准新的分段方案，或选择保留原分段，再继续制作。")
-            if any(isinstance(value, dict) and value.get("status") == "candidate"
-                   for value in state.get("asset_amendments", [])):
-                raise ValueError("请先确认或取消新增资产方案。")
-            if any(shot.get("status") == "awaiting_prompt_approval"
-                   for episode in state.get("episodes", []) for shot in episode.get("shots", [])):
-                raise ValueError("请在片段下确认提示词后再生成。")
-            if _current_planning_block(state):
-                raise ValueError("请在当前片段填写调整意见，重新准备提示词；尚未提交视频生成。")
+            self.ensure_launchable(state)
             self.running = True
             self.worker_error = None
         try:
@@ -1719,7 +1730,12 @@ class _Context:
             finally:
                 with self.lock:
                     self.running = False
-        threading.Thread(target=worker, name="norlan-pipeline", daemon=True).start()
+        try:
+            threading.Thread(target=worker, name="norlan-pipeline", daemon=True).start()
+        except Exception:
+            with self.lock:
+                self.running = False
+            raise RuntimeError("制作线程未能启动，请稍后继续制作。") from None
         return True
 
 
@@ -1784,6 +1800,26 @@ class _Handler(BaseHTTPRequestHandler):
                     self.wfile.write(payload)
             elif path == "/api/state":
                 self._json(200, context.state())
+            elif path == "/api/asset-prompt-editor":
+                if not secrets.compare_digest(self.headers.get("X-Norlan-Token", "").encode("utf-8"),
+                                              context.token.encode("ascii")):
+                    return self._error(403, "会话已失效，请刷新页面。")
+                origin = self.headers.get("Origin")
+                if origin is not None and origin != "http://" + self.headers.get("Host", ""):
+                    return self._error(403, "不允许跨站操作。")
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                if (set(query) != {"id", "version"} or any(len(values) != 1 for values in query.values())
+                        or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", query["id"][0])
+                        or not re.fullmatch(r"[0-9]{1,9}", query["version"][0])):
+                    return self._error(400, "资产编辑参数无效，请刷新后重新打开。")
+                from . import asset_prompt_edit
+                try:
+                    editor = asset_prompt_edit.editor_snapshot(
+                        context.project_dir, query["id"][0], int(query["version"][0]))
+                except (_core().GateError, ValueError) as exc:
+                    from .failures import sanitize_failure
+                    return self._error(409, sanitize_failure({"message": str(exc)})["message"])
+                self._json(200, editor)
             elif path.startswith("/media/"):
                 state = _core().load_project(context.project_dir)
                 media = resolve_media(context.project_dir, unquote(path[len("/media/"):]), state)
@@ -1868,9 +1904,42 @@ class _Handler(BaseHTTPRequestHandler):
             action = data.get("action")
             if path == "/api/post-edit" and action != "edit_postproduction":
                 return self._error(409, "此接口只接受字幕或配乐表格编辑。")
-            if path == "/api/prompt-edit" and action not in {"edit_prompt_and_generate", "asset_prompt_approve"}:
+            if path == "/api/prompt-edit" and action not in {"edit_prompt_and_generate", "asset_prompt_approve", "asset_edit_and_generate"}:
                 return self._error(409, "此接口只接受完整提示词编辑。")
             with context.mutation_lock:
+                if action == "asset_edit_and_generate":
+                    if path != "/api/prompt-edit":
+                        return self._error(409, "请从资产卡片的完整提示词编辑器提交。")
+                    item_id, version, signature, prompt, model = (data.get(key) for key in
+                                                                  ("id", "version", "sha256", "prompt", "model"))
+                    if (set(data) != {"action", "id", "version", "sha256", "prompt", "model"}
+                            or not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", item_id)
+                            or type(version) is not int or version < 0
+                            or not _valid_sha(signature) or not isinstance(prompt, str)
+                            or not prompt.strip() or len(prompt) > 100000 or "\x00" in prompt
+                            or not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", model)):
+                        raise ValueError
+                    if context.running or context.external_run_active():
+                        return self._error(409, "制作正在进行，请等待当前任务结束后再编辑资产提示词。")
+                    from . import asset_prompt_edit
+                    try:
+                        context.ensure_launchable(
+                            _core().load_project(context.project_dir), excluding_asset_id=item_id)
+                        asset_prompt_edit.edit_and_approve(
+                            context.project_dir, item_id, version, signature, prompt, model=model)
+                    except (_core().GateError, ValueError) as exc:
+                        from .failures import sanitize_failure
+                        return self._error(409, sanitize_failure({"message": str(exc)})["message"])
+                    try:
+                        context.launch()
+                    except Exception:
+                        # Consent is already durable. Do not present a rejected
+                        # request that invites an accidental duplicate submission.
+                        with context.lock:
+                            context.worker_error = ("提示词和生成授权已保存，但制作尚未启动。"
+                                                    "请处理当前制作状态后点击“继续制作”，"
+                                                    "启动这次已确认的生成；无需再次提交提示词。")
+                    return self._json(202, context.state())
                 if path == "/api/prompt-edit" and action == "edit_prompt_and_generate":
                     item_id, candidate_id, request_hash, prompt = (data.get(key) for key in
                                                                  ("id", "candidate_id", "request_hash", "prompt"))

@@ -913,6 +913,41 @@ def _invalidate_episode(ep, reason, shot_ids=None, *, state=None):
     ep["subtitle_status"] = "needs_retiming"
 
 
+def _reject_asset(state, item, version, feedback):
+    """Apply an already validated human asset revision in the current transaction."""
+    s, item_id = state, item["id"]
+    if is_internal_voice_source(item):
+        raise GateError("画外声源是内部绑定；请在对应声音资产中提出音色修改要求")
+    if item["status"] not in {"candidate", "approved", "rejected", "generation_failed"}:
+        raise GateError("资产尚未生成")
+    if item["status"] == "generation_failed":
+        failed = s["jobs"].get(item.get("job_id", ""), {})
+        expected_kind = "voice" if item.get("kind") == "voice" else "image"
+        if (not item.get("generation_error") or failed.get("state") != "failed" or
+                failed.get("accounting") not in {"spent", "released"} or
+                failed.get("kind") != expected_kind or failed.get("item_id") != item_id or
+                item.get("voice_only") is True):
+            raise GateError("资产失败记录尚未核实，不能再次提交；请先核实原调用结果")
+        from .failures import sanitize_failure
+        detail = sanitize_failure(failed.get("failure") or {
+            "stage": "unknown", "message": "原资产生成失败，旧版本未保存具体原因。", "uncertain": False})
+        history = item.setdefault("failure_history", [])
+        if not any(record.get("job_id") == item["job_id"] and record.get("version") == version
+                   for record in history):
+            history.append({"job_id": item["job_id"], "version": version, "failure": detail,
+                            "recorded_at": now()})
+    item.update(status="rejected", feedback=feedback)
+    # The completed task belongs to the rejected candidate, not its replacement.
+    for key in ("job_id", "approved_at", "approved_sha256", "generation_error"):
+        item.pop(key, None)
+    affected = False
+    for ep in s["episodes"]:
+        selected = [sh["id"] for sh in ep["shots"] if item_id in sh["asset_ids"]]
+        if selected or affected:
+            _invalidate_episode(ep, "资产变更：" + feedback, None if affected else selected, state=s)
+            affected = True
+
+
 def reject(root, kind, item_id, version, feedback, shot_ids=None):
     if not isinstance(feedback, str) or not feedback.strip():
         raise ValueError("返工意见不能为空")
@@ -926,36 +961,7 @@ def reject(root, kind, item_id, version, feedback, shot_ids=None):
                 raise GateError("已有生成素材，请使用资产或分集返工")
             item.update(status="rejected", feedback=feedback)
         elif kind == "asset":
-            if is_internal_voice_source(item):
-                raise GateError("画外声源是内部绑定；请在对应声音资产中提出音色修改要求")
-            if item["status"] not in {"candidate", "approved", "rejected", "generation_failed"}:
-                raise GateError("资产尚未生成")
-            if item["status"] == "generation_failed":
-                failed = s["jobs"].get(item.get("job_id", ""), {})
-                expected_kind = "voice" if item.get("kind") == "voice" else "image"
-                if (not item.get("generation_error") or failed.get("state") != "failed" or
-                        failed.get("accounting") not in {"spent", "released"} or
-                        failed.get("kind") != expected_kind or failed.get("item_id") != item_id or
-                        item.get("voice_only") is True):
-                    raise GateError("资产失败记录尚未核实，不能再次提交；请先核实原调用结果")
-                from .failures import sanitize_failure
-                detail = sanitize_failure(failed.get("failure") or {
-                    "stage": "unknown", "message": "原资产生成失败，旧版本未保存具体原因。", "uncertain": False})
-                history = item.setdefault("failure_history", [])
-                if not any(record.get("job_id") == item["job_id"] and record.get("version") == version
-                           for record in history):
-                    history.append({"job_id": item["job_id"], "version": version, "failure": detail,
-                                    "recorded_at": now()})
-            item.update(status="rejected", feedback=feedback)
-            # The completed task belongs to the rejected candidate, not its replacement.
-            for key in ("job_id", "approved_at", "approved_sha256", "generation_error"):
-                item.pop(key, None)
-            affected = False
-            for ep in s["episodes"]:
-                selected = [sh["id"] for sh in ep["shots"] if item_id in sh["asset_ids"]]
-                if selected or affected:
-                    _invalidate_episode(ep, "资产变更：" + feedback, None if affected else selected, state=s)
-                    affected = True
+            _reject_asset(s, item, version, feedback)
         elif kind == "episode":
             if item["status"] not in {"awaiting_review", "approved", "revision_requested"}:
                 raise GateError("本集尚未进入审片阶段")

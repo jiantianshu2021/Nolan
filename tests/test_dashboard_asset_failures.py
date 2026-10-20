@@ -106,7 +106,7 @@ const nodes=new Map(),revisions=[],decisions=[];
 const context={document:{createElement:tag=>new Element(tag)},
  $:id=>{if(!nodes.has(id))nodes.set(id,new Element('div'));return nodes.get(id);},
  kinds:{voice:'声音',character:'人物'},names:{asset_generation_failed:'资产生成失败'},
- state:{paused:false,dashboard:{running:false}},showRevision:(...args)=>revisions.push(args),
+ state:{paused:false,dashboard:{running:false}},requestBusy:false,assetDirectEditor:()=>null,openAssetPromptEditor:(...args)=>revisions.push(args),
  perform:(...args)=>decisions.push(args),assert,nodes,revisions,decisions};
 vm.runInNewContext(sources.join('\n')+`
 const walk=node=>[node,...(node.children||[]).flatMap(walk)];
@@ -118,9 +118,9 @@ for(const kind of ['voice','character']){
  assert.equal(content.some(n=>n.tag==='button'&&n.textContent==='确认并继续'),false);
  assert.equal(content.some(n=>n.textContent.includes('synthetic-request')),true);
  assert.equal(content.some(n=>n.textContent.includes('没有可审批的新候选')),true);
- const retry=content.find(n=>n.tag==='button'&&n.textContent===(kind==='voice'?'填写意见并重试试听':'填写意见并重试资产'));
+ const retry=content.find(n=>n.tag==='button'&&n.textContent===(kind==='voice'?'修改提示词并重试试听':'修改提示词并重试资产'));
  assert.ok(retry);assert.equal(retry.disabled,false);assert.equal(revisions.length,kind==='voice'?0:1);
- retry.listeners.click();assert.equal(revisions.at(-1)[0].id,asset.id);assert.equal(revisions.at(-1)[0].version,2);assert.equal(revisions.at(-1)[1],'asset');
+ retry.listeners.click();assert.equal(revisions.at(-1)[0].id,asset.id);assert.equal(revisions.at(-1)[0].version,2);assert.equal(revisions.at(-1).length,1);
  assert.equal(decisions.length,0,'opening the retry form cannot run production');
  state.paused=true;assert.equal(walk(assetCard(asset)).find(n=>n.tag==='button').disabled,true);state.paused=false;
  asset.can_retry=false;asset.failure.uncertain=true;assert.equal(walk(assetCard(asset)).some(n=>n.tag==='button'),false);

@@ -23,17 +23,20 @@ class DashboardAssetPromptDomTests(unittest.TestCase):
     def run_dom(self, assertions):
         sources = [function_source(name) for name in (
             "el", "mediaURL", "previewInfo", "assetPromptDraft", "assetPromptApproval", "updateAssetPromptControls",
-            "nextHumanNavigationGate", "paintApprovalGate", "perform", "action")]
+            "nextHumanNavigationGate", "paintApprovalGate", "perform", "action", "assetEditSession",
+            "openAssetPromptEditor", "submitAssetPromptEdit", "assetDirectEditor", "assetCard",
+            "inputDraft", "inputCard", "paintIntake")]
         program = r'''
 const assert=require('node:assert/strict'),vm=require('node:vm');
 const {sources,assertions}=JSON.parse(require('node:fs').readFileSync(0,'utf8'));
 class Element{
- constructor(tag='div'){this.tag=tag;this.children=[];this.dataset={};this.listeners={};this.textContent='';this.value='';}
+ constructor(tag='div'){this.tag=tag;this.children=[];this.dataset={};this.listeners={};this.textContent='';this.value='';this.classList={add:()=>{},remove:()=>{},toggle:()=>{}};}
  append(...nodes){this.children.push(...nodes);}
  replaceChildren(...nodes){this.children=[...nodes];}
  addEventListener(key,handler){this.listeners[key]=handler;}
  setAttribute(key,value){this[key]=value;}
  focus(){this.focused=true;}
+ querySelector(selector){return walk(this).find(node=>node.className===selector.slice(1));}
 }
 const nodes=new Map(),calls=[],messages=[],roots=[],previews=[];
 const $=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
@@ -45,12 +48,14 @@ const asset={id:'synthetic-hero',kind:'character',name:'合成人物',version:1,
  {id:'legacy',label:'旧模型',available:false,reason:'不支持参考图'}],selected_generation_model:'image-fast',
  creation_input:{references:[{name:'人物参考',file:'inputs/hero/synthetic-reference.png'}]}};
 const context={assert,$,nodes,calls,messages,asset,roots,previews,walk,setTimeout,currentAsset:null,previewReady:false,previewAsset:null,showImage:asset=>previews.push(asset),
- requestBusy:false,TOKEN:'synthetic-token',
+ requestBusy:false,TOKEN:'synthetic-token',signature:'',inputDrafts:new Map(),kinds:{character:'人物',voice:'声音'},
+ badge:status=>new Element('span'),appendPrompt:()=>{},failureDetails:()=>null,uploadReferences:()=>{},removeReference:()=>{},saveInput:()=>{},
  state:{id:'synthetic-project',assets:[asset],paused:false,episodes:[],plan:{status:'approved'},dashboard:{running:false}},
- document:{createElement:tag=>new Element(tag),querySelectorAll:selector=>selector==='[data-asset-prompt-control]'?
+ document:{createElement:tag=>new Element(tag),createTextNode:text=>({tag:"text",textContent:text}),querySelectorAll:selector=>selector==='[data-asset-prompt-control]'?
  roots.flatMap(walk).filter(node=>node.dataset.assetPromptControl):[]},
  toast:(...args)=>messages.push(args),updateInputControls:()=>{},paint:()=>{},refresh:async()=>{},
- fetch:async(url,options)=>{calls.push({url,payload:JSON.parse(options.body)});
+ fetch:async(url,options)=>{calls.push({url,headers:options.headers,payload:options.body?JSON.parse(options.body):null});
+  if(!options.body)return{ok:!context.readFail,json:async()=>context.readFail?({error:"合成只读检查失败"}):context.snapshot};
   if(context.fail)return{ok:false,json:async()=>({error:'合成测试：候选已经更新'})};
   return{ok:true,json:async()=>context.state};}};
 vm.runInNewContext(sources.join('\n')+'\n(async()=>{'+assertions+'\n})().catch(error=>{throw error;});',context);
@@ -177,6 +182,72 @@ asset.creation_input.references=[{file:'inputs/old-stale-reference.png'}];
 const all=walk(assetPromptApproval(asset));assert.equal(all.some(node=>node.tag==='img'),false);
 assert.ok(all.some(node=>node.textContent==='本次声音试片没有图片参考；按已确认的画外声源制作。'));assert.equal(calls.length,0);
 ''')
+
+    def test_direction_initial_prompt_and_model_share_one_card_without_duplicate_intake(self):
+        self.run_dom(r"""
+asset.input_editable=true;asset.input_required=false;asset.creation_input={mode:'gpt',confirmed:true,revision:1,references:[]};
+const card=assetCard(asset),all=walk(card);assert.equal(card.dataset.assetCard,asset.id);
+assert.equal(all.filter(node=>node.tag==='article').length,1);
+assert.equal(all.filter(node=>node.tag==='h3'&&node.textContent===asset.name).length,1);
+assert.equal(all.filter(node=>node.tag==='textarea'&&node.id==='asset-generation-prompt-'+asset.id).length,1);
+assert.equal(all.filter(node=>node.tag==='select').length,1);
+assert.ok(all.some(node=>node.textContent==='生成方向与参考图'));
+assert.ok(all.some(node=>node.textContent==='确认提示词并生成资产'));
+paintIntake(state);assert.equal(calls.length,0);assert.equal(nodes.has('asset-inputs'),false);
+""")
+        self.assertNotIn('id="asset-inputs"', HTML)
+        self.assertNotIn('.asset:has(.asset-prompt-approval){grid-column:1/-1}', HTML)
+        self.assertGreater(HTML.index('id="intake-panel"'), HTML.index('id="assets-panel"'))
+
+    def test_asset_edit_reads_original_prompt_then_one_exact_submission_without_gpt_feedback(self):
+        self.run_dom(r"""
+asset.status='candidate';asset.file='media/synthetic-v1.png';
+snapshot={id:asset.id,version:1,target_version:2,sha256:'c'.repeat(64),prompt:'  原始实际提交提示词\n含全部样式与规则。\n',model:'image-fast',models:asset.generation_models,reference_manifest:{images:[],audio:[]}};
+let content=walk(assetCard(asset));assert.equal(content.some(node=>node.textContent==='提出修改'),false);
+content.find(node=>node.textContent==='修改提示词').listeners.click();
+await new Promise(resolve=>setTimeout(resolve,0));
+assert.equal(calls.length,1);assert.ok(calls[0].url.startsWith('/api/asset-prompt-editor?id='));assert.equal(calls[0].headers['X-Norlan-Token'],'synthetic-token');assert.equal(calls[0].payload,null);
+content=walk(assetCard(asset));const editor=content.find(node=>node.tag==='textarea'),select=content.find(node=>node.tag==='select');
+assert.equal(editor.value,snapshot.prompt);assert.equal(select.value,'image-fast');
+const exact='  人工直接修改，原样发给图片引擎。\n\n';editor.value=exact;editor.listeners.input();select.value='image-pro';select.listeners.change();
+const submit=content.find(node=>node.textContent==='提交提示词并生成');submit.listeners.click();submit.listeners.click();
+await new Promise(resolve=>setTimeout(resolve,0));
+assert.equal(calls.length,2);assert.equal(calls[1].url,'/api/prompt-edit');
+assert.equal(JSON.stringify(calls[1].payload),JSON.stringify({action:'asset_edit_and_generate',id:asset.id,version:1,sha256:snapshot.sha256,prompt:exact,model:'image-pro'}));
+assert.equal(assetEditSession(asset).open,false);assert.equal(asset.generation_prompt.prompt.startsWith('  完整人物'),true);
+assert.equal(calls.some(call=>['reject','run','planning_feedback'].includes(call.payload?.action)),false);
+""")
+
+    def test_asset_edit_cancel_poll_and_failed_submission_keep_exact_draft(self):
+        self.run_dom(r"""
+asset.status='candidate';snapshot={id:asset.id,version:1,sha256:'d'.repeat(64),prompt:'原始提示词',model:'image-fast',models:asset.generation_models,reference_manifest:{images:[],audio:[]}};
+await openAssetPromptEditor(asset);let all=walk(assetDirectEditor(asset)),editor=all.find(node=>node.tag==='textarea'),select=all.find(node=>node.tag==='select');
+const exact='  未提交人工草稿\n';editor.value=exact;editor.listeners.input();select.value='image-pro';select.listeners.change();
+all=walk(assetDirectEditor(asset));assert.equal(all.find(node=>node.tag==='textarea').value,exact);
+all.find(node=>node.textContent==='取消修改').listeners.click();assert.equal(assetEditSession(asset).open,false);assert.equal(calls.length,1);
+await openAssetPromptEditor(asset);all=walk(assetDirectEditor(asset));assert.equal(all.find(node=>node.tag==='textarea').value,exact);assert.equal(all.find(node=>node.tag==='select').value,'image-pro');
+fail=true;all.find(node=>node.textContent==='提交提示词并生成').listeners.click();await new Promise(resolve=>setTimeout(resolve,0));
+assert.equal(assetEditSession(asset).open,true);assert.equal(requestBusy,false);all=walk(assetDirectEditor(asset));assert.equal(all.find(node=>node.tag==='textarea').value,exact);assert.equal(all.find(node=>node.tag==='select').value,'image-pro');
+assert.equal(calls.filter(call=>call.payload).length,1);assert.ok(all.some(node=>node.textContent==='合成测试：候选已经更新'));
+""")
+
+    def test_direct_editor_reference_preview_is_bound_to_loaded_request(self):
+        self.run_dom(r"""
+asset.status='candidate';snapshot={id:asset.id,version:1,sha256:'f'.repeat(64),prompt:'原始提示词',model:'image-fast',models:asset.generation_models,reference_manifest:{images:['media/synthetic-approved.png'],audio:[]}};
+await openAssetPromptEditor(asset);const all=walk(assetDirectEditor(asset));all.find(node=>node.className==='asset-image-button').listeners.click();
+previewAsset=previews[0];previewInfo();assert.equal($('image-info').textContent,'本次生成参考图');assert.equal($('image-source').hidden,false);
+asset.version=2;previewInfo();assert.ok($('image-info').textContent.includes('当前参考清单已更新'));assert.equal($('image-source').hidden,true);assert.equal(calls.length,1);
+""")
+
+    def test_asset_editor_stale_version_pause_and_loading_failure_never_generate(self):
+        self.run_dom(r"""
+asset.status='candidate';snapshot={id:asset.id,version:1,sha256:'e'.repeat(64),prompt:'原始提示词',model:'image-fast',models:asset.generation_models,reference_manifest:{images:[],audio:[]},source_notice:'合成旧版资产提示词说明'};
+await openAssetPromptEditor(asset);let all=walk(assetDirectEditor(asset));assert.ok(all.some(node=>node.textContent===snapshot.source_notice));
+state.paused=true;all=walk(assetDirectEditor(asset));const button=all.find(node=>node.textContent==='提交提示词并生成');assert.equal(button.disabled,true);button.listeners.click();state.paused=false;
+asset.version=2;all=walk(assetDirectEditor(asset));assert.equal(all.find(node=>node.tag==='textarea').value,snapshot.prompt);assert.equal(all.find(node=>node.textContent==='提交提示词并生成').disabled,true);all.find(node=>node.textContent==='提交提示词并生成').listeners.click();assert.equal(calls.length,1);
+readFail=true;await openAssetPromptEditor(asset);all=walk(assetDirectEditor(asset));assert.equal(all.some(node=>node.textContent==='提交提示词并生成'),false);assert.ok(all.some(node=>node.textContent==='合成只读检查失败'));
+assert.equal(calls.every(call=>call.payload===null),true);
+""")
 
     def test_intake_labels_only_prepare_prompts_and_keep_reference_upload_and_paste(self):
         self.assertIn('准备资产提示词', HTML)

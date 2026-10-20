@@ -126,7 +126,7 @@ const nodes=new Map(),decisions=[];
 const context={document:{createElement:tag=>new Element(tag)},
  $:id=>{if(!nodes.has(id))nodes.set(id,new Element('div'));return nodes.get(id);},
  kinds:{voice:'声音'},names:{candidate:'待确认'},perform:(...args)=>decisions.push(args),
- state:{paused:false,dashboard:{running:false}},amendmentSignature:'',inputDrafts:new Map(),hasInputDrafts:()=>false,requestBusy:false,assert,nodes,decisions};
+ assetDirectEditor:()=>null,openAssetPromptEditor:()=>{},state:{paused:false,dashboard:{running:false}},amendmentSignature:'',inputDrafts:new Map(),hasInputDrafts:()=>false,requestBusy:false,assert,nodes,decisions};
 vm.runInNewContext(sources.join('\n')+`
 const walk=node=>[node,...(node.children||[]).flatMap(walk)];
 assert.equal(assetCard({id:'hidden-role',kind:'character',voice_only:true,status:'candidate'}),null);

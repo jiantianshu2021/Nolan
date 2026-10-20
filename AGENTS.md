@@ -46,6 +46,14 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   Check credentials and local voice transport before advancing version;
   a local refusal keeps the same consent. Recover submitted jobs by original
   ID/configuration; do not backfill consent for existing media.
+- Keep initial asset directions, full prompt/model confirmation and generated
+  previews inside one card per asset. Asset-card revisions open the existing
+  final request text read-only first; only explicit Submit and Generate adopts
+  exact human text/model and authorizes one replacement. No GPT rewrite or
+  second prompt gate on this route. Bind the editor to version, source and
+  reference hashes; retain old media and reject stale/unknown/in-flight edits.
+  Legacy reconstructed templates must be labelled as such. Ordinary video
+  feedback still uses its existing storyboard/asset planning workflow.
 - Asset direction/input confirmation must preserve a blocked failure reason.
   Production failures keep bounded, sanitized phase/asset diagnostics separate
   from transient last_error. Clear the active error only on a real phase

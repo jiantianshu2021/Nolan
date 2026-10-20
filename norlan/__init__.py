@@ -1,3 +1,3 @@
 """Nolan: a local, supervised animation production agent."""
 
-__version__ = "0.8.2"
+__version__ = "0.8.3"

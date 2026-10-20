@@ -798,8 +798,13 @@ def _assets(root):
             version = asset["version"] + 1
             with core.transaction(root) as current:
                 a = core._find(current, "asset", asset["id"])
-                if a.get("file"):
-                    a["history"].append({k: copy.deepcopy(a[k]) for k in
+                # A failed replacement can still display the preceding file.
+                # It was archived before that failed attempt; do not relabel
+                # the same artifact as the failed version on an explicit retry.
+                if a.get("file") and not any(
+                        old.get("file") == a["file"] and old.get("sha256") == a.get("sha256")
+                        for old in a.get("history", []) if isinstance(old, dict)):
+                    a.setdefault("history", []).append({k: copy.deepcopy(a[k]) for k in
                         ("file", "sha256", "version", "generation_model", "generation_request", "audio_file", "audio_sha256") if k in a})
                 a.update(version=version, status="generating")
                 if consent is not None:
