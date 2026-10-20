@@ -103,6 +103,28 @@ class ProgressTests(unittest.TestCase):
         ep.update(file="exports/E001-v1.mp4", sha256="old-render", status="revision_requested")
         self.assertEqual(episode_progress(state, ep)["percent"], 90)
 
+    def test_unchecked_final_waits_for_automatic_sync_instead_of_human_approval(self):
+        state, ep = fixture(1)
+        accept(ep["shots"][0])
+        state["settings"] = {"postproduction": {"enabled": True}}
+        ep.update(file="exports/E001-v1.mp4", sha256="synthetic-final", status="awaiting_review",
+                  postproduction={"status": "awaiting_final_approval", "final_ready": True})
+        result = episode_progress(state, ep)
+        self.assertEqual(result["stage"], "checking_subtitle_sync")
+        self.assertLess(result["percent"], 100)
+        self.assertFalse(result["waiting_for_human"])
+        for status in ("checking_subtitle_sync", "repairing_subtitle_sync"):
+            ep["postproduction"]["status"] = status
+            result = episode_progress(state, ep)
+            self.assertTrue(result["is_working"])
+            self.assertLess(result["percent"], 100)
+        ep["postproduction"]["status"] = "subtitle_sync_needs_attention"
+        result = episode_progress(state, ep)
+        self.assertFalse(result["is_working"])
+        self.assertIn("停止重复", result["label"])
+        ep["status"] = "approved"
+        self.assertEqual(episode_progress(state, ep)["percent"], 100, "past human approval is retained")
+
     def test_final_state_without_hash_does_not_reach_one_hundred(self):
         state, ep = fixture(1)
         accept(ep["shots"][0])

@@ -1339,8 +1339,18 @@ def _episode(root, ep_id):
     s = _gate(root)
     ep = core._find(s, "episode", ep_id)
     post_enabled = s["settings"].get("postproduction", {}).get("enabled")
+    post_ready = not post_enabled
+    if post_enabled and ep.get("postproduction", {}).get("final_ready"):
+        from .episode_post import check_final
+        try:
+            check_final(root, s, ep)
+            post_ready = True
+        except (core.GateError, OSError, ValueError, KeyError):
+            # Old exports or stale evidence must enter local postproduction
+            # again instead of trapping Continue behind a legacy ready flag.
+            post_ready = False
     if (ep["status"] == "awaiting_review" and all(core.human_approved_shot(shot) for shot in ep["shots"])
-            and (not post_enabled or ep.get("postproduction", {}).get("final_ready"))):
+            and post_ready):
         _set(root, status="awaiting_episode_review")
         return
     _save_episode(root, ep_id, status="generating")
@@ -1350,6 +1360,16 @@ def _episode(root, ep_id):
         raise core.GateError("前集尚未人工批准，不能生成下一集")
     if prior:
         core._check_artifact(root, prior)
+    post = ep.get("postproduction", {})
+    if (post_enabled and post.get("revision_target") in {"manual_music", "manual_subtitles"}
+            and all(core.human_approved_shot(shot) for shot in ep["shots"])):
+        # A user's table/slider submission is a local postproduction action.
+        # Do not revisit shot reviews, GPT reports or provider task polling.
+        from .episode_post import finish
+        def local_only(*args, **kwargs):
+            raise core.GateError("手动调整只在本地合成；请先完成缺失的自动后期或音乐确认，没有调用模型。")
+        finish(root, ep, brain_call=local_only, gate=_gate, soundtrack=local_only)
+        return
     previous = prior["shots"][-1] if prior else None
     for index, original in enumerate(ep["shots"]):
         if not _shot(root, ep_id, original["id"], previous):
@@ -1419,6 +1439,18 @@ def run(root):
     try:
         with core.run_lock(root):
             acquired = True
+            pending = core.load_project(root)
+            manual = next((e for e in pending.get("episodes", []) if e.get("status") != "approved"
+                and e.get("postproduction", {}).get("revision_target") in {"manual_music", "manual_subtitles"}
+                and not e.get("postproduction", {}).get("final_ready")), None)
+            if manual is not None:
+                # Explicit slider/table saves never resume unrelated assets,
+                # model reviews or provider recovery before the local remix.
+                if (not pending["settings"].get("postproduction", {}).get("enabled")
+                        or not all(core.human_approved_shot(sh) for sh in manual["shots"])):
+                    raise core.GateError("先逐段批准本集视频，再手动调整本集字幕或配乐。")
+                _episode(root, manual["id"])
+                return core.load_project(root)
             recovered = _recover(root)
             s = _gate(root)
             _set(root, last_error=None)

@@ -72,6 +72,14 @@ class EpisodePostTests(unittest.TestCase):
         self.asr_patch = patch("norlan.local_transcription.LocalTranscriber", return_value=self.asr)
         self.asr_patch.start()
         self.addCleanup(self.asr_patch.stop)
+        self.verifier = Mock()
+        self.verifier.identity = {"backend": "synthetic-independent-ctc-only", "model_sha256": "b" * 64}
+        self.verifier.last_metadata = {"synthetic_only": True, "changes": []}
+        self.verifier.verify.side_effect = self.sync_observations
+        self.verifier.repair.side_effect = self.sync_repair
+        self.verifier_patch = patch("norlan.local_alignment.LocalSubtitleVerifier", return_value=self.verifier)
+        self.verifier_patch.start()
+        self.addCleanup(self.verifier_patch.stop)
         self.connection_patch = patch("norlan.connection.production_brain_config",
                                       return_value={"provider": "codex", "billing": "subscription"})
         self.connection_patch.start()
@@ -84,6 +92,18 @@ class EpisodePostTests(unittest.TestCase):
 
     def shots(self):
         return copy.deepcopy(self.episode()["shots"])
+
+    def sync_observations(self, audio, captions):
+        return {"independent": True, "method": "independent_ctc", "full_audio_checked": True,
+                "audio_sha256": core.digest(Path(audio)), "checker_identity": self.verifier.identity,
+                "cues": [{"cue_index": i, "start": c["start"], "end": c["end"], "text": c["text"],
+                          "coverage": 1.0, "consistent": True} for i, c in enumerate(captions)],
+                "contradictions": []}
+
+    def sync_repair(self, captions, report, attempt):
+        for row in report["aligned_cues"]:
+            captions[row["cue_index"]].update(start=row["start"], end=row["end"])
+        return captions
 
     def brain_response(self, root, method, *args, **kwargs):
         if method == "proofread_subtitles":
@@ -245,6 +265,199 @@ class EpisodePostTests(unittest.TestCase):
         self.assertTrue(core.safe_path(self.root, original["file"]).is_file())
         episode_post.check_final(self.root, core.load_project(self.root), updated)
         self.soundtrack.assert_not_called()
+
+    def test_independent_sync_check_repairs_times_then_rechecks_before_final(self):
+        self.import_music(approve=True)
+        original_shots = self.shots()
+        intended = [(0.41, 0.87), (1.22, 1.88)]
+        def observed(audio, captions):
+            result = self.sync_observations(audio, captions)
+            for row, (start, end) in zip(result["cues"], intended):
+                row.update(start=start, end=end)
+            return result
+        self.verifier.verify.side_effect = observed
+        self.assertTrue(self.finish())
+        updated = self.episode()
+        sub = updated["postproduction"]["subtitles"]
+        self.assertEqual([(c["start"], c["end"]) for c in sub["segments"]], intended)
+        self.assertEqual(sub["sync_check"]["status"], "passed")
+        self.assertEqual(sub["sync_check"]["attempts"], 1)
+        self.assertEqual(self.verifier.verify.call_count, 2)
+        self.assertEqual(self.verifier.repair.call_count, 1)
+        self.assertEqual(len(self.calls("proofread_subtitles")), 1)
+        self.assertEqual(self.shots(), original_shots)
+        self.assertEqual(updated["status"], "awaiting_review")
+        episode_post.check_final(self.root, core.load_project(self.root), updated)
+        self.soundtrack.assert_not_called()
+
+    def test_unresolved_sync_is_bounded_and_continue_never_resets_attempts(self):
+        self.import_music(approve=True)
+        original = self.shots()
+        def uncertain(audio, captions):
+            result = self.sync_observations(audio, captions)
+            result["cues"][0]["consistent"] = False
+            return result
+        self.verifier.verify.side_effect = uncertain
+        self.assertFalse(self.finish())
+        post = self.episode()["postproduction"]
+        self.assertEqual(post["status"], "subtitle_sync_needs_attention")
+        self.assertEqual(post["subtitles"]["sync_check"]["attempts"], 2)
+        self.assertFalse(post["final_ready"])
+        self.assertNotIn("file", self.episode())
+        self.assertFalse(self.finish())
+        self.assertEqual(self.verifier.verify.call_count, 3)
+        self.assertEqual(self.verifier.repair.call_count, 2)
+        self.assertEqual(len(self.calls("proofread_subtitles")), 1)
+        self.assertFalse(self.calls("arrange_music"))
+        self.assertEqual(self.shots(), original)
+        # An explicit new subtitle opinion starts a new bounded repair cycle.
+        ep = self.episode()
+        episode_post.request(self.root, ep["id"], ep["version"], "subtitles", "重新检查这句实际声音")
+        self.verifier.verify.side_effect = self.sync_observations
+        self.assertTrue(self.finish())
+        self.assertEqual(self.episode()["postproduction"]["subtitles"]["sync_check"]["attempts"], 0)
+        self.soundtrack.assert_not_called()
+
+    def test_missing_or_changed_sync_report_blocks_final_human_approval(self):
+        self.import_music(approve=True)
+        self.assertTrue(self.finish())
+        baseline = core.load_project(self.root)
+        ep = baseline["episodes"][0]
+        with core.transaction(self.root) as state:
+            state["episodes"][0]["postproduction"]["subtitles"].pop("sync_check")
+        with self.assertRaisesRegex(core.GateError, "同步自动检查尚未通过"):
+            core.approve(self.root, "episode", ep["id"], ep["version"])
+        with core.transaction(self.root) as state:
+            state["episodes"][0]["postproduction"]["subtitles"] = copy.deepcopy(ep["postproduction"]["subtitles"])
+            state["episodes"][0]["postproduction"]["subtitles"]["sync_check"]["evidence_hash"] = "e" * 64
+        with self.assertRaisesRegex(core.GateError, "记录与当前音轨或字幕不一致"):
+            core.approve(self.root, "episode", ep["id"], ep["version"])
+
+    def test_continue_reenters_postproduction_for_legacy_export_without_sync_report(self):
+        from norlan import pipeline
+        self.import_music(approve=True)
+        self.assertTrue(self.finish())
+        ep = self.episode()
+        with patch.object(pipeline, "_gate", side_effect=core.load_project), \
+                patch.object(pipeline, "_shot", side_effect=AssertionError("reentered production")) as shot:
+            pipeline._episode(self.root, ep["id"])
+            shot.assert_not_called()
+            with core.transaction(self.root) as state:
+                state["episodes"][0]["postproduction"]["subtitles"].pop("sync_check")
+            with self.assertRaisesRegex(AssertionError, "reentered production"):
+                pipeline._episode(self.root, ep["id"])
+            shot.assert_called_once()
+
+    def test_legacy_subtitle_check_keeps_previous_export_and_its_provenance(self):
+        self.import_music(approve=True)
+        self.assertTrue(self.finish())
+        original = self.episode()
+        with core.transaction(self.root) as state:
+            state["episodes"][0]["postproduction"]["subtitles"].pop("sync_check")
+        self.assertTrue(self.finish())
+        updated = self.episode()
+        self.assertEqual(updated["history"][-1]["file"], original["file"])
+        self.assertEqual(updated["history"][-1]["sha256"], original["sha256"])
+        self.assertEqual(updated["history"][-1]["render_manifest"], original["render_manifest"])
+        self.assertEqual(core.digest(core.safe_path(self.root, original["file"])), original["sha256"])
+        self.assertEqual(updated["version"], original["version"] + 1)
+
+    def test_manual_music_slider_and_time_edits_render_without_gpt_or_generation(self):
+        from norlan.post_edits import apply_edits
+        self.import_music(approve=True)
+        self.assertTrue(self.finish())
+        original = self.episode()
+        original_shots = self.shots()
+        self.brain.reset_mock()
+        cue = original["postproduction"]["music"]["cues"][0]
+        apply_edits(self.root, original["id"], original["version"], original["postproduction"].get("revision", 0),
+                    "music", [{"index": 0, "start": .1, "end": 1.8, "gain_db": -30}])
+        self.assertTrue(self.finish())
+        updated = self.episode()
+        revised = updated["postproduction"]["music"]["cues"][0]
+        self.assertEqual((revised["start"], revised["end"], revised["gain_db"]), (.1, 1.8, -30))
+        self.assertEqual(revised["track_sha256"], cue["track_sha256"])
+        self.assertEqual(updated["render_manifest"]["subtitles"], original["render_manifest"]["subtitles"])
+        self.assertEqual(self.shots(), original_shots)
+        self.assertNotEqual(updated["file"], original["file"])
+        self.brain.assert_not_called()
+        self.soundtrack.assert_not_called()
+        episode_post.check_final(self.root, core.load_project(self.root), updated)
+
+    def test_manual_pipeline_goes_directly_to_local_postproduction(self):
+        from norlan import pipeline
+        from norlan.post_edits import apply_edits
+        self.import_music(approve=True)
+        self.assertTrue(self.finish())
+        original = self.episode()
+        apply_edits(self.root, original["id"], original["version"], original["postproduction"].get("revision", 0),
+                    "music", [{"index": 0, "start": .1, "end": 1.8, "gain_db": -30}])
+        with patch.object(pipeline, "_gate", side_effect=core.load_project), \
+                patch.object(pipeline, "_shot", side_effect=AssertionError("manual must not review shots")), \
+                patch.object(episode_post, "finish", return_value=True) as local:
+            pipeline._episode(self.root, original["id"])
+        local.assert_called_once()
+
+    def test_manual_run_never_advances_unrelated_assets_or_model_calls(self):
+        from norlan import pipeline
+        from norlan.post_edits import apply_edits
+        self.import_music(approve=True)
+        self.assertTrue(self.finish())
+        original = self.episode()
+        apply_edits(self.root, original["id"], original["version"], original["postproduction"].get("revision", 0),
+                    "music", [{"index": 0, "start": .1, "end": 1.8, "gain_db": -30}])
+        with patch.object(pipeline, "_gate", side_effect=core.load_project), \
+                patch.object(pipeline, "_recover", side_effect=AssertionError("no provider recovery")), \
+                patch.object(pipeline, "_assets", side_effect=AssertionError("no asset generation")), \
+                patch.object(pipeline, "_brain", side_effect=AssertionError("no GPT")):
+            result = pipeline.run(self.root)
+        self.assertEqual(result["episodes"][0]["status"], "awaiting_review")
+        self.assertEqual(result["episodes"][0]["version"], original["version"] + 1)
+
+    def test_manual_subtitle_times_are_preserved_without_rechecking(self):
+        from norlan.post_edits import apply_edits
+        self.import_music(approve=True)
+        self.assertTrue(self.finish())
+        original = self.episode()
+        original_shots = self.shots()
+        self.brain.reset_mock(); self.asr.transcribe.reset_mock(); self.verifier.repair.reset_mock(); self.verifier.verify.reset_mock()
+        edits = [{"index": i, "start": c["start"] + .04, "end": c["end"] + .04, "text": c["text"]}
+                 for i, c in enumerate(original["postproduction"]["subtitles"]["segments"])]
+        apply_edits(self.root, original["id"], original["version"], original["postproduction"].get("revision", 0), "subtitles", edits)
+        self.assertTrue(self.finish())
+        updated = self.episode()
+        self.assertEqual(updated["render_manifest"]["subtitles"],
+            [{"start": round(c["start"], 6), "end": round(c["end"], 6), "text": c["text"]} for c in edits])
+        self.assertEqual(updated["postproduction"]["music"]["sha256"], original["postproduction"]["music"]["sha256"])
+        self.assertEqual(self.shots(), original_shots)
+        self.brain.assert_not_called(); self.asr.transcribe.assert_not_called(); self.verifier.repair.assert_not_called(); self.verifier.verify.assert_not_called()
+        episode_post.check_final(self.root, core.load_project(self.root), updated)
+
+    def test_manual_times_skip_checker_and_wait_for_final_human_decision(self):
+        from norlan.post_edits import apply_edits
+        self.import_music(approve=True)
+        self.assertTrue(self.finish())
+        original = self.episode()
+        self.verifier.repair.reset_mock(); self.verifier.verify.reset_mock(); self.verifier.check_ready.reset_mock()
+        edits = [{"index": i, **c} for i, c in enumerate(original["postproduction"]["subtitles"]["segments"])]
+        edits[0].update(start=.02, end=.2)
+        apply_edits(self.root, original["id"], original["version"], original["postproduction"].get("revision", 0), "subtitles", edits)
+        self.verifier.verify.side_effect = AssertionError("manual edits must not trigger sync checks")
+        self.assertTrue(self.finish())
+        updated = self.episode()
+        self.assertNotEqual(updated["file"], original["file"])
+        self.assertEqual(updated["render_manifest"]["subtitles"][0]["start"], .02)
+        self.assertFalse(updated["postproduction"]["manual_preview"])
+        self.assertEqual(updated["postproduction"]["status"], "awaiting_final_approval")
+        self.assertEqual(updated["postproduction"]["subtitles"]["sync_check"]["status"], "manual")
+        self.assertEqual(updated["status"], "awaiting_review")
+        self.assertNotIn("approved_at", updated)
+        self.verifier.repair.assert_not_called(); self.verifier.verify.assert_not_called(); self.verifier.check_ready.assert_not_called()
+        episode_post.check_final(self.root, core.load_project(self.root), updated)
+        with core.transaction(self.root) as state:
+            state["episodes"][0]["postproduction"]["manual_subtitles"]["segments"][0]["start"] = .03
+        with self.assertRaises(core.GateError):
+            episode_post.check_final(self.root, core.load_project(self.root), self.episode())
 
     def test_subtitle_only_revision_does_not_rearrange_invalid_music(self):
         self.import_music(approve=True)

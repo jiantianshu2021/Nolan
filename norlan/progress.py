@@ -24,11 +24,14 @@ _POST_STAGES = {
     "subtitles": (93.0, "处理本集字幕与时间轴"),
     "rendering": (96.0, "合成整集画面、配乐和字幕"),
     "transcribing": (91.0, "本地识别本集实际对白和字幕时间轴"),
-    "correcting_subtitles": (93.0, "GPT 校对字幕文字与断句"),
+    "correcting_subtitles": (93.0, "GPT 校对字幕文字"),
     "arranging_music": (95.0, "GPT 复用已批准音乐，编排本集配乐"),
+    "mixing_manual_music": (95.0, "按你设置的时间和音量在本机重新混音"),
     "assembling": (90.0, "锁定已批准片段，拼接本集原声粗剪"),
     "recognizing": (91.0, "本地识别本集实际对白和字幕时间轴"),
-    "proofreading": (93.0, "GPT 校对字幕文字与断句"),
+    "proofreading": (93.0, "GPT 校对字幕文字"),
+    "checking_subtitle_sync": (94.0, "独立声学模型检查字幕与实际声音是否同步"),
+    "repairing_subtitle_sync": (94.0, "自动重新对齐字幕，并重新检查实际声音"),
 }
 
 
@@ -138,7 +141,15 @@ def episode_progress(state, episode, *, now=None):
     post = episode.get("postproduction", {})
     post = post if isinstance(post, dict) else {}
     post_enabled = state.get("settings", {}).get("postproduction", {}).get("enabled") is True
-    if all_complete and episode.get("file") and episode.get("sha256") and episode.get("status") in {"awaiting_review", "approved"} and (not post_enabled or post.get("final_ready") is True):
+    from .subtitle_sync import report_matches, manual_report_matches
+    sub = post.get("subtitles", {})
+    sync_ready = bool(sub.get("audio_sha256") and post.get("source_key")
+                      and (report_matches(sub.get("sync_check"), sub.get("segments"),
+                                         audio_sha256=sub.get("audio_sha256"), source_key=post.get("source_key"))
+                           or manual_report_matches(sub.get("sync_check"), sub.get("segments"),
+                                         audio_sha256=sub.get("audio_sha256"), source_key=post.get("source_key"))))
+    final_ready = not post_enabled or (post.get("final_ready") is True and (episode.get("status") == "approved" or sync_ready))
+    if all_complete and episode.get("file") and episode.get("sha256") and episode.get("status") in {"awaiting_review", "approved"} and final_ready:
         if episode["status"] == "approved":
             return finish("approved", "本集已通过人工审批", value=100.0)
         return finish("awaiting_review", "本集已合成，请观看成片并审批", waiting=True, value=100.0)
@@ -167,6 +178,10 @@ def episode_progress(state, episode, *, now=None):
         return finish("unknown", "存在结果不明的调用，需核实原任务后继续", waiting=True)
     if all_complete and post_enabled:
         post_status = post.get("status", "")
+        if post_status == "subtitle_sync_needs_attention":
+            return finish("subtitle_sync_needs_attention", "字幕自动复检仍未通过，已停止重复处理；请查看折叠检查报告", waiting=True, value=94.0)
+        if post_status == "awaiting_final_approval" and not sync_ready:
+            return finish("checking_subtitle_sync", "本集字幕尚未通过自动同步检查，检查后再进入最终验收", value=94.0)
         if post_status == "awaiting_music_approval":
             return finish("awaiting_music_approval", "请在本集后期试听并确认新音乐，才能混入成片", waiting=True, value=94.0)
         if post_status in {"configuration_required", "awaiting_music", "awaiting_music_selection", "postproduction_configuration"}:

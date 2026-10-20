@@ -20,6 +20,20 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
 - Show the current final export directly in the episode postproduction panel,
   with its human approval and subtitle/music feedback together. Never substitute
   a dry cut or retired export for the current final preview.
+- Before final episode approval, independently check subtitle timing against the
+  actual audio. Repair locally at most twice and recheck; a spelling pass, the
+  original VAD boundaries, or missing/contradictory evidence cannot pass this gate.
+  Bind the report to current audio, captions, source and rendered manifest.
+  Continuing or restarting must not reset exhausted automatic repair attempts.
+  Subtitle checks never regenerate video, voices or music, or approve an episode.
+- Manual postproduction edits retain the user's subtitle times and approved
+  track identities. Render a new local preview; do not send them back to GPT or
+  silently replace them with automatic timing. Explicit user edits bypass new
+  ASR/sync checks: bind the manual adoption to audio, captions, source and export,
+  label it as manual rather than machine-passed, then await final human approval.
+  Keep prior exports and provenance.
+- Prefer nearby scripted dialogue for caption text, then verify against actual
+  audio. Do not add unspoken lines or overwrite differing numbers from a script.
 - Route segment feedback through the same revision planner for ordinary edits,
   local storyboarding and asset additions. A new storyboard may change only the
   target segment's internal shots and duration within provider limits. GPT

@@ -173,7 +173,7 @@ class MusicFolderRenderingTests(unittest.TestCase):
     def test_early_folder_setup_and_audition_do_not_unlock_post_or_paid_generation(self):
         html = Path(dashboard.__file__).with_name("dashboard.html").read_text()
         sources = []
-        for name in ("el", "mediaURL", "appendPrompt", "postproductionFeedback", "musicTrack", "postproductionPanel"):
+        for name in ("el", "mediaURL", "appendPrompt", "postproductionFeedback", "musicTrack", "postproductionEditor", "subtitleSyncReport", "postproductionPanel"):
             match = re.search(r"(?:async )?function " + name + r"\(", html)
             following = re.search(r"\n(?:async )?function ", html[match.start() + 1:])
             end = match.start() + 1 + following.start() if following else len(html)

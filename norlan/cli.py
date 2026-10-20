@@ -114,6 +114,12 @@ def doctor():
         findings[command] = shutil.which(command) or "未安装"
     from .local_transcription import DEFAULT_MODEL_PATH
     findings["本地字幕模型"] = str(DEFAULT_MODEL_PATH) if DEFAULT_MODEL_PATH.is_file() else "未安装；运行 scripts/install-local-asr.sh"
+    from .local_alignment import LocalSubtitleVerifier
+    try:
+        LocalSubtitleVerifier({}).check_ready()
+        findings["字幕独立同步检查"] = "已就绪（本地中文声学模型）"
+    except Exception as exc:
+        findings["字幕独立同步检查"] = str(exc)
     try:
         from .brain import BrainError, resolve_codex
         selected_codex = resolve_codex()

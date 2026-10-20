@@ -11,7 +11,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from norlan import dashboard, progress
+from norlan import dashboard, progress, subtitle_sync
 
 
 def synthetic_state():
@@ -37,6 +37,23 @@ def synthetic_state():
 
 
 class PostproductionProjectionTests(unittest.TestCase):
+    def expose_verified(self, state):
+        # Synthetic acoustic observations verify the real report/projection
+        # contract; they do not test recognition or claim acoustic accuracy.
+        post = state["episodes"][0]["postproduction"]
+        subtitles = post["subtitles"]
+        post["source_key"], subtitles["audio_sha256"] = "e" * 64, "d" * 64
+        checker = {"name": "synthetic-independent-ctc", "version": 1}
+        observations = {"independent": True, "method": "independent_ctc", "full_audio_checked": True,
+            "audio_sha256": subtitles["audio_sha256"], "checker_identity": checker,
+            "contradictions": [], "cues": [{"cue_index": index, "start": cue["start"], "end": cue["end"],
+                "text": cue["text"], "coverage": 1.0, "consistent": True}
+                for index, cue in enumerate(subtitles["segments"])]}
+        subtitles["sync_check"] = subtitle_sync.evaluate_alignment(subtitles["segments"], observations, 5.0,
+            audio_sha256=subtitles["audio_sha256"], source_key=post["source_key"], checker_identity=checker)
+        self.assertEqual(subtitles["sync_check"]["status"], "passed")
+        return dashboard.public_state(state)
+
     def test_projection_keeps_media_and_editorial_plan_without_provider_internals(self):
         state = synthetic_state()
         before = copy.deepcopy(state)
@@ -59,8 +76,9 @@ class PostproductionProjectionTests(unittest.TestCase):
         self.assertNotEqual(progress.episode_progress(state, episode)["percent"], 100)
         episode["postproduction"].update(final_ready=True, status="awaiting_final_approval",
             final_file=episode["file"], final_version=episode["version"], final_sha256=episode["sha256"])
-        post = dashboard.public_state(state)["episodes"][0]["postproduction"]
+        post = self.expose_verified(state)["episodes"][0]["postproduction"]
         self.assertTrue(post["final_ready"])
+        self.assertTrue(post["final_available"])
         self.assertEqual((post["final_file"], post["final_version"], post["final_sha256"]),
                          (episode["file"], episode["version"], episode["sha256"]))
         self.assertEqual(progress.episode_progress(state, episode)["percent"], 100)
@@ -75,13 +93,66 @@ class PostproductionProjectionTests(unittest.TestCase):
             final_file=episode["file"], final_version=1, final_sha256=episode["sha256"])
         before = copy.deepcopy(state)
         exposed = dashboard.public_state(state)["episodes"][0]
-        self.assertTrue(exposed["postproduction"]["final_ready"])
+        self.assertTrue(exposed["postproduction"]["final_available"])
+        self.assertFalse(exposed["postproduction"]["final_ready"], "an old export is viewable but needs automatic checking before a new approval")
         self.assertEqual(exposed["postproduction"]["final_file"], "exports/E1-v1.mp4")
         self.assertTrue(exposed["has_subtitles"])
         self.assertTrue(exposed["subtitles_burned"])
         self.assertEqual(state, before)
         episode["status"] = "approved"
-        self.assertTrue(dashboard.public_state(state)["episodes"][0]["postproduction"]["final_ready"])
+        approved = dashboard.public_state(state)["episodes"][0]
+        self.assertTrue(approved["postproduction"]["final_available"])
+        self.assertEqual(approved["status"], "approved", "upgrading does not revoke a human decision")
+
+    def test_sync_diagnostics_are_bounded_sanitized_and_not_verification_internals(self):
+        state = synthetic_state()
+        report = {"status": "needs_attention", "summary": "检查完成，仍有疑点", "attempts": 2,
+                  "max_attempts": 2, "checked_cues": 7, "total_cues": 8,
+                  "source_audio_sha256": "PRIVATE-AUDIO", "source_key": "PRIVATE-SOURCE",
+                  "caption_hash": "PRIVATE-CAPTIONS", "evidence": {"path": "/private/model.json"},
+                  "issues": [{"start": 6.5, "end": 8.9, "reason": "字幕开始早于实际人声 token=sk-abcdefghijklmno",
+                              "code": "early_start", "cue_index": 0, "raw": "PRIVATE-ASR"},
+                             {"start": float("nan"), "end": float("inf"), "reason": "时间无效"},
+                             {"start": True, "end": 4, "reason": "布尔值不能当作时间"}]}
+        state["episodes"][0]["postproduction"]["subtitles"]["sync_check"] = report
+        public = dashboard.public_state(state)
+        safe = public["episodes"][0]["postproduction"]["subtitles"]["sync_check"]
+        self.assertEqual(safe["attempts"], 2)
+        self.assertEqual((safe["checked_cues"], safe["total_cues"]), (7, 8))
+        self.assertEqual(safe["issues"][0]["start"], 6.5)
+        self.assertEqual(safe["issues"][0]["cue_index"], 0)
+        self.assertNotIn("sk-abcdefghijklmno", safe["issues"][0]["reason"])
+        self.assertTrue(all("start" not in item for item in safe["issues"][1:]))
+        self.assertNotIn("PRIVATE-", json.dumps(public))
+        self.assertNotIn("evidence", safe)
+        self.assertNotIn("source_audio_sha256", safe)
+        report.update(summary="过长" * 1000, issues=report["issues"] * 300, attempts=True, checked_cues=-1)
+        safe = dashboard.public_state(state)["episodes"][0]["postproduction"]["subtitles"]["sync_check"]
+        self.assertLessEqual(len(safe["summary"]), 401)
+        self.assertLessEqual(len(safe["issues"]), 200)
+        self.assertNotIn("attempts", safe)
+        self.assertNotIn("checked_cues", safe)
+
+    def test_passed_but_stale_sync_report_never_opens_final_approval(self):
+        state = synthetic_state()
+        episode = state["episodes"][0]
+        episode.update(status="awaiting_review", version=1, file="exports/E1-v1.mp4", sha256="c" * 64)
+        episode["postproduction"].update(status="awaiting_final_approval", final_ready=True,
+            final_file=episode["file"], final_version=1, final_sha256=episode["sha256"])
+        episode["postproduction"]["subtitles"]["sync_check"] = {"status": "passed", "summary": "旧检查"}
+        with patch("norlan.subtitle_sync.report_matches", return_value=False):
+            post = dashboard.public_state(state)["episodes"][0]["postproduction"]
+        self.assertTrue(post["final_available"])
+        self.assertFalse(post["final_ready"])
+        self.assertEqual(post["subtitles"]["sync_check"]["status"], "needs_attention")
+        self.assertIn("不一致", post["subtitles"]["sync_check"]["summary"])
+
+    def test_invalid_report_status_is_not_presented_as_passed(self):
+        state = synthetic_state()
+        state["episodes"][0]["postproduction"]["subtitles"]["sync_check"] = {
+            "status": "private-internal-state", "summary": "未知检查状态"}
+        post = dashboard.public_state(state)["episodes"][0]["postproduction"]
+        self.assertEqual(post["subtitles"]["sync_check"]["status"], "needs_attention")
 
     def test_stale_or_unbound_final_preview_is_not_exposed(self):
         state = synthetic_state()
@@ -216,13 +287,23 @@ class PostproductionHttpTests(unittest.TestCase):
         (path.parent / "unreferenced.mp3").write_bytes(b"private")
         self.assertEqual(self.request(None, "/media/music/library/unreferenced.mp3", method="GET")[0], 404)
 
+    def test_sync_approval_gate_errors_are_explicit_and_do_not_start_production(self):
+        for message in ("字幕同步自动检查尚未通过，暂不能最终批准；请查看本集字幕检查报告。",
+                        "字幕同步检查记录与当前音轨或字幕不一致，请重新检查后再批准。"):
+            with self.subTest(message=message):
+                self.core.approve.side_effect = ValueError(message)
+                status, body = self.request({"action": "approve", "kind": "episode", "id": "E1", "version": 1})
+                self.assertEqual(status, 409)
+                self.assertEqual(json.loads(body)["error"], message)
+        self.run.assert_not_called()
+
 
 @unittest.skipUnless(shutil.which("node"), "Node.js required for synthetic DOM test")
 class PostproductionRenderingTests(unittest.TestCase):
     def test_panel_is_after_rough_cut_and_human_final_gate_requires_completed_post(self):
         html = Path(dashboard.__file__).with_name("dashboard.html").read_text()
         sources = []
-        for name in ("el", "mediaURL", "appendPrompt", "episodeCard", "postproductionFeedback", "musicTrack", "postproductionPanel"):
+        for name in ("el", "mediaURL", "appendPrompt", "episodeCard", "postproductionFeedback", "musicTrack", "postproductionEditor", "subtitleSyncReport", "postproductionPanel"):
             match = re.search(r"(?:async )?function " + name + r"\(", html)
             next_match = re.search(r"\n(?:async )?function ", html[match.start() + 1:])
             end = match.start() + 1 + next_match.start() if next_match else len(html)
@@ -244,7 +325,7 @@ assert.equal(nodes.find(n=>n.tag==='button'&&n.textContent==='继续本集后期
 assert.equal(nodes.find(n=>n.tag==='button'&&n.textContent==='生成一首新音乐').disabled,true);
 const feedback=nodes.find(n=>n.tag==='textarea'&&n.dataset.feedbackFor==='post:E1:subtitles');feedback.value='合成字幕修改';
 const subtitleSection=nodes.find(n=>n.className==='postproduction-step');walk(subtitleSection).find(n=>n.tag==='button'&&n.textContent==='提交意见并重新合成').listeners.click();assert.equal(actions.at(-1)[0].action,'postproduction');assert.equal(actions.at(-1)[0].target,'subtitles');
-episode.file='exports/E1-v1.mp4';Object.assign(episode.postproduction,{final_ready:true,final_file:episode.file,final_version:1});card=episodeCard(episode,0);assert.equal(walk(card).some(n=>n.tag==='button'&&n.textContent==='通过本集，完成制作'),true);
+episode.file='exports/E1-v1.mp4';Object.assign(episode.postproduction,{final_available:true,final_ready:true,final_file:episode.file,final_version:1,subtitles:{sync_check:{status:"passed"}}});card=episodeCard(episode,0);assert.equal(walk(card).some(n=>n.tag==='button'&&n.textContent==='通过本集，完成制作'),true);
 episode.postproduction.ready=false;const locked=postproductionPanel(episode);assert.equal(walk(locked).some(n=>n.tag==='button'),false);assert.equal(walk(locked).some(n=>n.textContent.includes('等待本集所有片段通过审批')),true);
 `,context);
 '''

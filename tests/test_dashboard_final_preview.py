@@ -15,7 +15,7 @@ class FinalPreviewRenderingTests(unittest.TestCase):
         html = Path(dashboard.__file__).with_name("dashboard.html").read_text()
         sources = []
         for name in ("el", "mediaURL", "appendPrompt", "episodeCard", "postproductionFeedback",
-                     "musicTrack", "postproductionPanel", "paintPostproductionStatus"):
+                     "musicTrack", "postproductionEditor", "subtitleSyncReport", "postproductionPanel", "paintPostproductionStatus"):
             match = re.search(r"(?:async )?function " + name + r"\(", html)
             following = re.search(r"\n(?:async )?function ", html[match.start() + 1:])
             end = match.start() + 1 + following.start() if following else len(html)
@@ -53,7 +53,7 @@ const context={assert,state,actions,nodes,document:{createElement:tag=>new Eleme
  perform:(...args)=>actions.push(args),uploadMusic:()=>{},showRevision:()=>{},toast:()=>{}};
 vm.runInNewContext(sources.join('\n')+`
 const walk=node=>[node,...(node.children||[]).flatMap(walk)];
-const episode={id:'E1',title:'合成测试第一集',version:4,status:'awaiting_review',file:'exports/E1-v4.mp4',has_subtitles:true,subtitles_burned:true,music_status:'approved_library_mixed',shots:[{id:'S1'},{id:'S2'}],postproduction:{enabled:true,ready:true,final_ready:true,final_file:'exports/E1-v4.mp4',final_version:4,final_sha256:'f'.repeat(64),dry_file:'exports/E1-original-audio.mp4',status:'awaiting_final_approval',subtitles:{status:'corrected'},music:{status:'mixed'}}};state.episodes=[episode];
+const episode={id:'E1',title:'合成测试第一集',version:4,status:'awaiting_review',file:'exports/E1-v4.mp4',has_subtitles:true,subtitles_burned:true,music_status:'approved_library_mixed',shots:[{id:'S1'},{id:'S2'}],postproduction:{enabled:true,ready:true,final_available:true,final_ready:true,final_file:'exports/E1-v4.mp4',final_version:4,final_sha256:'f'.repeat(64),dry_file:'exports/E1-original-audio.mp4',status:'awaiting_final_approval',subtitles:{status:'corrected',sync_check:{status:'passed',summary:'合成字幕已按独立音频证据检查。',attempts:1,max_attempts:2,checked_cues:3,total_cues:3,issues:[]}},music:{status:'mixed'}}};state.episodes=[episode];
 `+assertions,context);
 '''
         result = subprocess.run([shutil.which("node"), "-e", program],
@@ -95,14 +95,14 @@ assert.equal(actions.some(action=>action[0].action==='approve'),false);
 
     def test_rework_and_inconsistent_final_never_present_old_video_as_current(self):
         self.run_dom(r'''
-for(const update of [{final_ready:false},{ready:false},{final_file:'exports/E1-v3.mp4'},{final_version:3},{final_file:null}]){
+for(const update of [{final_available:false,final_ready:false},{ready:false},{final_file:'exports/E1-v3.mp4'},{final_version:3},{final_file:null}]){
  const changed={...episode,postproduction:{...episode.postproduction,...update}};
  const card=episodeCard(changed,0);
  assert.equal(card.querySelector('.postproduction-final-preview'),null);
  assert.equal(card.querySelector('.final-approval'),null);
  assert.equal(card.querySelectorAll('video').length,0);
 }
-const pending=episodeCard({...episode,postproduction:{...episode.postproduction,final_ready:false}},0);
+const pending=episodeCard({...episode,postproduction:{...episode.postproduction,final_available:false,final_ready:false}},0);
 assert.ok(pending.querySelector('.postproduction-preview-pending'));
 assert.ok(pending.querySelector('.postproduction-preview-pending').textContent.includes('新的最终成片'));
 ''')
@@ -133,6 +133,86 @@ state.episodes=[{...episode,status:'approved'}];nodes.get('run').listeners.click
         self.run_dom(r'''
 const card=episodeCard({...episode,has_subtitles:false,subtitles_burned:false},0);
 assert.equal(card.querySelector('.final-media-status').textContent,'无实际对白字幕 · 配乐已混入');
+''')
+
+    def test_sync_report_is_collapsed_and_passed_requires_human_verification(self):
+        self.run_dom(r'''
+const card=episodeCard(episode,0),report=card.querySelector('.subtitle-sync-report');
+assert.ok(report);assert.equal(report.tag,'details');assert.equal(Boolean(report.open),false);
+assert.equal(report.id,'subtitle-sync-E1');assert.equal(report.dataset.uiKey,'subtitle-sync:E1');
+assert.ok(walk(report).some(node=>node.textContent==='字幕自动同步检查通过'));
+assert.ok(walk(report).some(node=>node.textContent.includes('重新对齐 1 / 2 次')));
+assert.ok(walk(report).some(node=>node.textContent.includes('已检查 3 / 3 条字幕')));
+assert.ok(walk(report).some(node=>node.textContent.includes('请完整播放成片')));
+assert.equal(actions.length,0,'automatic pass does not perform human approval');
+''')
+
+    def test_unchecked_checking_repairing_and_uncertain_keep_preview_but_block_approval(self):
+        self.run_dom(r'''
+for(const status of [null,'checking','repairing','needs_attention']){
+ const sync_check=status?{status,summary:'合成检查说明',attempts:2,max_attempts:2,checked_cues:2,total_cues:3,issues:[{start:6.56,end:8.9,reason:'字幕开始时间偏早'}]}:undefined;
+ const changed={...episode,postproduction:{...episode.postproduction,final_ready:false,subtitles:{...episode.postproduction.subtitles,sync_check}}};
+ const card=episodeCard(changed,0),preview=card.querySelector('.postproduction-final-preview'),report=card.querySelector('.subtitle-sync-report');
+ assert.ok(preview,'the same current export remains available');
+ assert.equal(preview.querySelector('video').src,'/media/exports/E1-v4.mp4');
+ assert.equal(card.querySelector('.final-approval'),null);
+ assert.ok(card.querySelector('.subtitle-sync-approval-blocked'));
+ if(status)assert.equal(report.querySelector('time').textContent,'00:06.6–00:08.9 · ');
+ assert.equal(preview.querySelectorAll('.postproduction-feedback').length,2,'the same feedback route remains usable');
+}
+assert.equal(actions.length,0);
+''')
+
+    def test_attention_navigation_does_not_restart_checks_or_production(self):
+        self.run_dom(r'''
+episode.postproduction.final_ready=false;
+episode.postproduction.subtitles.sync_check={status:'needs_attention',summary:'两轮后仍有疑点',attempts:2,max_attempts:2,issues:[{start:6,end:8,reason:'仍无法验证同步'}]};
+const card=episodeCard(episode,0),report=card.querySelector('.subtitle-sync-report');nodes.set(report.id,report);
+const locate=walk(card).find(node=>node.tag==='button'&&node.textContent==='查看字幕检查报告');
+assert.ok(locate);locate.listeners.click();assert.equal(report.open,true);assert.equal(report.scrolls.length,1);assert.equal(actions.length,0);
+paintPostproductionStatus(state);assert.equal(nodes.get('status').textContent,'字幕同步需要处理');assert.equal(nodes.get('run').textContent,'查看字幕检查报告');
+nodes.get('run').listeners.click();assert.equal(report.scrolls.length,2);assert.equal(actions.length,0);
+''')
+
+    def test_live_check_progress_is_distinct_and_no_final_gate_is_opened(self):
+        self.run_dom(r'''
+state.dashboard.running=true;
+for(const status of ['checking','repairing']){
+ episode.postproduction.subtitles.sync_check={status,summary:'当前检查说明'};
+ paintPostproductionStatus(state);
+ assert.ok(nodes.get('status').textContent.includes(status==='checking'?'检查字幕同步':'修复字幕同步'));
+ assert.equal(nodes.get('run').disabled,true);
+ const card=episodeCard(episode,0);assert.equal(card.querySelector('.final-approval'),null,'status itself also blocks a racing final_ready flag');
+}
+assert.equal(actions.length,0);
+''')
+
+    def test_manual_revision_can_be_previewed_with_uncertain_sync_without_approval(self):
+        self.run_dom(r'''
+episode.postproduction.manual_preview=true;episode.postproduction.final_ready=false;
+episode.postproduction.status='subtitle_sync_needs_attention';
+episode.postproduction.subtitles.sync_check={status:'needs_attention',summary:'手动时间已保留，独立证据仍有疑点',attempts:0,max_attempts:2,issues:[]};
+const card=episodeCard(episode,0),preview=card.querySelector('.postproduction-final-preview');
+assert.ok(preview);assert.equal(preview.querySelector('video').src,'/media/exports/E1-v4.mp4');
+assert.equal(preview.querySelector('.final-preview-title').textContent,'手动调整成片预览');
+assert.ok(preview.querySelector('.subtitle-sync-approval-blocked').textContent.includes('字幕检查仍有疑点'));
+assert.equal(card.querySelector('.final-approval'),null);assert.equal(actions.length,0);
+''')
+
+    def test_manual_adoption_is_final_human_verification_without_automatic_recheck_claim(self):
+        self.run_dom(r'''
+episode.postproduction.subtitles.sync_check={status:'manual',summary:'采用你输入的字幕文字和时间，不再自动复检。',attempts:2,max_attempts:2,checked_cues:3,total_cues:3,issues:[]};
+episode.postproduction.subtitles.previous_sync_check={status:'passed',summary:'调整前的自动检查记录',issues:[{start:6,end:8,reason:'调整前检查说明'}]};
+const card=episodeCard(episode,0),report=card.querySelector('.subtitle-sync-report'),history=report.querySelector('.subtitle-sync-history'),preview=card.querySelector('.postproduction-final-preview');
+assert.equal(report.children[0].textContent,'手动调整版 · 不再自动复检，请试看后最终确认');
+assert.ok(walk(report).some(node=>node.textContent.includes('不再调用识别、GPT 校对或同步复检')));
+assert.equal(walk(report).some(node=>node.textContent.includes('本轮已自动重新对齐')),false);
+assert.equal(walk(report).some(node=>node.textContent.includes('已检查 3 / 3')),false);
+assert.ok(history);assert.equal(Boolean(history.open),false);
+assert.ok(walk(history).some(node=>node.textContent.includes('不代表本次手动调整重新经过自动检查')));
+assert.ok(preview.querySelector('.final-approval'));assert.equal(actions.length,0);
+assert.equal(walk(preview).some(node=>node.textContent.includes('字幕自动检查通过')),false);
+paintPostproductionStatus(state);assert.ok(nodes.get('status-note').textContent.includes('不再自动复检'));
 ''')
 
 

@@ -90,10 +90,15 @@ def request(root, eid, version, target, feedback):
             pp["revision"] = pp.get("revision", 0) + 1
             pp["revision_target"] = target
             if target in {"subtitles", "all"}:
+                pp.pop("manual_subtitles", None)
                 pp["subtitle_feedback"] = feedback.strip()
                 pp["subtitle_feedback_source"] = copy.deepcopy(pp.get("subtitles", {}).get("segments"))
                 pp.pop("subtitle_key", None)
+                pp.pop("subtitle_proofread_key", None)
+                pp.get("subtitles", {}).pop("sync_check", None)
+                pp.get("subtitles", {}).pop("proofread_segments", None)
             if target in {"music", "all"}:
+                pp.pop("manual_music_plan", None)
                 pp["music_feedback"] = feedback.strip()
                 pp.pop("music_key", None)
             core.event(state, "postproduction_revision_requested", id=eid, target=target, feedback=feedback.strip())
@@ -170,6 +175,7 @@ def _caption_context(state, ep, feedback, previous=None):
     names = [a.get("name", "")[:30] for a in state["assets"] if a["id"] in used and a.get("kind") in {"character", "voice"}][:30]
     dialogue = "\n".join(sh.get("dialogue") or "" for sh in ep["shots"])
     context = {"names": names, "planned_dialogue_reference_only": dialogue[:3000], "feedback": feedback[:1500]}
+    context["script_text_policy"] = "字幕候选优先提取邻近分镜的剧本台词；实际音轨独立核验后才可使用。数字与原识别不符时不得凭剧本改写。"
     if feedback and isinstance(previous, list):
         # Prior corrections can inform spelling, never timing, cue count or order.
         text = "\n".join(s.get("text", "") for s in previous if isinstance(s, dict))[:2000]
@@ -181,16 +187,50 @@ def _caption_context(state, ep, feedback, previous=None):
 def _captions(root, ep, dry, brain_call, gate):
     from .connection import production_brain_config
     from .local_transcription import LocalTranscriber
+    from .local_alignment import LocalSubtitleVerifier
+    from .subtitle_sync import report_matches, run_sync
     state = gate(root)
     config = dict(state["settings"].get("subtitles", {}))
-    brain_config = production_brain_config(state["settings"]["brain"])
-    if brain_config.get("provider", "codex") != "codex" or brain_config.get("billing") != "subscription":
-        _wait(root, ep["id"], "configuration_required", missing_configuration=["字幕校对要求ChatGPT订阅连接；请在终端运行 nolan setup 选择订阅。"])
-        return None
+    pp = _episode(root, ep["id"]).get("postproduction", {})
+    manual = pp.get("manual_subtitles")
+    manual_mode = (isinstance(manual, dict) and manual.get("source_key") == pp.get("source_key")
+                   and type(manual.get("revision")) is int and manual["revision"] <= pp.get("revision", 0))
+    stored = pp.get("subtitles", {})
+    if manual_mode:
+        from .subtitle_sync import make_manual_report, caption_hash
+        if (not manual.get("submitted_at") or manual.get("submitted_caption_hash") != caption_hash(manual["segments"])):
+            raise core.GateError("手动字幕与明确保存的内容不一致，请在表格重新确认；没有自动复检或采用改动。")
+        evidence = media.extract_evidence(dry, Path(root) / "evidence" / ("post-audio-" + pp["source_key"][:16]))
+        if not evidence.get("audio"):
+            raise core.GateError("锁定粗剪没有音轨，无法合成字幕；原视频已保留")
+        audio = Path(evidence["audio"])
+        corrected, audio_hash = copy.deepcopy(manual["segments"]), core.digest(audio)
+        report = make_manual_report(corrected, audio_sha256=audio_hash, source_key=pp["source_key"],
+                                    revision=manual["revision"], manual_record_hash=_hash(manual))
+        _save(root, ep["id"], subtitle_key=_hash({"manual": manual, "audio": audio_hash}),
+            subtitles={"status": "manual", "engine": "用户手动调整（不再自动复检）", "segments": corrected,
+                "audio_sha256": audio_hash, "audio_file": _rel(root, audio), "sync_check": report,
+                "previous_sync_check": copy.deepcopy(stored.get("previous_sync_check")),
+                "note": "采用你填写的文字和时间，只重新合成供试看；未运行自动同步检查。"})
+        return corrected
+    if pp.get("revision_target") == "manual_music":
+        if (isinstance(stored.get("segments"), list) and stored.get("audio_file") and stored.get("audio_sha256")
+                and core.digest(core.safe_path(root, stored["audio_file"])) == stored["audio_sha256"]):
+            return stored["segments"]
+        raise core.GateError("原字幕音轨记录已变化，请先恢复当前字幕；没有重新识别或检查。")
+    if not manual_mode:
+        brain_config = production_brain_config(state["settings"]["brain"])
+        if brain_config.get("provider", "codex") != "codex" or brain_config.get("billing") != "subscription":
+            _wait(root, ep["id"], "configuration_required", missing_configuration=["字幕校对要求ChatGPT订阅连接；请在终端运行 nolan setup 选择订阅。"])
+            return None
     try:
-        transcriber = LocalTranscriber(config, cache_dir=Path(root) / "cache" / "local-asr",
-                                      cancel_check=lambda: core.load_project(root)["paused"])
-        transcriber.check_ready()
+        if not manual_mode:
+            transcriber = LocalTranscriber(config, cache_dir=Path(root) / "cache" / "local-asr",
+                                          cancel_check=lambda: core.load_project(root)["paused"])
+            transcriber.check_ready()
+        verifier = LocalSubtitleVerifier(config, cache_dir=Path(root) / "cache" / "subtitle-sync",
+                                        cancel_check=lambda: core.load_project(root)["paused"])
+        verifier.check_ready()
     except Exception as exc:
         _wait(root, ep["id"], "configuration_required", missing_configuration=[str(exc)])
         return None
@@ -200,29 +240,67 @@ def _captions(root, ep, dry, brain_call, gate):
     if not evidence.get("audio"):
         raise core.GateError("锁定粗剪没有音轨，无法识别实际对白；原视频已保留")
     audio = Path(evidence["audio"])
+    audio_hash = core.digest(audio)
     _save(root, ep["id"], status="recognizing")
     raw = transcriber.transcribe(audio)
     if not raw and any((sh.get("dialogue") or "").strip() for sh in ep["shots"]):
         raise core.GateError("本集计划含对白，但本地识别结果为空；请检查原声音轨或本地模型。不会把剧本冒充字幕。")
     # Only current audio-derived timings are authoritative. A rework must never
     # feed stale subtitle_feedback_source timestamps back into text proofreading.
-    key = _hash({"source": pp["source_key"], "raw": raw, "context": context, "policy": 2})
-    # Registered results are immutable and safe to reuse on restarts.
+    from .subtitle_script import prefer_script
+    candidates, script_selection = prefer_script(raw, ep)
+    key = _hash({"source": pp["source_key"], "raw": raw, "candidates": candidates, "context": context, "policy": 3})
     current = _episode(root, ep["id"]).get("postproduction", {})
-    if current.get("subtitle_key") == key and current.get("subtitles", {}).get("status") == "ready":
-        return current["subtitles"]["segments"]
-    _save(root, ep["id"], status="proofreading", subtitles={"status": "proofreading", "engine": "whisper.cpp + GPT订阅校对", "segments": raw})
-    corrected = []
-    for offset in range(0, len(raw), 60):
+    stored = current.get("subtitles", {})
+    same_proofreading = (current.get("subtitle_proofread_key") == key
+                         or current.get("subtitle_key") == key)  # 0.6.4 text cache migration
+    if (same_proofreading and stored.get("status") == "ready"
+            and stored.get("sync_check", {}).get("checker_identity") == verifier.identity
+            and report_matches(stored.get("sync_check"), stored.get("segments"),
+                               audio_sha256=audio_hash, source_key=pp["source_key"])):
+        return stored["segments"]
+    # A repair changes time locally, not GPT wording. Keep already proofread
+    # text and bounded repair progress on restart rather than spending again.
+    if same_proofreading and isinstance(stored.get("segments"), list):
+        corrected = copy.deepcopy(stored["segments"])
+        previous_report = copy.deepcopy(stored.get("sync_check"))
+    else:
+        corrected, previous_report = [], None
+        _save(root, ep["id"], status="proofreading", subtitles={"status": "proofreading",
+              "engine": "Whisper 本地识别 + GPT订阅文字校对 + 独立中文声学同步检查", "segments": raw})
+        for offset in range(0, len(candidates), 60):
+            gate(root)
+            batch = candidates[offset:offset + 60]
+            corrected.extend(brain_call(root, "proofread_subtitles", batch, context,
+                _cache_key=_hash({"method": "proofread_subtitles", "batch": batch, "context": context, "policy": 3})))
+    base = {"engine": "Whisper 本地识别 + GPT订阅文字校对 + 独立中文声学同步检查",
+        "raw_segments": raw, "script_selection": script_selection, "audio_sha256": audio_hash, "audio_file": _rel(root, audio), "asr_metadata": transcriber.last_metadata,
+        "proofread_segments": copy.deepcopy(stored.get("proofread_segments", corrected)) if same_proofreading else copy.deepcopy(corrected),
+        "note": "本地独立声学模型检查同步，异常自动重对齐后复检；GPT仅校对文字，未听音频。机器通过后仍需人工最终听审。"}
+
+    def progress(report, candidates):
         gate(root)
-        batch = raw[offset:offset + 60]
-        corrected.extend(brain_call(root, "proofread_subtitles", batch, context,
-            _cache_key=_hash({"method": "proofread_subtitles", "batch": batch, "context": context, "policy": 2})))
-    _save(root, ep["id"], subtitle_key=key, subtitles={"status": "ready", "engine": "whisper.cpp + GPT订阅校对",
-        "segments": corrected, "raw_segments": raw, "audio_sha256": core.digest(audio),
-        "asr_metadata": transcriber.last_metadata,
-        "note": "按实际人声位置识别并对齐；GPT仅校对文字，未听音频。最终请审听整集。"})
-    return corrected
+        phase = "repairing_subtitle_sync" if report.get("status") == "repairing" else "checking_subtitle_sync"
+        _save(root, ep["id"], status=phase, subtitle_proofread_key=key,
+              subtitles={**base, "status": report.get("status", "checking"),
+                         "segments": candidates, "sync_check": report,
+                         "sync_metadata": verifier.last_metadata})
+
+    checked, report = run_sync(corrected, verify=lambda cues: verifier.verify(audio, cues),
+        repair=verifier.repair, previous_report=previous_report, on_progress=progress,
+        audio_sha256=audio_hash, source_key=pp["source_key"], checker_identity=verifier.identity,
+        duration=media.probe(audio)["duration"])
+    passed = report_matches(report, checked, audio_sha256=audio_hash, source_key=pp["source_key"])
+    subtitles = {**base, "status": "ready" if passed else "needs_attention", "segments": checked,
+                 "sync_check": report, "sync_metadata": verifier.last_metadata}
+    _save(root, ep["id"], subtitle_proofread_key=key,
+          subtitle_key=_hash({"proofread_key": key, "segments": checked, "sync_check": report}), subtitles=subtitles)
+    if not passed:
+        _wait(root, ep["id"], "subtitle_sync_needs_attention", subtitles=subtitles)
+        if pp.get("revision_target") == "manual_music":
+            return checked
+        return None
+    return checked
 
 
 def _music(root, ep, duration, captions, brain_call, gate, soundtrack):
@@ -230,10 +308,29 @@ def _music(root, ep, duration, captions, brain_call, gate, soundtrack):
     state = gate(root)
     pp = _episode(root, ep["id"]).get("postproduction", {})
     music = pp.get("music", {})
+    manual = pp.get("manual_music_plan")
+    if (isinstance(manual, dict) and manual.get("source_key") == pp.get("source_key")
+            and type(manual.get("revision")) is int and manual["revision"] <= pp.get("revision", 0)):
+        if (not manual.get("submitted_at") or manual.get("submitted_plan_hash") != _hash(
+                {"summary": manual.get("summary"), "cues": manual.get("cues")})):
+            raise core.GateError("手动配乐与明确保存的内容不一致，请在表格重新确认；没有自动编排或采用改动。")
+        validated = library_api.validate_cue_plan(manual, state["music_library"], duration, project=root)
+        key = _hash({"manual_plan": validated, "source_key": pp["source_key"], "policy": 1})
+        if pp.get("music_key") == key and music.get("status") == "ready":
+            bed = core.safe_path(root, music["file"])
+            if core.digest(bed) == music["sha256"] and music.get("fingerprint") == validated["fingerprint"]:
+                return bed
+        _save(root, ep["id"], status="mixing_manual_music")
+        out = Path(root) / "exports" / f"{ep['id']}-music-{key[:16]}.wav"
+        result = library_api.render_music_bed(validated, state["music_library"], duration, out, project=root)
+        _save(root, ep["id"], music_key=key, music={"status": "ready", "can_generate": False,
+            "summary": validated["summary"], "cues": validated["cues"], "file": _rel(root, out),
+            "sha256": result["sha256"], "duration": duration, "fingerprint": result["fingerprint"], "manual": True})
+        return out
     # A subtitle-only request keeps the existing approved arrangement, including
     # when unrelated new tracks await audition. Validate its exact source bytes
     # before any catalog scan or candidate gate can replace the current record.
-    if (pp.get("revision_target") == "subtitles" and pp.get("music_key")
+    if (pp.get("revision_target") in {"subtitles", "manual_subtitles"} and pp.get("music_key")
             and music.get("status") == "ready"):
         try:
             bed = core.safe_path(root, music["file"])
@@ -358,8 +455,19 @@ def _finish(root, ep, *, brain_call, gate, soundtrack):
     source = [{"id": sh["id"], "version": sh["version"], "sha256": sh["sha256"]} for sh in ep["shots"]]
     source_key = _hash(source)
     pp = ep.get("postproduction", {})
+    if (pp.get("revision_target") in {"manual_music", "manual_subtitles"}
+            and pp.get("source_key") != source_key):
+        raise core.GateError("本集源片段已变化，请先更新后期，再编辑当前版本。")
+    if ep.get("file") and not any(
+            old.get("file") == ep["file"] and old.get("version") == ep["version"]
+            and old.get("sha256") == ep.get("sha256") for old in ep.get("history", [])):
+        # A legacy export can enter the new machine check via Continue without
+        # an explicit rework request. Preserve its complete export provenance.
+        with core.transaction(root) as current:
+            _retire(core._find(current, "episode", ep["id"]))
     if pp.get("source_key") != source_key:
-        _save(root, ep["id"], subtitle_key=None, music_key=None, subtitle_feedback_source=None, subtitles={}, music={},
+        _save(root, ep["id"], subtitle_key=None, subtitle_proofread_key=None, music_key=None, subtitle_feedback_source=None,
+              manual_music_plan=None, manual_subtitles=None, subtitles={}, music={},
               source_key=source_key, source_manifest=source)
     _save(root, ep["id"], enabled=True, ready=True, final_ready=False, error=None,
           status="assembling", missing_configuration=[], revision=pp.get("revision", 0))
@@ -399,12 +507,19 @@ def _finish(root, ep, *, brain_call, gate, soundtrack):
         if source != [{"id": sh["id"], "version": sh["version"], "sha256": sh["sha256"]} for sh in current["shots"]] or any(not core.human_approved_shot(sh) for sh in current["shots"]):
             raise core.GateError("本集片段已变更，保留此次导出，需重新生成后期")
         pp = current["postproduction"]
-        pp.update(status="awaiting_final_approval", final_ready=True, final_file=_rel(root, out),
+        from .subtitle_sync import report_matches, manual_report_matches
+        sync_passed = (report_matches(pp["subtitles"]["sync_check"], captions,
+            audio_sha256=pp["subtitles"]["audio_sha256"], source_key=source_key)
+            or manual_report_matches(pp["subtitles"]["sync_check"], captions,
+                audio_sha256=pp["subtitles"]["audio_sha256"], source_key=source_key))
+        pp.update(status="awaiting_final_approval" if sync_passed else "subtitle_sync_needs_attention",
+                  manual_preview=not sync_passed, final_ready=True, final_file=_rel(root, out),
                   final_sha256=core.digest(out), final_version=version, missing_configuration=[])
         pp["music"].update(credits_file=_rel(root, credits["file"]), credits_sha256=credits["sha256"])
         pp["subtitles"]["file"] = _rel(root, result["subtitles"]) if result.get("subtitles") else None
         current.update(version=version, file=_rel(root, out), sha256=core.digest(out),
-            status="awaiting_review", duration=result["duration"], subtitle_status="local_asr_subscription_proofread",
+            status="awaiting_review", duration=result["duration"],
+            subtitle_status="manual_adopted" if pp["subtitles"]["sync_check"].get("status") == "manual" else "local_asr_subscription_proofread",
             subtitle_file=pp["subtitles"]["file"], subtitles_burned=result.get("burned_subtitles", False),
             music_status="approved_library_mixed", render_warnings=result.get("warnings", []),
             review_note="请完整观看带字幕配乐的本集，审批对白字幕、音乐音量与衔接；GPT未替代人工听审。",
@@ -414,22 +529,39 @@ def _finish(root, ep, *, brain_call, gate, soundtrack):
                     "music_key": pp["music_key"], "music_sha256": pp["music"]["sha256"],
                     "music_fingerprint": pp["music"]["fingerprint"],
                     "subtitle_content_hash": _hash(captions),
+                    "subtitle_sync_hash": _hash(pp["subtitles"]["sync_check"]),
                     "credits_sha256": credits["sha256"],
                     "srt_sha256": core.digest(result["subtitles"]) if result.get("subtitles") else None,
                     "revision": pp.get("revision", 0)}})
-        state.update(status="awaiting_episode_review", last_error=None)
+        state.update(status="awaiting_episode_review" if sync_passed else "awaiting_postproduction", last_error=None)
     return True
 
 
 def check_final(root, state, ep):
     """Reject a stale subtitle, mix, cue plan or final-version approval."""
     from .music_library import validate_cue_plan
+    from .subtitle_sync import report_matches, manual_report_matches
     pp = ep.get("postproduction", {})
     manifest = ep.get("render_manifest", {}).get("postproduction", {})
     source = [{"id": sh["id"], "version": sh["version"], "sha256": sh["sha256"]} for sh in ep["shots"]]
+    sub = pp.get("subtitles", {})
+    report = sub.get("sync_check", {})
+    manual_valid = (manual_report_matches(report, sub.get("segments"),
+                    audio_sha256=sub.get("audio_sha256"), source_key=_hash(source))
+                    and isinstance(pp.get("manual_subtitles"), dict)
+                    and report.get("manual_record_hash") == _hash(pp["manual_subtitles"])
+                    and pp["manual_subtitles"].get("submitted_at")
+                    and pp["manual_subtitles"].get("submitted_caption_hash") == report.get("caption_hash")
+                    and pp["manual_subtitles"].get("segments") == sub.get("segments"))
+    if report.get("status") != "passed" and not manual_valid:
+        raise core.GateError("字幕同步自动检查尚未通过，暂不能最终批准；请查看本集字幕检查报告。")
+    if ((not report_matches(report, sub.get("segments"), audio_sha256=sub.get("audio_sha256"), source_key=_hash(source)) and not manual_valid)
+            or not sub.get("audio_sha256") or manifest.get("subtitle_sync_hash") != _hash(report)
+            or not sub.get("audio_file") or core.digest(core.safe_path(root, sub["audio_file"])) != sub["audio_sha256"]):
+        raise core.GateError("字幕同步检查记录与当前音轨或字幕不一致，请重新检查后再批准。")
     if not pp.get("final_ready") or pp.get("final_sha256") != ep.get("sha256") or pp.get("final_version") != ep["version"]:
         raise core.GateError("本集后期尚未完成或导出版本已变化")
-    if (pp.get("subtitles", {}).get("status") != "ready" or pp.get("music", {}).get("status") != "ready"
+    if (pp.get("subtitles", {}).get("status") not in {"ready", "manual"} or pp.get("music", {}).get("status") != "ready"
             or not pp.get("music", {}).get("cues")):
         raise core.GateError("本集字幕或音乐编排尚未就绪")
     if (manifest.get("source_key") != _hash(source) or manifest.get("subtitle_key") != pp.get("subtitle_key")

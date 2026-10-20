@@ -4,6 +4,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import mimetypes
 import re
 import secrets
@@ -19,9 +20,11 @@ from .regroup import PUBLIC_ERRORS as SEGMENT_ERRORS
 
 
 MAX_BODY = 32_768
+MAX_POST_EDIT_BODY = 1_048_576
 MAX_REFERENCE_BODY = 12 * 1024 * 1024
 MAX_MUSIC_BODY = 42 * 1024 * 1024
 INPUT_ERRORS = frozenset({
+    "手动调整只在本地合成；请先完成缺失的自动后期或音乐确认，没有调用模型。",
     "这张参考图片已经上传，无需重复添加。",
     "每项资产最多上传 9 张参考图片。",
     "参考图片每张不能超过 8 MiB。",
@@ -55,6 +58,15 @@ INPUT_ERRORS = frozenset({
     "未找到火山音乐AK/SK；方舟API Key不能代替。可在本机配置，或导入本地音乐。",
     "已有音乐生成请求，请继续原任务，不能重复提交",
     "原音乐任务未结清，请恢复或核实原任务，不能再次提交",
+    "字幕同步自动检查尚未通过，暂不能最终批准；请查看本集字幕检查报告。",
+    "字幕同步检查记录与当前音轨或字幕不一致，请重新检查后再批准。",
+    "后期编辑版本已变化，请刷新后重新检查当前条目。",
+    "先逐段批准本集视频，再手动调整本集字幕或配乐。",
+    "本集源片段已变化，请先更新后期，再编辑当前版本。",
+    "已有制作任务运行中，请勿重复启动",
+    "手动字幕与明确保存的内容不一致，请在表格重新确认；没有自动复检或采用改动。",
+    "手动配乐与明确保存的内容不一致，请在表格重新确认；没有自动编排或采用改动。",
+    "原字幕音轨记录已变化，请先恢复当前字幕；没有重新识别或检查。",
 })
 MUSIC_INPUT_ERRORS = frozenset({
     "音乐资产 ID 无效。", "音乐版本号无效。", "音乐库格式无效。", "音乐资产格式无效。",
@@ -774,6 +786,47 @@ def _public_music_library(state: dict) -> dict:
     return result
 
 
+def _public_subtitle_sync_report(report, *, current=None):
+    """Publish bounded current or historical diagnostics, never internal evidence."""
+    if not isinstance(report, dict):
+        return None
+    from .failures import sanitize_failure
+    # Diagnostics are a bounded editorial summary. Hashes, cache
+    # paths, model output and verification internals stay local.
+    status = report.get("status")
+    status = status if status in {"checking", "repairing", "passed", "manual", "needs_attention"} else "needs_attention"
+    summary = report.get("summary")
+    summary = sanitize_failure({"message": summary[:1200]})["message"] if isinstance(summary, str) and summary else "字幕同步检查尚未完成。"
+    if status in {"passed", "manual"} and current is False:
+        status, summary = "needs_attention", ("手动调整记录与当前音轨或字幕不一致，请重新保存当前调整。" if status == "manual" else "字幕同步检查记录与当前音轨或字幕不一致，需要重新检查。")
+    safe_report = {"status": status, "summary": summary, "issues": []}
+    for key, maximum in (("attempts", 2), ("max_attempts", 2), ("checked_cues", 10000), ("total_cues", 10000)):
+        count = report.get(key)
+        if status != "manual" and type(count) is int and 0 <= count <= maximum:
+            safe_report[key] = count
+    issues = report.get("issues", [])
+    for issue in issues[:200] if isinstance(issues, list) else []:
+        if not isinstance(issue, dict):
+            continue
+        safe_issue = {}
+        start, end = issue.get("start"), issue.get("end")
+        if (type(start) in {int, float} and type(end) in {int, float}
+                and 0 <= start < end <= 3600):
+            safe_issue.update(start=round(start, 3), end=round(end, 3))
+        index = issue.get("cue_index")
+        if type(index) is int and 0 <= index < 10000:
+            safe_issue["cue_index"] = index
+        reason = issue.get("reason")
+        if isinstance(reason, str) and reason:
+            safe_issue["reason"] = sanitize_failure({"message": reason[:1200]})["message"]
+        code = issue.get("code")
+        if isinstance(code, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", code):
+            safe_issue["code"] = code
+        if safe_issue:
+            safe_report["issues"].append(safe_issue)
+    return safe_report
+
+
 def _public_postproduction(state: dict, episode: dict) -> dict:
     """Only the editing plan and bounded human-facing diagnostics reach the page."""
     from .failures import sanitize_failure
@@ -781,11 +834,14 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
     if not isinstance(value, dict):
         value = {}
     result = _pick(value, ("enabled", "status", "revision", "ready", "final_ready", "rough_file", "dry_file", "feedback"))
+    if type(value.get("duration")) in {int, float} and math.isfinite(value["duration"]) and 0 < value["duration"] <= 3600:
+        result["duration"] = value["duration"]
     from .core import human_approved_shot
     result["enabled"] = state.get("settings", {}).get("postproduction", {}).get("enabled") is True
     library_mode = state.get("settings", {}).get("music", {}).get("mode") == "library"
     shots = episode.get("shots", [])
     result["ready"] = bool(shots) and all(human_approved_shot(shot) for shot in shots)
+    result["manual_preview"] = value.get("manual_preview") is True
     # A previous export may remain on the episode during postproduction rework.
     # Publish a final preview only when its saved identity is the current export,
     # rather than letting the UI fall back to the dry cut or a retired version.
@@ -796,15 +852,25 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
                      and not Path(final_file).is_absolute() and ".." not in Path(final_file).parts
                      and "\\" not in final_file
                      and Path(final_file).suffix.lower() in {".mp4", ".m4v", ".mov", ".webm"})
-    result["final_ready"] = bool(result["enabled"] and result["ready"]
+    result["final_available"] = bool(result["enabled"] and result["ready"]
         and value.get("final_ready") is True
-        and value.get("status") in {"awaiting_final_approval", "approved"}
+        and (value.get("status") in {"awaiting_final_approval", "approved"}
+             or (result["manual_preview"] and value.get("status") == "subtitle_sync_needs_attention"))
         and episode.get("status") in {"awaiting_review", "approved"}
         and final_path_ok and final_file == episode.get("file")
         and type(final_version) is int and final_version > 0
         and type(episode.get("version")) is int and final_version == episode["version"]
         and _valid_sha(final_sha256) and final_sha256 == episode.get("sha256"))
-    if result["final_ready"]:
+    from .subtitle_sync import manual_report_matches, report_matches
+    subtitles = value.get("subtitles", {})
+    subtitles = subtitles if isinstance(subtitles, dict) else {}
+    sync_current = bool(_valid_sha(subtitles.get("audio_sha256")) and _valid_sha(value.get("source_key"))
+        and (report_matches(subtitles.get("sync_check"), subtitles.get("segments", []),
+                            audio_sha256=subtitles["audio_sha256"], source_key=value["source_key"])
+             or manual_report_matches(subtitles.get("sync_check"), subtitles.get("segments", []),
+                                      audio_sha256=subtitles["audio_sha256"], source_key=value["source_key"])))
+    result["final_ready"] = result["final_available"] and sync_current
+    if result["final_available"]:
         result.update(final_file=final_file, final_version=final_version, final_sha256=final_sha256)
     result["missing_configuration"] = [sanitize_failure({"message": text})["message"] for text in value.get("missing_configuration", [])
                                         if isinstance(text, str) and len(text) <= 1000][:20]
@@ -820,6 +886,15 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
     for section in ("subtitles", "music"):
         source = value.get(section, {})
         source = source if isinstance(source, dict) else {}
+        pending = value.get("manual_music_plan" if section == "music" else "manual_subtitles")
+        if (isinstance(pending, dict) and _valid_sha(value.get("source_key"))
+                and pending.get("source_key") == value["source_key"]
+                and type(pending.get("revision")) is int
+                and pending["revision"] == value.get("revision", 0)):
+            # The save response already has a new revision. Present those saved
+            # rows while the local preview is rendering, never the old table.
+            editable = ("cues", "summary") if section == "music" else ("segments",)
+            source = {**source, **_pick(pending, editable)}
         item = _pick(source, ("status", "file", "engine", "summary", "feedback", "can_generate", "credits_file"))
         if source.get("error"):
             item["error"] = sanitize_failure({"message": str(source["error"])})["message"]
@@ -827,6 +902,11 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
             segments = source.get("segments", source.get("cues", []))
             item["segments"] = [_pick(cue, ("start", "end", "text")) for cue in segments
                                 if isinstance(cue, dict)][:2000] if isinstance(segments, list) else []
+            for report_key in ("sync_check", "previous_sync_check"):
+                report = _public_subtitle_sync_report(source.get(report_key),
+                    current=sync_current if report_key == "sync_check" else None)
+                if report is not None:
+                    item[report_key] = report
         else:
             item["cues"] = [_pick(cue, ("track_id", "start", "end", "source_start", "gain_db", "fade_in", "fade_out", "reason"))
                             for cue in source.get("cues", []) if isinstance(cue, dict)][:500]
@@ -1294,7 +1374,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._host_ok():
             return self._error(403, "仅允许本机访问。")
         path = urlsplit(self.path).path
-        if path not in {"/api/action", "/api/asset-reference", "/api/music-upload"}:
+        if path not in {"/api/action", "/api/post-edit", "/api/asset-reference", "/api/music-upload"}:
             return self._error(404, "未找到此操作。")
         context = self.server.context
         if not secrets.compare_digest(self.headers.get("X-Norlan-Token", "").encode("utf-8"), context.token.encode("ascii")):
@@ -1310,7 +1390,9 @@ class _Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             return self._error(400, "请求长度无效。")
-        limit = MAX_REFERENCE_BODY if path == "/api/asset-reference" else MAX_MUSIC_BODY if path == "/api/music-upload" else MAX_BODY
+        limit = (MAX_REFERENCE_BODY if path == "/api/asset-reference" else
+                 MAX_MUSIC_BODY if path == "/api/music-upload" else
+                 MAX_POST_EDIT_BODY if path == "/api/post-edit" else MAX_BODY)
         if length <= 0 or length > limit:
             return self._error(413, "请求过大或为空。")
         try:
@@ -1318,7 +1400,45 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 raise ValueError
             action = data.get("action")
+            if path == "/api/post-edit" and action != "edit_postproduction":
+                return self._error(409, "此接口只接受字幕或配乐表格编辑。")
             with context.mutation_lock:
+                if path == "/api/post-edit" and action == "edit_postproduction":
+                    if context.running or context.external_run_active():
+                        return self._error(409, "制作正在进行，请等待当前任务结束后再调整后期。")
+                    item_id, version, revision, section, edits = (data.get(key) for key in ("id", "version", "revision", "section", "edits"))
+                    valid = (set(data) == {"action", "id", "version", "revision", "section", "edits"}
+                        and isinstance(item_id, str) and 0 < len(item_id) <= 128
+                        and type(version) is int and version >= 0 and type(revision) is int and revision >= 0
+                        and isinstance(section, str) and section in {"music", "subtitles"} and isinstance(edits, list)
+                        and 0 < len(edits) <= (500 if section == "music" else 2000))
+                    if valid:
+                        expected = {"index", "start", "end", "gain_db" if section == "music" else "text"}
+                        for index, row in enumerate(edits):
+                            if (not isinstance(row, dict) or set(row) != expected
+                                    or type(row.get("index")) is not int or row["index"] != index
+                                    or any(type(row.get(key)) not in {int, float} or not math.isfinite(row[key]) for key in ("start", "end"))
+                                    or not 0 <= row["start"] < row["end"] <= 3600):
+                                valid = False
+                                break
+                            if section == "music":
+                                gain = row.get("gain_db")
+                                valid = type(gain) in {int, float} and math.isfinite(gain) and -60 <= gain <= 0
+                            else:
+                                text = row.get("text")
+                                valid = isinstance(text, str) and bool(text.strip()) and len(text) <= 4000 and "\x00" not in text
+                            if not valid:
+                                break
+                    if not valid:
+                        return self._error(409, "后期编辑数据无效，请检查每行的文字、时间和音量后重试。")
+                    from .post_edits import EditError, apply_edits
+                    try:
+                        apply_edits(context.project_dir, item_id, version, revision, section, edits)
+                    except EditError as exc:
+                        from .failures import sanitize_failure
+                        return self._error(409, sanitize_failure({"message": str(exc)})["message"])
+                    context.launch()
+                    return self._json(200, context.state())
                 if path == "/api/action" and action == "music_folder_scan":
                     if context.running or context.external_run_active():
                         return self._error(409, "制作正在进行，请等待当前任务结束后再扫描音乐文件夹。")
