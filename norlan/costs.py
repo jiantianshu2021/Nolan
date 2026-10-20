@@ -87,12 +87,29 @@ def sync_usage(root, confirm_no_video_input=False):
     return summary
 
 
+def cost_summary(state):
+    """Public cost totals; historical budget ceilings are never active controls."""
+    currency = state.get("budget", {}).get("currency", "CNY")
+    jobs = state.get("jobs", {})
+    result = {"currency": currency, **summarize_costs(jobs, currency)}
+    entries = [job for job in jobs.values() if isinstance(job, Mapping)]
+    result["unknown_jobs"] = sum(
+        job.get("accounting") == "unknown" or job.get("state") == "uncertain"
+        for job in entries)
+    result["inflight_jobs"] = sum(
+        job.get("accounting") != "unknown" and job.get("state") != "uncertain"
+        and (job.get("accounting") == "reserved"
+             or job.get("state") in {"submitting", "submitted", "download_pending"})
+        for job in entries)
+    return result
+
+
 def cost_report(root):
     """Return only bounded accounting metadata, not prompts, keys or responses."""
     state = core.load_project(root)
     currency = state["budget"]["currency"]
-    budget = {key: state["budget"].get(key) for key in ("currency", "limit", "spent", "reserved", "unknown", "available")}
-    budget.update(summarize_costs(state["jobs"], currency))
+    # Retain the JSON container name for existing clients, not budget controls.
+    budget = cost_summary(state)
     calls = []
     for job_id, job in state["jobs"].items():
         billing = job.get("billing")
@@ -103,7 +120,7 @@ def cost_report(root):
         calls.append({"job_id": _identifier(job_id), "kind": _identifier(job.get("kind")),
                       "item_id": _identifier(job.get("item_id")), "task_id": _identifier(job.get("task_id")),
                       "accounting": _identifier(job.get("accounting")), "state": _identifier(job.get("state")),
-                      "budget_cap": _number(job.get("amount")), "currency": currency,
+                      "currency": currency,
                       "actual_cost": single["actual_cost"], "bill_verified": single["actual_cost_jobs"] > 0,
                       "usage_cost": single["usage_cost"], "usage": _usage(billing.get("usage")),
                       "usage_status": _identifier(billing.get("status")), "model": _identifier(billing.get("model")),
@@ -111,12 +128,10 @@ def cost_report(root):
                       "historical_public_price": bool(price.get("historical_lookup"))})
     return {"budget": budget, "calls": calls,
             "basis": {"actual_cost": "逐调用账单核实的实际费用；没有账单依据时显示待对账。",
-                      "usage_cost": "供应商实际用量 × 锁定公开单价，未核对账单，不含折扣、赠额等调整，不等于账户扣款。",
-                      "budget_cap": "保守预算占用上限，用于拦截后续支出，不代表实际费用。"}}
+                      "usage_cost": "供应商实际用量 × 锁定公开单价，未核对账单，不含折扣、赠额等调整，不等于账户扣款。"}}
 
 
 def _money(value, currency, missing="待对账"):
-    # Remaining budget may legitimately be negative after a larger real bill.
     number = value if not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) else None
     return f"{number:.6f}".rstrip("0").rstrip(".") + " " + currency if number is not None else missing
 
@@ -124,22 +139,16 @@ def _money(value, currency, missing="待对账"):
 def format_report(report):
     budget = report["budget"]
     currency = budget["currency"]
-    exposure = sum(budget.get(key, 0) for key in ("spent", "reserved", "unknown"))
     rows = ["Nolan · 费用明细",
             "已核对实际费用：" + _money(budget["actual_cost"], currency)
             + f"（{budget['actual_cost_jobs']} / {budget['cost_jobs']} 次调用已核对）",
             "按实际用量计费（未对账）：" + _money(budget["usage_cost"], currency, "暂无可计费用量")
             + f"；未核实调用 {budget['cost_pending_jobs']} 次",
-            "预算占用上限：" + _money(exposure, currency)
-            + "；在途预留：" + _money(budget["reserved"], currency)
-            + "；结果待核实：" + _money(budget["unknown"], currency),
-            "剩余预算：" + _money(budget["available"], currency)
-            + "；项目上限：" + _money(budget["limit"], currency), ""]
+            f"进行中调用：{budget.get('inflight_jobs', 0)} 次；结果待核实调用：{budget.get('unknown_jobs', 0)} 次", ""]
     for call in report["calls"]:
         rows.append(f"{call['job_id']} · {call['kind']} · {call['item_id']} · {call['accounting']}")
         rows.append("  核实费用 " + _money(call["actual_cost"], currency)
-                    + " / 用量计费 " + _money(call["usage_cost"], currency, "—")
-                    + " / 调用预算上限 " + _money(call["budget_cap"], currency))
+                    + " / 用量计费 " + _money(call["usage_cost"], currency, "—"))
         if call["task_id"]:
             rows.append("  任务 ID " + call["task_id"])
         if call["historical_public_price"]:

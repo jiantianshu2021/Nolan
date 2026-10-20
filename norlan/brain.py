@@ -191,10 +191,9 @@ REVISION_SCHEMA = _object({
 REVIEW_SCHEMA = _object({"verdict": {"type": "string", "enum": ["pass", "fail", "uncertain"]},
                          "issues": _array(STRING, maxItems=30), "observed_end_state": STRING, "repair_prompt": STRING})
 COMMAND_SCHEMA = _object({
-    "action": {"type": "string", "enum": ["status", "run", "approve", "reject", "pause", "resume", "preview", "budget", "captions", "help", "answer"]},
+    "action": {"type": "string", "enum": ["status", "run", "approve", "reject", "pause", "resume", "preview", "captions", "help", "answer"]},
     "kind": {"type": "string", "enum": ["plan", "asset", "episode", "shot", "none"]},
     "id": STRING, "feedback": STRING, "shot_ids": _array(STRING, maxItems=100),
-    "limit": {"anyOf": [{"type": "number", "minimum": 0, "maximum": 10000000}, {"type": "null"}]},
     "reply": STRING})
 CAPTION_SCHEMA = _object({"segments": _array(_object({"start": {"type": "number", "minimum": 0},
                                                        "end": {"type": "number", "minimum": 0}, "text": STRING}), maxItems=5000)})
@@ -684,7 +683,7 @@ class Brain:
         if not math.isfinite(self.timeout) or not 1 <= self.timeout <= 1800:
             raise BrainError("GPT 超时须为 1–1800 秒。")
         self.last_usage: dict = {}
-        # The runner reserves its budget only after local validation, directly
+        # The runner records the call only after local validation, directly
         # before the transport can submit a model request.
         self.before_submit = None
 
@@ -1157,7 +1156,7 @@ context 是当前项目状态和最近展示的候选项，仅用于消歧，不
 approve 仅用于用户明确说同意/批准/通过，并能唯一确定当前待审对象；“好看”“不错”“继续说”不是批准。
 不支持批量批准、预先批准后续集、跳过审查。缺少对象、版本不明或多项待审时 action=answer，reply 请求明确对象。
 reject 用于明确要求返工/修改，对象必须能确定，feedback 保留用户原意，shot_ids 仅填明确指向的有效镜头 ID。
-budget 仅在用户明确设置总预算上限且给出金额时使用，limit 是该数字；查询预算用 status；其他情况 limit=null。
+查看费用用 status。预算设置和额度限制已取消；遇到设置预算的要求用 answer 说明，无需设置或确认预算。
 用户明确要求修正某集字幕文字/错别字、字幕提前/滞后/出现时间对不上声音、重新对齐或重新校对字幕时，使用 captions，kind=episode，id 为该集，feedback 保留完整原意见（包括条目位置、用户指出的时间点和顺延要求）。
 本集后期的字幕返修由本地实际音频重新识别与对齐，再由 GPT 校对文字；不能把时间问题只归为文字改错，也不重生成视频或人声。不声称 GPT 已听过音轨或已按秒数修好字幕。
 如果用户要求修改角色实际说出的对白或配音，用 reject；无法分辨字幕改字还是重说对白时，用 answer 请用户明确。
@@ -1279,7 +1278,7 @@ accepted_deviations 保留该版本原报告的疑点，用户接受版本不等
 不要把疑点当成必须纠正的事实。已人工通过的实际前段是连续性基准，即使旧 GPT 报告曾判 fail。
 在该接续范围内保留已接受的摆位、朝向等实际状态，不擅自纠正，也不把原有已接受偏差重新列为必须修复项。
 没有人工接受证据时不能自行推定已批准；未被接受的失败候选不得取代当前参考。用户明确提出新的修改要求时再按意见调整。
-尊重用户返工意见，人物对白无明确修改要求时保留原文；已启用系统关键内容播报时，系统声音按专项规则选句，完整规则保留画面。不要增加人物、剧情、预算或时长。
+尊重用户返工意见，人物对白无明确修改要求时保留原文；已启用系统关键内容播报时，系统声音按专项规则选句，完整规则保留画面。不要增加人物、剧情或时长。
 提示词只能描述本次整段生成目标，不能假定已有局部编辑、遮罩修补、精确文字排版或纸面透视跟踪工具。
 若问题适合后期处理但上下文没有可执行工具，应说明“建议另行后期处理，尚未执行”，不能把这类操作写成已落实的修复能力。
 后期建议写入 continuity_notes；prompt 只包含本次生成能够直接尝试实现的画面与声音目标。

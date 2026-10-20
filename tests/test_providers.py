@@ -272,8 +272,8 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(result["scope"], "sampled_frames_only")
         self.assertFalse(result["audio_assessed"])
 
-    def test_command_limit_null_and_invalid_actions(self):
-        command = {"action": "status", "kind": "none", "id": "", "feedback": "", "shot_ids": [], "limit": None, "reply": "查看进度"}
+    def test_command_rejects_retired_budget_and_invalid_actions(self):
+        command = {"action": "status", "kind": "none", "id": "", "feedback": "", "shot_ids": [], "reply": "查看进度"}
         _validate(command, COMMAND_SCHEMA)
         command["action"] = "shell"
         with self.assertRaises(BrainError):

@@ -106,13 +106,14 @@ class ProductionStopProjectionTests(unittest.TestCase):
         self.assertEqual(public["production_stop"]["stage"], "shot_review")
         self.assertNotIn("preparation_failure", public["episodes"][0]["shots"][7])
 
-    def test_missing_old_asset_error_explains_unconfigured_project_budget(self):
+    def test_missing_old_asset_error_never_blames_retired_budget_setting(self):
         self.state.update(last_error=None, assets=[{"id": "hero", "kind": "character", "status": "generating"}])
         self.state["budget"].update(approved=False, limit=0)
         public = dashboard.public_state(self.state)
         self.assertEqual(public["production_stop"]["stage"], "assets")
-        self.assertIn("本项目", public["production_stop"]["message"])
-        self.assertIn("0 元", public["production_stop"]["message"])
+        self.assertIn("旧版未保留", public["production_stop"]["message"])
+        self.assertNotIn("预算", public["production_stop"]["message"])
+        self.assertNotIn("0 元", public["production_stop"]["message"])
         from norlan import __version__
         self.assertEqual(public["app_version"], __version__)
 

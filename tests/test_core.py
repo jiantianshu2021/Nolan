@@ -64,8 +64,30 @@ class CoreTests(unittest.TestCase):
         state = core.load_project(self.root)
         self.assertEqual(state["budget"]["reserved"], 4)
         self.assertEqual(core._find(state, "shot", "E001-S002")["job_id"], "two")
-        with self.assertRaises(core.GateError):
-            core.reserve(self.root, "too-much", "video", "E002-S001", 4)
+        # The historical limit is no longer a production gate.
+        core.reserve(self.root, "above-old-limit", "video", "E002-S001", 4)
+        self.assertEqual(core.load_project(self.root)["jobs"]["above-old-limit"]["amount"], 4)
+
+    def test_zero_unapproved_live_budget_allows_registration_but_keeps_unknown_guard(self):
+        with core.transaction(self.root) as state:
+            state["mode"] = "live"
+            state["budget"].update(limit=0, approved=False)
+        job = core.reserve(self.root, "no-price", "image", "hero", 0)
+        self.assertTrue(job["cost_track"])
+        self.assertEqual(core.load_project(self.root)["budget"]["enforcement"], "disabled")
+        core.update_job(self.root, "no-price", state="uncertain", accounting="unknown")
+        with self.assertRaisesRegex(core.GateError, "未核实"):
+            core.reserve(self.root, "repeat", "image", "hero", 0)
+
+    def test_api_without_cost_cap_still_obeys_call_count(self):
+        core.configure(self.root, {"brain": {"provider": "openai"}, "max_llm_calls": 1})
+        with core.transaction(self.root) as state:
+            state["mode"] = "live"
+        job = core.reserve(self.root, "api-one", "llm", "plan", 0)
+        self.assertTrue(job["cost_track"])
+        core.update_job(self.root, "api-one", state="completed", accounting="spent")
+        with self.assertRaisesRegex(core.GateError, "调用次数"):
+            core.reserve(self.root, "api-two", "llm", "plan", 0)
 
     def test_version_and_file_hash_approval_gates(self):
         with self.assertRaises(core.GateError):

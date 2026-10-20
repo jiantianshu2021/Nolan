@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from urllib.error import URLError
 
+from norlan import episode_post
 from norlan.music import MusicProvider, _audio_url, _signed_headers, _signing_key
 from norlan.providers import ProviderError
 
@@ -31,7 +32,7 @@ class MusicTests(unittest.TestCase):
         changed = _signed_headers(body + b" ", "GenBGMForTime", "test-ak", "test-secret", now)
         self.assertNotEqual(headers["authorization"], changed["authorization"])
 
-    def test_submit_pins_budget_duration_and_does_not_accept_override(self):
+    def test_submit_pins_requested_duration_and_does_not_accept_override(self):
         provider = MusicProvider()
         with patch.object(provider, "_call", return_value=({"TaskID": "12345"}, "req")) as call:
             result = provider.submit("安静钢琴纯音乐，剧情后半段渐强", 45)
@@ -47,6 +48,20 @@ class MusicTests(unittest.TestCase):
         for invalid in (True, -1, 4, 121, 45.5, float("nan")):
             with self.assertRaises(ProviderError):
                 MusicProvider().submit("中文提示词", invalid)
+
+    def test_music_configuration_requires_service_credentials_but_no_monetary_cap(self):
+        for cap in (None, 0, -1, float("nan")):
+            config = {"mode": "volc"}
+            if cap is not None:
+                config["call_cap"] = cap
+            with self.subTest(cap=cap), patch.object(MusicProvider, "_credentials", return_value=("synthetic-ak", "synthetic-sk")) as credentials:
+                self.assertEqual(episode_post.music_configuration({"settings": {"music": config}}), (True, ""))
+                credentials.assert_called_once()
+        with patch.object(MusicProvider, "_credentials", side_effect=ValueError("synthetic missing credentials")):
+            enabled, reason = episode_post.music_configuration({"settings": {"music": {"mode": "volc"}}})
+        self.assertFalse(enabled)
+        self.assertIn("AK/SK", reason)
+        self.assertNotIn("费用上限", reason)
 
     def test_poll_maps_documented_status_and_preserves_original_id(self):
         provider = MusicProvider()

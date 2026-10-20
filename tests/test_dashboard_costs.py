@@ -1,8 +1,12 @@
 """Synthetic dashboard cost workers; no provider API calls or production runs."""
 
+import copy
 import http.client
 import json
 from pathlib import Path
+import re
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -141,6 +145,22 @@ class DashboardCostsTests(unittest.TestCase):
         self.assertNotIn("SECRET-RAW", json.dumps(state))
         self.assertEqual(self.core.approvals, [])
 
+    def test_cost_projection_ignores_legacy_budget_ceiling_and_tracks_unsettled_calls(self):
+        self.state["budget"].update(approved=False, limit=0, available=-999)
+        self.state["jobs"].update({
+            "synthetic-active": {"amount": 0, "accounting": "reserved", "state": "submitted"},
+            "synthetic-unknown": {"amount": 3, "accounting": "unknown", "state": "uncertain"},
+        })
+        before = copy.deepcopy(self.state)
+        data = dashboard.public_state(self.state)
+        for retired in ("limit", "available", "approved", "spent", "reserved", "unknown"):
+            self.assertNotIn(retired, data["budget"])
+        self.assertEqual(data["budget"]["inflight_jobs"], 1)
+        self.assertEqual(data["budget"]["unknown_jobs"], 1)
+        self.assertEqual(data["budget"]["cost_pending_jobs"], 2)
+        self.assertIsNone(data["budget"]["actual_cost"])
+        self.assertEqual(self.state, before)
+
     def test_csrf_and_origin_still_required_for_cost_sync(self):
         with patch.object(self.server.context, "launch_cost_sync") as launch:
             self.assertEqual(self.request("POST", {"action": "sync_costs"}, {"X-Norlan-Token": "wrong"})[0], 403)
@@ -187,6 +207,47 @@ class DashboardCostsTests(unittest.TestCase):
         state = self.server.context.state()["dashboard"]["cost_sync"]
         self.assertFalse(state["running"])
         self.assertIn("费用同步未能启动", state["error"])
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js required for synthetic DOM checks")
+class CostDisplayDomTests(unittest.TestCase):
+    def test_zero_bill_pending_cost_and_unknown_calls_render_without_budget_panel(self):
+        html = Path(dashboard.__file__).with_name("dashboard.html").read_text()
+        self.assertIn("<h2>费用记录</h2>", html)
+        self.assertNotIn("费用与预算", html)
+        self.assertNotIn("预算占用", html)
+        self.assertNotIn("剩余预算", html)
+        sources = []
+        for name in ("el", "budgetNumber", "money", "paintBudget"):
+            start = re.search(r"function " + name + r"\(", html).start()
+            following = re.search(r"\n(?:async )?function ", html[start + 1:])
+            sources.append(html[start:start + 1 + following.start()])
+        program = r'''
+const assert=require('node:assert/strict'),vm=require('node:vm');
+const source=JSON.parse(require('node:fs').readFileSync(0,'utf8')).join('\n');
+class Element{
+ constructor(tag='div'){this.tag=tag;this.children=[];this.textContent='';}
+ append(...nodes){this.children.push(...nodes);}
+ replaceChildren(...nodes){this.children=[...nodes];}
+}
+const nodes=new Map(),$=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
+const context={assert,$,document:{createElement:tag=>new Element(tag)}};
+vm.runInNewContext(source+`
+const pending={currency:'CNY',cost_jobs:3,actual_cost_jobs:0,actual_cost:null,
+ usage_cost_jobs:1,usage_cost:2.5,cost_pending_jobs:3,inflight_jobs:1,unknown_jobs:2,
+ limit:2000,available:999,spent:400,reserved:100,unknown:77};
+paintBudget(pending);
+assert.equal($('budget-total').textContent,'待对账');
+assert.equal(JSON.stringify($('budget').children.map(n=>n.children.map(x=>x.textContent))),JSON.stringify([
+ ['按实际用量计费（未对账）','2.50 CNY'],['未核实调用数','3 次'],['进行中调用','1 次'],['结果待核实调用','2 次']]));
+paintBudget({...pending,actual_cost_jobs:1,actual_cost:0});
+assert.equal($('budget-total').textContent,'0.00 CNY');
+assert.equal($('budget-status').textContent,'已核对 1 / 3 次调用');
+`,context);
+'''
+        result = subprocess.run([shutil.which("node"), "-e", program], input=json.dumps(sources),
+                                text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

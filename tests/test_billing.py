@@ -150,6 +150,40 @@ class BillingTests(unittest.TestCase):
         self.assertEqual(summary["usage_cost_jobs"], 0)
         self.assertIsNone(summary["usage_cost"])
 
+    def test_zero_estimate_live_call_stays_pending_until_usage_or_bill_is_known(self):
+        snapshot = price_snapshot({"video_model": "ep-synthetic-custom"}, "video")
+        jobs = {
+            "submitted": {"amount": 0, "accounting": "reserved", "cost_track": True},
+            "unknown": {"amount": 0, "accounting": "unknown", "cost_track": True},
+            "completed": {"amount": 0, "accounting": "spent", "cost_track": True,
+                          "billing": usage_record({"model": "ep-synthetic-custom",
+                              "provider_status": "succeeded", "usage": {"completion_tokens": 500}}, snapshot)},
+            "subscription": {"amount": 0, "accounting": "spent", "cost_track": False},
+            "demo": {"amount": 0, "accounting": "spent", "cost_track": False},
+            "released": {"amount": 0, "accounting": "released", "cost_track": True},
+        }
+        result = summarize_costs(jobs, "CNY")
+        self.assertEqual(result["cost_jobs"], 2)
+        self.assertEqual(result["cost_pending_jobs"], 2)
+        self.assertIsNone(result["actual_cost"])
+        self.assertIsNone(result["usage_cost"])
+
+    def test_zero_estimate_never_hides_existing_usage_or_verified_bill(self):
+        jobs = {
+            "priced": {"amount": 0, "accounting": "spent", "billing": self.video_record({"completion_tokens": 1000})},
+            "unpriced": {"amount": 0, "accounting": "spent", "billing": {
+                "usage": {"completion_tokens": 500}, "currency": "CNY", "status": "pricing_missing"}},
+            "bill": {"amount": 0, "accounting": "spent", "billing": {
+                "actual_cost": 0, "bill_reference": "synthetic-credit", "currency": "CNY"}},
+        }
+        result = summarize_costs(jobs, "CNY")
+        self.assertEqual(result["cost_jobs"], 3)
+        self.assertEqual(result["cost_pending_jobs"], 2)
+        self.assertEqual(result["actual_cost"], 0)
+        self.assertEqual(result["usage_cost"], .037)
+        self.assertEqual(result["actual_cost_jobs"], 1)
+        self.assertEqual(result["usage_cost_jobs"], 1)
+
     def test_summary_invalid_or_wrong_currency_is_unknown(self):
         invalid_billing = [
             {"currency": "USD", "actual_cost": 1, "bill_reference": "bill"},

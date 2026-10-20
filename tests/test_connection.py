@@ -100,15 +100,22 @@ class ConnectionTests(unittest.TestCase):
                 connection.setup("openai", "chosen")
         key_prompt.assert_not_called()
 
-    def test_api_budget_required_before_production_request(self):
+    def test_api_production_needs_no_budget_and_still_records_before_submit(self):
         project = self.root / "story"
         core.create_project(project, "A synthetic test story", "live")
         with patch("norlan.connection.production_brain_config", return_value={"provider": "codex", "billing": "api"}), \
                 patch("norlan.brain.Brain") as brain:
-            with self.assertRaises(core.GateError):
-                pipeline._brain(project, "plan", "test")
-        brain.assert_not_called()
-        self.assertEqual(core.load_project(project)["jobs"], {})
+            def synthetic_plan(_):
+                self.assertEqual(core.load_project(project)["jobs"], {})
+                brain.return_value.before_submit()
+                job = list(core.load_project(project)["jobs"].values())[-1]
+                self.assertEqual((job["state"], job["accounting"]), ("submitting", "reserved"))
+                return {"synthetic": True}
+            brain.return_value.plan.side_effect = synthetic_plan
+            self.assertEqual(pipeline._brain(project, "plan", "test"), {"synthetic": True})
+        state = core.load_project(project)
+        self.assertEqual(state["llm_calls"], 1)
+        self.assertEqual(list(state["jobs"].values())[-1]["state"], "completed")
 
     def test_api_production_preserves_reservation_and_selected_connection(self):
         project = self.root / "story"
@@ -120,10 +127,10 @@ class ConnectionTests(unittest.TestCase):
             self.assertFalse(before["jobs"])
             self.assertEqual(before["llm_calls"], 0)
             # Fake transport explicitly reaches the real pre-submit callback;
-            # construction/local validation must not reserve budget by itself.
+            # construction/local validation must not create a call record by itself.
             brain.return_value.before_submit()
             state = core.load_project(project)
-            self.assertEqual(state["budget"]["reserved"], 1)
+            self.assertEqual(state["budget"]["reserved"], 0)
             self.assertEqual(state["llm_calls"], 1)
             job = list(state["jobs"].values())[-1]
             self.assertEqual((job["state"], job["accounting"]), ("submitting", "reserved"))
@@ -132,7 +139,7 @@ class ConnectionTests(unittest.TestCase):
             brain.return_value.plan.side_effect = check_reserved
             self.assertEqual(pipeline._brain(project, "plan", "test"), {"ok": True})
             brain.assert_called_once_with(config)
-        self.assertEqual(core.load_project(project)["budget"]["spent"], 1)
+        self.assertEqual(core.load_project(project)["budget"]["spent"], 0)
 
 
 class NativeEntryTests(unittest.TestCase):

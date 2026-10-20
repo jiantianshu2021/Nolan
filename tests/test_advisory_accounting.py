@@ -82,7 +82,7 @@ class AdvisoryAccountingTests(unittest.TestCase):
         core.reserve(self.root, "different-work", "image", "new-prop", 1)
         self.assertEqual(core.load_project(self.root)["jobs"][original["id"]], original)
 
-    def test_nonzero_unknown_cost_stays_reserved_for_budget_and_is_not_released(self):
+    def test_historical_unknown_cost_is_preserved_without_enforcing_old_limit(self):
         core.configure(self.root, limit=10)
         original = self.unknown_review(7)
         core.reserve(self.root, "new-media", "video", "E001-S002", 3)
@@ -91,8 +91,8 @@ class AdvisoryAccountingTests(unittest.TestCase):
         self.assertEqual(state["budget"]["reserved"], 3)
         self.assertEqual(state["budget"]["available"], 0)
         self.assertEqual(state["jobs"][original["id"]], original)
-        with self.assertRaises(core.GateError):
-            core.reserve(self.root, "over-budget", "image", "prop", 0.01)
+        core.reserve(self.root, "above-old-limit", "image", "prop", 0.01)
+        self.assertEqual(core.load_project(self.root)["jobs"][original["id"]], original)
 
     def test_media_and_nonreview_unknown_jobs_still_block_reservation(self):
         for kind, item in (("video", "E001-S001"), ("voice", "voice"), ("image", "hero"),

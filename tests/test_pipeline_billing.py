@@ -45,10 +45,9 @@ class PipelineBillingTests(unittest.TestCase):
 
     def live_jobs(self, state=None):
         state = state or core.load_project(self.root)
-        return [job for job in state["jobs"].values() if job["amount"] > 0]
+        return [job for job in state["jobs"].values() if job.get("cost_track") is True]
 
     def assert_video_cost(self, state):
-        self.assertEqual(state["budget"]["spent"], 4)
         self.assertEqual(state["budget"]["usage_cost"], 3.999996)
         self.assertEqual(state["budget"]["usage_cost_jobs"], 1)
         self.assertEqual(state["budget"]["cost_jobs"], 1)
@@ -81,7 +80,8 @@ class PipelineBillingTests(unittest.TestCase):
             job = self.live_jobs(after)[0]
             self.assertEqual(job["accounting"], "unknown")
             self.assertEqual(job["state"], "uncertain")
-            self.assertEqual(after["budget"]["unknown"], 1)
+            self.assertEqual(after["budget"]["unknown"], job["amount"])
+            self.assertEqual(job["amount"], .12)
             self.assertEqual(after["budget"]["usage_cost"], 0.12)
             self.assertIsNone(after["budget"]["actual_cost"])
             with self.assertRaises(core.GateError):
@@ -156,7 +156,7 @@ class PipelineBillingTests(unittest.TestCase):
         events = [event for event in state["events"] if event["action"] == "provider_usage_recorded"]
         self.assertEqual(len(events), 1)
 
-    def test_failed_task_reported_zero_usage_keeps_cap_and_is_not_a_verified_bill(self):
+    def test_failed_task_reported_zero_usage_retains_ledger_and_is_not_a_verified_bill(self):
         output = self.root / "media" / "synthetic-failed.mp4"
         core.reserve(self.root, "synthetic-failed", "video", "E001-S001", 4,
                      pricing=price_snapshot(self.config, "video"))

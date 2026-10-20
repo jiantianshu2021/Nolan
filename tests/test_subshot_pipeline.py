@@ -131,7 +131,12 @@ class SubshotPipelineTests(unittest.TestCase):
         state = core.load_project(self.root)
         video_jobs = [job for job in state["jobs"].values() if job["kind"] == "video" and job["item_id"] == "E001-S001"]
         self.assertEqual(len(video_jobs), 1)
-        self.assertEqual(video_jobs[0]["amount"], 15)
+        # No verified price/usage is available for the synthetic model. Keep
+        # the real single-call record and leave actual fees unverified.
+        self.assertEqual(video_jobs[0]["duration"], 15)
+        self.assertEqual(video_jobs[0]["amount"], 0)
+        self.assertTrue(video_jobs[0]["cost_track"])
+        self.assertIsNone(video_jobs[0].get("billing", {}).get("actual_cost"))
         self.assertEqual(core._find(state, "shot", "E001-S001")["subshots"], SUBSHOTS)
         context = self.review_contexts[0]
         self.assertEqual([item["image_index"] for item in context["current_frame_samples"]], list(range(4, 13)))

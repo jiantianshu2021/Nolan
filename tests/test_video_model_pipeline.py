@@ -217,7 +217,8 @@ class VideoModelPipelineTests(unittest.TestCase):
         self.assertEqual(videos[0]["role"], "reference_video")
         self.assertIn(self.job()["task_id"], videos[0]["video_url"]["url"])
         self.assertEqual(self.job(1)["reference_video_duration"], 4)
-        self.assertEqual(self.job(1)["amount"], 8)
+        self.assertEqual(self.job(1)["amount"], 0)
+        self.assertTrue(self.job(1)["cost_track"])
         self.assertEqual(self.job()["billing"]["price"]["model"], STANDARD)
         self.assert_job_model(MINI, 1, rate=14, video_input=True)
 
@@ -242,43 +243,51 @@ class VideoModelPipelineTests(unittest.TestCase):
                                          ("video_watermark", "watermark")):
             self.assertEqual(self.job()["video_request"].get(request_key), payload[payload_key])
 
-    def test_unsubmitted_budget_failure_keeps_selected_consent_without_gpt_replanning(self):
-        self.approve(self.prepare(), STANDARD)
-        candidate = copy.deepcopy(self.shot()["prompt_candidate"])
-        core.configure(self.root, limit=0)
-        self.brain.reset_mock()
-        self.brain.side_effect = AssertionError("A local budget block must not rewrite approved text")
+    def test_zero_unapproved_budget_keeps_selected_consent_and_submits_once_without_gpt(self):
+        original = self.prepare()
+        with core.transaction(self.root) as state:
+            state["budget"].update(limit=0, approved=False)
+            state["settings"]["caps"]["video_second"] = 0
         for _ in range(2):
-            self.assertEqual(pipeline.run(self.root)["status"], "blocked")
-            self.assertEqual(self.shot()["status"], "prompt_approved")
-            self.assertEqual(self.shot()["version"], candidate["version"] - 1)
-            self.assertEqual(self.shot()["prompt_candidate"], candidate)
-            self.assertNotIn("job_id", self.shot())
+            self.assertEqual(pipeline.run(self.root)["status"], "awaiting_prompt_approval")
         self.assertFalse(self.posts())
+        self.approve(original, STANDARD)
+        candidate = copy.deepcopy(self.shot()["prompt_candidate"])
+        decision = copy.deepcopy(self.shot()["prompt_approval"])
+        self.brain.reset_mock()
+        self.brain.side_effect = AssertionError("Generation must not rewrite approved text")
+        for _ in range(2):
+            self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+            self.assertEqual(self.shot()["status"], "review_required")
+            self.assertEqual(self.shot()["version"], candidate["version"])
+            self.assertEqual(self.shot()["prompt_candidate"], candidate)
+            self.assertEqual(self.shot()["prompt_approval"], decision)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(self.posts()[0]["payload"]["content"][0]["text"], candidate["prompt"])
+        self.assert_job_model(STANDARD, rate=46)
         self.brain.assert_not_called()
 
-    def test_selected_25_model_reserves_more_than_fast_and_blocks_insufficient_budget(self):
+    def test_selected_25_model_records_own_quote_without_enforcing_legacy_low_budget(self):
         original = self.prepare()
         duration = self.shot()["duration"]
         config = {"video_model": FAST, "resolution": "720p", "ratio": "16:9"}
         fast_quote = estimate_reservation(config, duration)
         selected_quote = estimate_reservation({**config, "video_model": V25}, duration)
         self.assertGreater(selected_quote, fast_quote)
-        fast_reservation = max(duration, fast_quote * 1.15)
-        selected_reservation = round(max(duration, selected_quote * 1.15), 6)
-        self.assertGreater(selected_reservation, fast_reservation)
         self.approve(original, V25)
-        core.configure(self.root, limit=(fast_reservation + selected_reservation) / 2)
+        candidate = copy.deepcopy(self.shot()["prompt_candidate"])
+        decision = copy.deepcopy(self.shot()["prompt_approval"])
+        core.configure(self.root, limit=0.01)
         self.brain.reset_mock()
-        self.brain.side_effect = AssertionError("Budget reconsideration must not rewrite the selected prompt")
-        self.assertEqual(pipeline.run(self.root)["status"], "blocked")
-        self.assertFalse(self.posts())
-        self.assertNotIn("job_id", self.shot())
-        self.assertEqual(self.shot()["status"], "prompt_approved")
-        core.configure(self.root, limit=10)
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.brain.side_effect = AssertionError("An old limit must not rewrite the selected prompt")
+        for _ in range(2):
+            self.assertEqual(pipeline.run(self.root)["status"], "review_required")
         self.assertEqual(len(self.posts()), 1)
-        self.assertEqual(self.job()["amount"], selected_reservation)
+        self.assertEqual(self.job()["amount"], selected_quote)
+        self.assertTrue(self.job()["cost_track"])
+        self.assertEqual(self.shot()["prompt_candidate"], candidate)
+        self.assertEqual(self.shot()["prompt_approval"], decision)
+        self.assertEqual(self.posts()[0]["payload"]["content"][0]["text"], candidate["prompt"])
         self.assert_job_model(V25, rate=70)
         self.brain.assert_not_called()
 

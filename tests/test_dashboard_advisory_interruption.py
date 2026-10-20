@@ -49,12 +49,13 @@ class AdvisoryInterruptionProjectionTests(unittest.TestCase):
         self.assertEqual(self.state, before)
         self.assertEqual(self.review_job["accounting"], "unknown")
 
-    def test_paid_advisory_unknown_still_displays_unsettled_budget_without_free_claim(self):
+    def test_paid_advisory_unknown_still_displays_unsettled_call_without_free_claim(self):
         self.review_job["amount"] = 3
         self.state["budget"]["unknown"] = 3
         public = dashboard.public_state(self.state)
         self.assertEqual(public["pending_advisory_count"], 1)
-        self.assertEqual(public["budget"]["unknown"], 3)
+        self.assertEqual(public["budget"]["unknown_jobs"], 1)
+        self.assertNotIn("unknown", public["budget"])
         self.assertNotIn("免费", public["pending_advisory_notice"])
         self.assertNotIn("已结算", public["pending_advisory_notice"])
 

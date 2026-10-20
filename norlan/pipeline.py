@@ -78,10 +78,8 @@ def _brain(root, method, *args, **kwargs):
     if s["mode"] == "demo":
         raise core.GateError("演示项目不调用在线模型；请新建 live 项目进行真实制作")
     config = production_brain_config(s["settings"]["brain"])
-    amount = s["settings"]["caps"]["llm"]
-    if (config.get("provider") == "openai" or config.get("billing") == "api") and (
-            amount <= 0 or not s["budget"]["approved"]):
-        raise core.GateError("GPT API 制作调用需要你先设置项目预算及 caps.llm 每次调用费用上限；尚未提交请求。")
+    amount = 0  # Token usage is not known before the request; never invent a charge.
+    cost_track = config.get("provider") == "openai" or config.get("billing") == "api"
     job_id = "gpt-" + uuid.uuid4().hex[:12]
     target = (args[0].get("advisory_target") if method == "review" and args and isinstance(args[0], dict) else None)
     submitted = False
@@ -91,7 +89,7 @@ def _brain(root, method, *args, **kwargs):
         if submitted:
             raise core.GateError("同一次 GPT 工作不能重复提交；请先核实原调用。")
         core.reserve(root, job_id, "llm", method, amount, advisory_target=target,
-                     require_video_review=method == "review")
+                     require_video_review=method == "review", cost_track=cost_track)
         submitted = True
 
     client = Brain(config)
@@ -533,7 +531,7 @@ def _poll_video(root, job_id, output):
             _record_video_failure(root, job_id, result.get("failure") or {
                 "stage": "generation", "message": "供应商报告视频生成失败。", "provider_code": result.get("error"), "uncertain": False},
                 state="failed", accounting="spent")
-            raise core.GateError("供应商报告任务失败；预算占用不代表实际扣费，重新生成须由你明确决定。")
+            raise core.GateError("供应商报告任务失败；实际费用须核对账单，重新生成须由你明确决定。")
         # A pause stops waiting/new submissions; the saved task is polled again
         # after resume. It may continue charging at the provider.
         _gate(root)
@@ -623,16 +621,13 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
             or not isinstance(reference_duration, (int, float)) or not math.isfinite(reference_duration)
             or not 2 <= reference_duration <= 15):
         raise core.GateError("原始视频参考时长尚未核实；未提交新任务。")
-    unit_cap = s["settings"]["caps"]["video_second"]
+    amount = 0
     if s["mode"] == "live":
         from .billing import estimate_reservation
-        # The no-input quote is a conservative per-second basis; input-video
-        # minimum-token rules make an exact input quote unavailable locally.
-        # Retain the operator's cap or a 15% margin above this model's basis.
-        basis = estimate_reservation({**config, "currency": s["budget"]["currency"]}, duration)
-        if basis is not None:
-            unit_cap = max(unit_cap, basis / duration * 1.15)
-    amount = 0 if s["mode"] == "demo" else round((duration + reference_duration) * unit_cap, 6)
+        # Informational public-price estimate only. Actual provider usage is
+        # recorded separately; an unknown price does not block generation.
+        amount = estimate_reservation({**config, "currency": s["budget"]["currency"]},
+                                      duration, reference_duration) or 0
     pricing = price_snapshot({**config, "currency": s["budget"]["currency"]}, kind,
                              has_video_input=previous_video is not None)
     core.reserve(root, job_id, kind, item_id, amount, pricing=pricing if s["mode"] == "live" else None)
@@ -790,12 +785,6 @@ def _assets(root):
                 if consent is None:
                     continue
                 references = [core.safe_path(root, file) for file in consent["reference_manifest"]["images"]]
-                amount = asset_models.reserve_amount(s, asset, model=consent["model"],
-                    duration=consent.get("duration"), candidate=consent)
-                if not s["budget"]["approved"] or amount <= 0:
-                    raise core.GateError("请先设置预算和媒体调用价格上限")
-                if amount > s["budget"]["available"] + 0.0000001:
-                    raise core.GateError("剩余预算不足，任务未提交；已确认的资产提示词和目标版本保留。")
                 # Credentials are checked after consent, before advancing the
                 # output version. Continue cannot turn a draft into a POST.
                 provider = _ark(root, consent["generation_config"])
@@ -1305,7 +1294,7 @@ def _shot(root, ep_id, shot_id, previous):
                             and job.get("item_id") == shot_id for job in current["jobs"].values())
                 and not any(attempt.get("revision", 0) == current_shot.get("revision", 0)
                             for attempt in current_shot.get("attempts", []))):
-            # Local validation/budget can fail before any reservation or POST.
+            # Local validation can fail before any registration or POST.
             # Preserve the unsubmitted model/text consent instead of letting a
             # resume interpret "generating, no job" as a fresh GPT rewrite.
             _save_shot(root, shot_id, status="prompt_approved", version=candidate["version"] - 1)
@@ -1401,8 +1390,7 @@ def _soundtrack(root, ep):
     if not job:
         _new_work_gate(s)
         job_id = "music-" + ep["id"] + "-" + uuid.uuid4().hex[:8]
-        cap = music_cfg.get("call_cap", 0)
-        core.reserve(root, job_id, "music", ep["id"], cap)
+        core.reserve(root, job_id, "music", ep["id"], 0)
         _save_episode(root, ep["id"], music_job_id=job_id, pending_music_file=_rel(root, out))
         try:
             result = provider.submit(ep.get("music_prompt", "适合剧情的无歌词背景音乐"), duration)
@@ -1489,7 +1477,7 @@ def _captions(root, ep):
         raise core.GateError("成片没有实际音轨，不能生成对白字幕")
     job_id = f"asr-{ep['id']}-{uuid.uuid4().hex[:8]}"
     _new_work_gate(s)
-    core.reserve(root, job_id, "transcription", ep["id"], config.get("call_cap", 0))
+    core.reserve(root, job_id, "transcription", ep["id"], 0)
     core.update_job(root, job_id, fingerprint=fingerprint, result_file=_rel(root, output))
     try:
         segments = transcriber.transcribe(Path(evidence["audio"]))

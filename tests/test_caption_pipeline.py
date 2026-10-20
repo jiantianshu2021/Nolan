@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from norlan import core, pipeline
 from norlan.providers import ProviderError
-from test_pipeline import choose_gpt_assets, fake_media, write, run_with_shot_approvals
+from tests.test_pipeline import choose_gpt_assets, fake_media, write, run_with_shot_approvals
 
 
 class CaptionPipelineTests(unittest.TestCase):
@@ -30,8 +30,8 @@ class CaptionPipelineTests(unittest.TestCase):
         self.assertEqual(state["status"], "awaiting_episode_review", state.get("last_error"))
         # Recompose already accepted real-state clips with ASR enabled. No video,
         # visual review, or voice service is needed or called by these tests.
-        core.configure(self.root, {"subtitles": {"mode": "openai", "call_cap": 1.5,
-                                                   "model": "whisper-1", "language": "zh"}}, limit=100)
+        core.configure(self.root, {"subtitles": {"mode": "openai",
+                                                   "model": "whisper-1", "language": "zh"}})
         with core.transaction(self.root) as state:
             state["mode"] = "live"
             episode = state["episodes"][0]
@@ -74,7 +74,9 @@ class CaptionPipelineTests(unittest.TestCase):
         self.assertNotIn("计划台词", str(final.kwargs["subtitles"]))
         self.assertEqual(self.episode()["subtitle_status"], "automatic_asr_needs_review")
         self.assertEqual(self.asr_jobs()[0]["accounting"], "spent")
-        self.assertEqual(core.load_project(self.root)["budget"]["spent"], 1.5)
+        self.assertTrue(self.asr_jobs()[0]["cost_track"])
+        self.assertEqual(core.load_project(self.root)["budget"]["cost_pending_jobs"], 1)
+        self.assertIsNone(core.load_project(self.root)["budget"]["actual_cost"])
         service.transcribe.assert_called_once()
         brain.assert_not_called()
         ark.assert_not_called()
@@ -88,7 +90,8 @@ class CaptionPipelineTests(unittest.TestCase):
         self.assertEqual(status, "automatic_asr_needs_review")
         service.transcribe.assert_called_once()
         self.assertEqual(len(self.asr_jobs()), 1)
-        self.assertEqual(core.load_project(self.root)["budget"]["spent"], 1.5)
+        self.assertTrue(self.asr_jobs()[0]["cost_track"])
+        self.assertEqual(core.load_project(self.root)["budget"]["cost_pending_jobs"], 1)
 
     def test_uncertain_asr_stops_all_automatic_resubmission(self):
         service = self.transcriber()
@@ -100,11 +103,15 @@ class CaptionPipelineTests(unittest.TestCase):
                 pipeline._captions(self.root, self.episode())
         self.assertEqual(first["status"], "blocked")
         self.assertEqual(second["status"], "blocked")
-        self.assertEqual(second["budget"]["unknown"], 1.5)
+        self.assertEqual(self.asr_jobs()[0]["accounting"], "unknown")
+        self.assertEqual(self.asr_jobs()[0]["amount"], 0)
+        self.assertTrue(self.asr_jobs()[0]["cost_track"])
+        self.assertEqual(second["budget"]["cost_pending_jobs"], 1)
+        self.assertIsNone(second["budget"]["actual_cost"])
         service.transcribe.assert_called_once()
         self.assertEqual(len(self.asr_jobs()), 1)
 
-    def test_missing_provider_key_reserves_no_budget(self):
+    def test_missing_provider_key_creates_no_submission(self):
         before = len(core.load_project(self.root)["jobs"])
         with patch.dict(os.environ, {}, clear=True), patch("norlan.transcription._open") as network:
             with self.assertRaises(ProviderError):

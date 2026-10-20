@@ -9,7 +9,7 @@ macOS 执行 `bash scripts/install-local-asr.sh` 安装 whisper-cpp 并下载官
 0.6.5 的自动同步检查还需运行 `bash scripts/install-subtitle-alignment.sh`，安装另一套本地中文 CTC 声学模型及隔离运行环境。默认针对普通话；外语、重叠对白和无法独立识别的声音不会被当作已经验证。`nolan doctor` 可检查是否就绪。不需要新增 API Key。
 
 ```json
-{"postproduction":{"enabled":true},"subtitles":{"mode":"local","backend":"whisper_cpp","language":"zh","call_cap":0}}
+{"postproduction":{"enabled":true},"subtitles":{"mode":"local","backend":"whisper_cpp","language":"zh"}}
 ```
 
 字幕源是实际识别文字，计划对白只作为当前集的短参考。GPT 不接收小说、历次报告或全部提示词，不新增未识别的对白，不推测数字；GPT 的文字校对步骤保持本地识别结果的时间和数量不变。每批最多60条，已完成校对按输入哈希缓存，重启后复用。原声音轨、模型或本地对齐策略改变则重新本地识别。识别结果为空而本集计划有对白时会停止，不伪装成已完成字幕。
@@ -55,13 +55,12 @@ Nolan 的自动字幕从已经生成的视频音轨识别文字和时间，不�
   "mode": "openai",
   "model": "whisper-1",
   "api_key_env": "OPENAI_API_KEY",
-  "call_cap": 0,
   "timeout": 120,
   "language": "zh"
 }
 ```
 
-`language` 可以省略以使用自动识别。`call_cap` 是每集转录一次的保守费用上限，使用项目账本币种；示例的 0 必须按实际服务价格和本集长度改成足够的正数，再批准总预算。API 密钥通过环境变量提供，不写入项目配置。请求固定发送到官方 OpenAI 地址，不跟随重定向；ChatGPT/Codex 登录本身不为这个 HTTP 接口提供 API 密钥。
+`language` 可以省略以使用自动识别。无需配置 `call_cap` 或确认总预算；调用记录、费用核实和结果不明禁止重发仍生效。API 密钥通过环境变量提供，不写入项目配置。请求固定发送到官方 OpenAI 地址，不跟随重定向；ChatGPT/Codex 登录本身不为这个 HTTP 接口提供 API 密钥。
 
 底层接口为 `Transcriber(config).transcribe(audio_path)`，返回 `[{"start": 0.2, "end": 2.1, "text": "实际识别文字"}]`，时间单位为秒，相对于输入音轨起点。接口可以接受单镜或整集音轨，当前主流程每集调用一次。单次文件上限为 25 MB，超过上限会停止，不会默默截断音频；需要先压缩或另行实现分块及时间偏移。无须为此购买另外的配音服务。[文件大小与时间戳说明](https://developers.openai.com/api/docs/guides/speech-to-text)
 

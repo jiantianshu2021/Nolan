@@ -51,8 +51,7 @@ def summary(s):
     actual = f"{b['actual_cost']:.6f}".rstrip("0").rstrip(".") + " " + b["currency"] if b.get("actual_cost_jobs") else "待对账"
     usage = f"{b['usage_cost']:.6f}".rstrip("0").rstrip(".") + " " + b["currency"] if b.get("usage_cost_jobs") else "暂无可计费用量"
     rows.append(f"已核对实际费用：{actual}；按实际用量计费（未对账）：{usage}")
-    rows.append(f"预算 {b['currency']}：上限 {b['limit']:.2f} / 已结束调用占用上限 {b['spent']:.2f} / 在途预留 {b['reserved']:.2f} / 结果待核实 {b['unknown']:.2f}")
-    rows.append("用量计费未含折扣、赠额等账单调整；预算占用不等于实际扣款。可用 nolan costs 查看逐调用明细。")
+    rows.append("用量计费未含折扣、赠额等账单调整，不等于实际扣款。可用 nolan costs 查看逐调用明细。")
     p = s["plan"]
     rows.append(f"规划 v{p['version']}：{STATUS.get(p['status'],p['status'])}")
     for a in s["assets"]:
@@ -202,7 +201,7 @@ def main(argv=None):
     p = sub.add_parser("configure")
     p.add_argument("project", type=Path)
     p.add_argument("--file", type=Path)
-    p.add_argument("--budget", type=float)
+    p.add_argument("--budget", type=float, help=argparse.SUPPRESS)
     p.add_argument("--currency", choices=["CNY", "USD"])
     p = sub.add_parser("reconcile")
     p.add_argument("project", type=Path)
@@ -341,7 +340,9 @@ def main(argv=None):
             state = core.reject(root, args.kind, args.id, args.version, args.feedback, args.shots)
         elif args.command == "configure":
             config = json.loads(args.file.read_text(encoding="utf-8")) if args.file else None
-            state = core.configure(root, config, args.budget, args.currency)
+            if args.budget is not None:
+                print("--budget 已废弃并忽略；Nolan 已取消预算设置和额度限制，费用仍按调用记录。", file=sys.stderr)
+            state = core.configure(root, config, currency=args.currency)
         elif args.command == "reconcile":
             state = core.reconcile(root, args.job, args.outcome, args.note, args.task_id)
         elif args.command == "import-plan":

@@ -609,9 +609,7 @@ def _public_production_stop(state):
             any(value.get("status") in {"candidate", "awaiting_assets"}
                 for value in state.get("asset_amendments", []) if isinstance(value, dict))):
         result.update(stage="assets", stage_label="准备或核对资产")
-        if not message and state.get("budget", {}).get("approved") is False:
-            result["message"] = "本项目尚未确认制作预算（当前预算上限为 0 元）；旧项目的预算不会自动转入新项目。请先检查资产提示词，再由你在本机为这个项目设置预算；尚未提交新的生成。"
-        elif not message:
+        if not message:
             result["message"] = "旧版未保留这次资产准备失败的具体原因。请用新版继续，仅重新检查本机配置并准备提示词；不会自动提交新资产生成。"
         return result
     for episode_index, episode in enumerate(state.get("episodes", []), 1):
@@ -1200,7 +1198,7 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
         if library_mode:
             result["missing_configuration"].append("需要首次导入音乐并试听确认；本地曲库无需音乐 API 凭据，可先扫描音乐文件夹。")
         else:
-            result["missing_configuration"].append("需要首次导入音乐并试听确认；自动生成音乐另需火山音乐 AK/SK 和调用预算。")
+            result["missing_configuration"].append("需要首次导入音乐并试听确认；自动生成音乐另需配置火山音乐 AK/SK。")
     return result
 
 
@@ -1317,10 +1315,8 @@ def public_state(state: dict) -> dict:
     production_stop = _public_production_stop(state)
     if production_stop:
         result["production_stop"] = production_stop
-    from .billing import summarize_costs
-    budget = state.get("budget", {})
-    result["budget"] = _pick(budget, ("limit", "spent", "reserved", "unknown", "currency", "available"))
-    result["budget"].update(summarize_costs(state.get("jobs", {}), budget.get("currency", "CNY")))
+    from .costs import cost_summary
+    result["budget"] = cost_summary(state)
     from .asset_inputs import input_state, has_started, confirmed
     from .progress import episode_progress
     from .core import now
@@ -1399,7 +1395,7 @@ def public_state(state: dict) -> dict:
                         pass
             item["planning"] = episode_planning
         # This is route eligibility only; production keeps every existing
-        # plan, asset, prompt, budget and final-approval gate.
+        # plan, asset, prompt and final-approval gate.
         can_produce = (episode.get("status") != "approved"
                        and all(previous.get("status") == "approved"
                                for previous in raw_episodes[:episode_index]))

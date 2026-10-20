@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 import re
 import shlex
@@ -20,10 +19,10 @@ HELP = """你可以直接用中文：
   播放第一集 / E001 通过 / E001 的 E001-S001 需要返工，理由是……
   E001 字幕 把“你好”改成“您好”（仅校正字幕，保留视频）
   E001 请重新对齐字幕，前五条出现太早（本集后期按实际人声重对齐）
-  总预算设为 30 元
+  查看费用
 演示模式不调用 GPT：用 ID（如 hero、E001）明确指定对象。
 退出：/quit。退出会暂停新的提交，已提交的任务可能仍在供应商执行。
-详细配置：nolan configure 项目目录 --file settings.json --budget 金额
+详细配置：nolan configure 项目目录 --file settings.json
 """
 
 
@@ -38,12 +37,13 @@ def context(s):
                 items.extend({"kind": "shot", "episode": item["id"], **{k: sh.get(k) for k in
                     ("id", "status", "version", "duration")}} for sh in item["shots"])
     return {"title": s["title"], "mode": s["mode"], "status": s["status"], "items": items,
-            "budget": s["budget"], "paused": s["paused"], "last_error": s.get("last_error")}
+            "costs": {key: value for key, value in s["budget"].items() if key in
+                {"currency", "actual_cost", "actual_cost_jobs", "usage_cost", "usage_cost_jobs", "cost_pending_jobs", "cost_jobs"}}, "paused": s["paused"], "last_error": s.get("last_error")}
 
 
 def _blank(action, **kwargs):
     return {"action": action, "kind": "none", "id": "", "feedback": "", "shot_ids": [],
-            "limit": None, "reply": "", **kwargs}
+            "reply": "", **kwargs}
 
 
 def _is_question_or_hypothesis(message):
@@ -52,22 +52,6 @@ def _is_question_or_hypothesis(message):
 
 def _without_quoted_content(message):
     return re.sub(r'"[^"\n]*"|“[^”\n]*”|‘[^’\n]*’', "〔内容〕", message)
-
-
-def _budget_update(message):
-    """Only explicit setting commands authorize changing a spending limit."""
-    if _is_question_or_hypothesis(message) or re.search(r"不|别|没|暂缓|等等", message):
-        return None
-    pattern = r"(?:总预算|预算(?:上限)?|上限|budget)\s*(?:设为|设置为|设置成|改为|改成|调整为|调整到|调到|增加到|提高到|降低到|减少到|set\s+to)\s*(\d+(?:\.\d+)?)\s*(美元|美金|USD|CNY|人民币|元)?"
-    matches = list(re.finditer(pattern, message, re.I))
-    if len(matches) != 1:
-        return None
-    value, currency = matches[0].groups()
-    value = float(value)
-    if not math.isfinite(value):
-        return None
-    unit = "USD" if currency and currency.lower() in {"美元", "美金", "usd"} else "CNY" if currency else None
-    return value, unit
 
 
 def _bound_item(intent, seen, message):
@@ -113,7 +97,7 @@ def quick_command(message, ctx):
     msg = original.lower()
     if msg in {"帮助", "/help", "help"}:
         return _blank("help")
-    if msg in {"状态", "进度", "查看进度", "status", "/status", "预算", "查看预算"}:
+    if msg in {"状态", "进度", "查看进度", "status", "/status", "费用", "查看费用", "costs", "预算", "查看预算"}:
         return _blank("status")
     if msg in {"开始", "开始制作", "开始生成", "run", "/run"}:
         return _blank("run")
@@ -129,9 +113,8 @@ def quick_command(message, ctx):
         return _blank("preview")
     if msg in {"规划通过", "批准规划", "同意规划"}:
         return _blank("approve", kind="plan", id="plan")
-    budget = _budget_update(msg)
-    if budget:
-        return _blank("budget", limit=budget[0])
+    if re.search(r"(?:总预算|预算上限|预算)\s*(?:设为|设置|改为|改成|调整|提高|降低)", msg):
+        return _blank("answer", reply="Nolan 已取消预算设置和额度限制；可以用“查看费用”检查实际费用与用量记录。")
     episodes = [item for item in ctx["items"] if item["kind"] == "episode"]
     if msg in {"本集通过", "这一集通过", "这集通过"}:
         pending = [item for item in episodes if item["status"] == "awaiting_review"]
@@ -200,13 +183,7 @@ def execute_intent(root, message, intent, seen):
             raise ValueError("请明确提出修改意见后再返工")
         return core.reject(root, intent["kind"], intent["id"], item["version"], intent["feedback"], intent["shot_ids"])
     if action == "budget":
-        limit = intent.get("limit")
-        update = _budget_update(message)
-        if not update or type(limit) not in {float, int} or not math.isfinite(limit) or update[0] != limit:
-            raise ValueError("请明确填写预算上限，例如：总预算设为 30 元")
-        if update[1] and update[1] != seen["budget"]["currency"]:
-            raise ValueError("这次预算的币种与账本不一致；请在首次调用前用 configure 明确选择币种")
-        return core.configure(root, limit=limit)
+        raise ValueError("Nolan 已取消预算设置和额度限制；请用“查看费用”检查费用记录。")
     if action in {"pause", "resume", "run"}:
         verbs = {"pause": r"暂停|停下|停止|\bpause\b", "resume": r"继续|恢复|\bresume\b", "run": r"开始|执行|生成|制作|\brun\b"}
         negated = re.search(r"(?:不要|不用|不能|别|不)\s*(?:暂停|停止|停下)", message) if action == "pause" else re.search(r"不|别|没|暂缓", message)
@@ -316,7 +293,7 @@ def chat(project_dir=None):
                 if message.lower() in {"帮助", "/help", "help"}:
                     print(HELP)
                     continue
-                if message.lower() in {"状态", "进度", "查看进度", "status", "/status", "预算", "查看预算"}:
+                if message.lower() in {"状态", "进度", "查看进度", "status", "/status", "费用", "查看费用", "costs", "预算", "查看预算"}:
                     print("Nolan：还没有制作项目。提供小说 TXT/MD 路径，或输入“演示”。")
                     continue
                 root = _new_from_message(message)
@@ -340,7 +317,7 @@ def chat(project_dir=None):
             action = intent["action"]
             if action in {"run", "resume", "approve", "reject", "captions"}:
                 start()
-            elif action in {"status", "pause", "budget"}:
+            elif action in {"status", "pause"}:
                 print(summary(result))
         except Exception as exc:
             message = str(exc) if isinstance(exc, (ValueError, OSError)) or getattr(exc, "safe_message", False) else type(exc).__name__ + "：未执行，请检查配置"

@@ -26,8 +26,8 @@ class MusicCandidateFlowTests(unittest.TestCase):
         self.case.setUp()
         self.addCleanup(self.case.doCleanups)
         self.root = self.case.root
-        core.configure(self.root, {"music": {"mode": "volc", "call_cap": 1},
-                                  "poll_seconds": 1}, limit=100)
+        core.configure(self.root, {"music": {"mode": "volc"},
+                                  "poll_seconds": 1})
         with core.transaction(self.root) as state:
             state["mode"] = "live"
         self.provider = Mock()
@@ -61,8 +61,9 @@ class MusicCandidateFlowTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["task_id"], "synthetic-song-task")
         self.assertEqual((jobs[0]["state"], jobs[0]["accounting"]), ("completed", "spent"))
-        self.assertEqual(first["budget"]["spent"], 1)
-        self.assertIsNone(first["budget"]["actual_cost"], "reservation cap must not become verified billing")
+        self.assertTrue(jobs[0]["cost_track"])
+        self.assertEqual(first["budget"]["cost_pending_jobs"], 1)
+        self.assertIsNone(first["budget"]["actual_cost"], "missing public price must not become a zero-cost bill")
         self.assertEqual(self.provider.submit.call_args.args[1], 30)
 
         # A healthy restart reuses local ASR/GPT proofreading and the completed
@@ -87,10 +88,10 @@ class MusicCandidateFlowTests(unittest.TestCase):
         self.assertEqual(len(self.case.calls("proofread_subtitles")), 1)
         self.assertEqual(len(self.case.calls("arrange_music")), 1)
         self.provider.submit.assert_called_once()
-        self.assertEqual(core.load_project(self.root)["budget"]["spent"], 1)
+        self.assertEqual(core.load_project(self.root)["budget"]["cost_pending_jobs"], 1)
         self.assertEqual(self.case.shots(), original_shots)
 
-    def test_130_second_episode_requests_one_60_second_candidate_under_one_yuan_cap(self):
+    def test_130_second_episode_requests_one_60_second_candidate_without_a_budget(self):
         ep = self.case.episode()
         with patch.object(pipeline.media, "probe", return_value={"duration": 65}):
             output = pipeline._soundtrack(self.root, {**ep, "post_music_candidate": True})
@@ -100,9 +101,10 @@ class MusicCandidateFlowTests(unittest.TestCase):
         state = core.load_project(self.root)
         jobs = [job for job in state["jobs"].values() if job["kind"] == "music"]
         self.assertEqual(len(jobs), 1)
-        self.assertEqual(jobs[0]["amount"], 1)
-        self.assertEqual(state["budget"]["spent"], 1)
-        self.assertIsNone(state["budget"]["actual_cost"], "one yuan is only the reservation cap")
+        self.assertEqual(jobs[0]["amount"], 0)
+        self.assertTrue(jobs[0]["cost_track"])
+        self.assertEqual(state["budget"]["cost_pending_jobs"], 1)
+        self.assertIsNone(state["budget"]["actual_cost"], "zero estimate means unknown cost, not free")
         # Once the candidate has been downloaded, resuming the original task
         # reuses that file; a long episode is scored later with explicit cues.
         self.assertEqual(pipeline._soundtrack(self.root, {**self.case.episode(), "post_music_candidate": True}), output)

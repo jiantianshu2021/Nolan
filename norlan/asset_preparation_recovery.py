@@ -39,6 +39,7 @@ def _zero(value):
 def _budget_never_enabled(state):
     budget, jobs, events = state.get("budget"), state.get("jobs"), state.get("events")
     if (state.get("mode") != "live" or state.get("paused") is True or not isinstance(budget, dict)
+            or budget.get("enforcement") == "disabled"
             or budget.get("approved") is not False or not _zero(budget.get("limit"))
             or not isinstance(jobs, dict) or not isinstance(events, list)):
         return False

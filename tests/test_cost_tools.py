@@ -33,6 +33,11 @@ class CostToolTests(unittest.TestCase):
         self.assertEqual(report["calls"], [])
         self.assertIn("账单", report["basis"]["actual_cost"])
         self.assertIn("不等于账户扣款", report["basis"]["usage_cost"])
+        for retired in ("limit", "available", "approved", "spent", "reserved", "unknown"):
+            self.assertNotIn(retired, report["budget"])
+        self.assertEqual(report["budget"]["inflight_jobs"], 0)
+        self.assertEqual(report["budget"]["unknown_jobs"], 0)
+        self.assertNotIn("budget_cap", report["basis"])
         self.assertNotIn("sync", report)
         self.assertEqual((self.root / "project.json").read_bytes(), before)
         sync.assert_not_called()

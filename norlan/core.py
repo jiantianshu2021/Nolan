@@ -152,7 +152,7 @@ def _totals(state):
                               if j["accounting"] == status), 6)
     b["available"] = round(b["limit"] - b["spent"] - b["reserved"] - b["unknown"], 6)
     b.update(summarize_costs(state["jobs"], b["currency"]))
-    b["basis"] = "预算占用与费用分开；用量费用按公开标准价计算，实际费用须核对账单"
+    b["basis"] = "历史限额不再限制制作；用量费用按公开标准价计算，实际费用须核对账单"
 
 
 def _write(root, state):
@@ -235,8 +235,8 @@ def create_project(root, novel: str, mode="demo", title="Nolan 漫剧"):
             "gpt_video_review_enabled": False,
         },
         "budget": {"limit": 0, "currency": "CNY", "spent": 0, "reserved": 0,
-                   "unknown": 0, "approved": mode == "demo",
-                   "basis": "按用户填写的每次调用上限保守记账；非供应商实时账单"},
+                   "unknown": 0, "approved": mode == "demo", "enforcement": "disabled",
+                   "basis": "只记录费用；用量估算不是供应商实际账单"},
         "jobs": {}, "llm_calls": 0, "events": [], "last_error": None,
     }
     event(state, "project_created", mode=mode)
@@ -1577,6 +1577,7 @@ def set_paused(root, paused):
 
 
 def configure(root, settings=None, limit=None, currency=None):
+    """Update configuration; legacy limits are retained only as historical data."""
     with transaction(root) as s:
         s["settings"].setdefault("postproduction", {"enabled": False})
         if settings:
@@ -1618,9 +1619,10 @@ def configure(root, settings=None, limit=None, currency=None):
                 raise ValueError("产生账本后不能改变币种")
             s["budget"]["currency"] = currency
         if limit is not None:
-            if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit) or limit < 0 or limit < sum(s["budget"][x] for x in ("spent", "reserved", "unknown")):
-                raise ValueError("预算不能小于已花费和已占用额度")
+            if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit) or limit < 0:
+                raise ValueError("历史限额记录必须为非负有限数字")
             s["budget"].update(limit=limit, approved=True)
+        s["budget"]["enforcement"] = "disabled"
         event(s, "configuration_updated", budget_limit=s["budget"]["limit"])
     return load_project(root)
 
@@ -1669,8 +1671,13 @@ def _validate_advisory_target(root, state, kind, item_id, target):
     return copy.deepcopy(target)
 
 
-def reserve(root, job_id, kind, item_id, amount, *, pricing=None, advisory_target=None, require_video_review=False):
-    """Persist BEFORE calling provider. Unknown outcomes stay charged/reserved."""
+def reserve(root, job_id, kind, item_id, amount, *, pricing=None, advisory_target=None, require_video_review=False,
+            cost_track=None):
+    """Persist BEFORE calling provider, without a monetary spending gate.
+
+    ``amount`` is a legacy estimate, never proof of billing. Retain duplicate,
+    pause, unknown-outcome and finite call-count protections independently.
+    """
     with transaction(root) as s:
         if require_video_review and kind == "llm" and item_id == "review" and not video_review_enabled(s):
             raise VideoReviewDisabled("GPT 视频审查已关闭，未提交新的审查请求。")
@@ -1682,21 +1689,24 @@ def reserve(root, job_id, kind, item_id, amount, *, pricing=None, advisory_targe
             raise GateError("存在未核实调用，必须先对账才能提交新任务")
         checked_target = _validate_advisory_target(root, s, kind, item_id, advisory_target)
         if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount) or amount < 0:
-            raise ValueError("预算金额无效")
-        if s["mode"] == "live" and kind != "llm" and (not s["budget"]["approved"] or amount <= 0):
-            raise GateError("请先设置预算和媒体调用价格上限")
+            raise ValueError("调用费用估算无效")
+        if cost_track is not None and type(cost_track) is not bool:
+            raise ValueError("费用记录标记必须为布尔值")
         if kind == "llm":
             if s["llm_calls"] >= s["settings"]["max_llm_calls"]:
                 raise GateError("GPT 调用次数已达到上限")
-            if s["settings"]["brain"].get("provider") == "openai" and amount <= 0:
-                raise GateError("OpenAI API 模式需要填写每次调用预算上限")
             s["llm_calls"] += 1
-        _totals(s)
-        if amount > s["budget"]["available"] + 0.0000001:
-            raise GateError("剩余预算不足，任务未提交")
+        # A zero legacy budget is no longer evidence that media could not have
+        # been submitted. Persist this before POST for legacy recovery checks.
+        s["budget"]["enforcement"] = "disabled"
         s["jobs"][job_id] = {"id": job_id, "kind": kind, "item_id": item_id,
             "amount": round(amount, 6), "accounting": "reserved", "state": "submitting",
             "created_at": now(), "task_id": None}
+        brain = s["settings"]["brain"]
+        s["jobs"][job_id]["cost_track"] = (
+            s["mode"] == "live" and (kind != "llm" or brain.get("provider") == "openai"
+                                    or brain.get("billing") == "api")
+            if cost_track is None else cost_track)
         if kind == "llm" and item_id == "review":
             s["jobs"][job_id].update(purpose="advisory_review", advisory_target=checked_target)
         if pricing is not None:
@@ -1709,8 +1719,8 @@ def reserve(root, job_id, kind, item_id, amount, *, pricing=None, advisory_targe
 def update_job(root, job_id, **values):
     with transaction(root) as s:
         j = s["jobs"][job_id]
-        if set(values) & {"id", "item_id", "kind", "amount", "created_at", "billing", "purpose", "advisory_target"}:
-            raise ValueError("已登记的调用身份和预算金额不可更改")
+        if set(values) & {"id", "item_id", "kind", "amount", "created_at", "billing", "purpose", "advisory_target", "cost_track"}:
+            raise ValueError("已登记的调用身份和费用记录属性不可更改")
         if "accounting" in values and values["accounting"] not in {"spent", "reserved", "unknown", "released"}:
             raise ValueError("账本状态无效")
         if j["accounting"] == "spent" and values.get("accounting", "spent") != "spent":

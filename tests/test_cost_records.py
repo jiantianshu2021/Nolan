@@ -195,6 +195,29 @@ class CostRecordsTests(unittest.TestCase):
         report = json.loads(output.getvalue())
         self.assertEqual(report["budget"]["cost_jobs"], 1)
         self.assertIsNone(report["budget"]["actual_cost"])
+        for retired in ("limit", "available", "approved", "spent", "reserved", "unknown"):
+            self.assertNotIn(retired, report["budget"])
+        self.assertNotIn("budget_cap", report["calls"][0])
+
+    def test_read_only_report_retains_real_costs_without_budget_controls(self):
+        self.job()
+        core.reserve(self.root, "job-2", "video", "synthetic-unknown", 5)
+        core.reserve(self.root, "inflight", "video", "synthetic-active", 7)
+        core.update_job(self.root, "job-2", accounting="unknown", state="uncertain")
+        core.import_bill_costs(self.root, [self.bill(amount=2)])
+        before = (self.root / "project.json").read_bytes()
+        report = cost_report(self.root)
+        self.assertEqual(report["budget"]["actual_cost"], 2)
+        self.assertEqual(report["budget"]["cost_pending_jobs"], 1)
+        self.assertEqual(report["budget"]["inflight_jobs"], 1)
+        self.assertEqual(report["budget"]["unknown_jobs"], 1)
+        rendered = format_report(report)
+        self.assertIn("核实费用 2 CNY", rendered)
+        self.assertIn("未核实调用 1 次", rendered)
+        self.assertIn("结果待核实调用：1 次", rendered)
+        self.assertNotIn("预算", rendered)
+        self.assertNotIn("项目上限", rendered)
+        self.assertEqual((self.root / "project.json").read_bytes(), before)
 
     def test_cli_import_json_and_confirmation_requires_sync(self):
         self.job()

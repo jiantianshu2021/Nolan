@@ -174,10 +174,6 @@ def validate_choice(state, asset, model, duration=None, *, candidate=None):
         raise ValueError("当前资产流程每次最多 9 张参考图片；不会静默丢弃素材。")
     if model in _BY_ID:
         _validate_image_size(config, _BY_ID[model])
-    else:
-        cap = _mapping(_mapping(state.get("settings")).get("caps")).get("image")
-        if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not math.isfinite(cap) or cap <= 0:
-            raise ValueError("自定义图片接入点费用未知，请先配置正数 image 预算占用上限。")
     return config
 
 
@@ -201,28 +197,21 @@ def options(state, asset, candidate=None, *, duration=None):
 
 
 def reserve_amount(state, asset, model=None, duration=None, *, candidate=None):
-    """Conservative budget occupancy, never an assertion of charged cost."""
+    """Return an optional public-price estimate for the submission ledger.
+
+    The historic function name is retained for callers. Monetary caps no longer
+    control selection or submission. Zero means the price could not be estimated;
+    the separate billing snapshot/usage record retains that uncertainty.
+    """
     config = effective_config(state, asset, model)
     selected = config["video_model" if _voice(asset) else "image_model"]
     validate_choice(state, asset, selected, duration, candidate=candidate)
-    settings = _mapping(_mapping(state).get("settings"))
-    caps = _mapping(settings.get("caps"))
     currency = _mapping(_mapping(state).get("budget")).get("currency", "CNY")
     if _voice(asset):
         seconds = _duration(asset, duration, candidate)
-        unit = caps.get("video_second", 0)
-        if isinstance(unit, bool) or not isinstance(unit, (int, float)) or not math.isfinite(unit) or unit < 0:
-            raise ValueError("声音试片的 video_second 预算占用上限无效。")
         estimate = estimate_reservation({**config, "currency": currency}, seconds)
-        if estimate is None and not unit:
-            raise ValueError("所选声音试片模型费用未知，请先配置正数 video_second 预算占用上限。")
-        return round(max(unit * seconds, (estimate or 0) * 1.15), 6)
-    cap = caps.get("image", 0)
-    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not math.isfinite(cap) or cap < 0:
-        raise ValueError("图片预算占用上限无效。")
+        return round(estimate or 0, 6)
     images, _ = _references(state, asset, candidate)
     snapshot = price_snapshot({**config, "currency": currency}, "image")
-    public_cap = snapshot.get("rate", 0) + max(0, len(images) - snapshot.get("input_images_free", 0)) * snapshot.get("input_rate", 0)
-    if not public_cap and not cap:
-        raise ValueError("所选模型费用未知，请先配置正数 image 预算占用上限。")
-    return round(max(cap, public_cap), 6)
+    public_estimate = snapshot.get("rate", 0) + max(0, len(images) - snapshot.get("input_images_free", 0)) * snapshot.get("input_rate", 0)
+    return round(public_estimate, 6)

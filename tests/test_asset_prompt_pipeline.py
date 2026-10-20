@@ -290,32 +290,16 @@ class AssetPromptPipelineTests(unittest.TestCase):
         reserve.assert_not_called()
         prepare.assert_not_called()
 
-    def test_budget_refusal_retains_same_consent_version_and_resumes_once_after_limit_increase(self):
+    def test_zero_unapproved_budget_generates_only_human_confirmed_prompt_once(self):
+        with core.transaction(self.root) as state:
+            state["budget"].update(limit=0, approved=False)
+            state["settings"]["caps"].update(image=0, video_second=0)
         pipeline.run(self.root)
-        exact = "  合成预算恢复测试的人工最终提示词。\n原文与目标版本保持。  "
+        self.provider.generate_image.assert_not_called()
+        exact = "  合成无预算设置测试的人工最终提示词。\n原文与目标版本保持。  "
         self.approve_prompt(prompt=exact)
         approved = copy.deepcopy(self.asset()["generation_prompt"])
         decision = copy.deepcopy(self.asset()["generation_prompt_approval"])
-        core.configure(self.root, {}, limit=0.01)
-        with patch.object(core, "reserve", wraps=core.reserve) as reserve:
-            for _ in range(3):
-                state = pipeline.run(self.root)
-                asset = self.asset()
-                self.assertEqual(state["status"], "blocked")
-                self.assertIn("预算不足", state["last_error"])
-                self.assertEqual((asset["status"], asset["version"]), ("asset_prompt_approved", 0))
-                self.assertEqual(asset["generation_prompt"], approved)
-                self.assertEqual(asset["generation_prompt_approval"], decision)
-                self.assertNotIn("generation_request", asset)
-                self.assertNotIn("job_id", asset)
-                self.assertEqual(state["jobs"], {})
-            reserve.assert_not_called()
-        self.ark.assert_not_called()
-        self.provider.generate_image.assert_not_called()
-        self.provider.submit_video.assert_not_called()
-        core.configure(self.root, {}, limit=200)
-        # Raising the existing budget resumes the already authorized request;
-        # there is no second human approval or hidden replacement candidate.
         for _ in range(3):
             state = pipeline.run(self.root)
         self.assertEqual((self.asset()["status"], self.asset()["version"]), ("candidate", 1))

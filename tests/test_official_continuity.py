@@ -197,7 +197,10 @@ class OfficialContinuityTests(unittest.TestCase):
         self.assertNotIn(self.root / self.job()["official_tail"]["file"], refs)
         self.assertEqual(self.api.submit_video.call_count, 2)
         second_job = self.job(1)
-        self.assertEqual(second_job["amount"], 8)
+        # Input-video minimum-token schedules are not a known upfront charge.
+        # The real returned usage still prices this request at the input rate.
+        self.assertEqual(second_job["amount"], 0)
+        self.assertTrue(second_job["cost_track"])
         self.assertTrue(second_job["billing"]["price"]["has_video_input"])
         self.assertEqual(second_job["billing"]["price"]["rate"], 22)
         self.assertEqual(second_job["billing"]["usage_cost"], 2.2)
@@ -326,15 +329,37 @@ class OfficialContinuityTests(unittest.TestCase):
         self.api.submit_video.assert_called_once()
         self.api.video_artifacts.assert_not_called()
 
-    def test_insufficient_budget_for_input_plus_output_blocks_before_post(self):
-        self.approve_first()
+    def test_zero_budget_still_requires_exact_prompt_consent_for_original_video_reference(self):
+        first = self.approve_first()
+        original = (self.root / first["file"]).read_bytes()
         self.set_video_override()
-        # First output reserves four. Six remain: enough for output alone,
-        # insufficient for the four-second reference plus four-second output.
-        core.configure(self.root, {}, limit=10)
-        self.assertEqual(run_confirming_prompts(self.root)["status"], "blocked")
+        with core.transaction(self.root) as state:
+            state["budget"].update(limit=0, approved=False)
+            state["settings"]["caps"]["video_second"] = 0
+        self.assertEqual(pipeline.run(self.root)["status"], "awaiting_prompt_approval")
+        candidate = copy.deepcopy(self.shot(1)["prompt_candidate"])
+        for _ in range(2):
+            self.assertEqual(pipeline.run(self.root)["status"], "awaiting_prompt_approval")
         self.api.submit_video.assert_called_once()
         self.assertFalse(self.shot(1).get("job_id"))
+        core.approve_prompt(self.root, self.shot(1)["id"], candidate["id"], candidate["request_hash"])
+        approved = copy.deepcopy(self.shot(1)["prompt_approval"])
+        self.brain.reset_mock()
+        self.brain.side_effect = AssertionError("Confirmed continuation must not call GPT again")
+        for _ in range(2):
+            self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(self.api.submit_video.call_count, 2)
+        self.assertEqual(self.api.submit_video.call_args.args[0], candidate["prompt"])
+        self.assertEqual(self.api.submit_video.call_args.kwargs["previous_video"],
+                         self.artifacts(self.job()["task_id"])["url"])
+        self.assertEqual(self.shot(1)["prompt_approval"], approved)
+        self.assertEqual(self.job(1)["reference_video_duration"], 4)
+        self.assertEqual(self.job(1)["amount"], 0)
+        self.assertTrue(self.job(1)["cost_track"])
+        self.assertEqual(self.job(1)["billing"]["usage_cost"], 2.2)
+        self.assertEqual((self.root / first["file"]).read_bytes(), original)
+        self.assertEqual(self.shot(), first)
+        self.brain.assert_not_called()
 
     def test_demo_keeps_explicit_synthetic_tail_behavior_without_provider_calls(self):
         with core.transaction(self.root) as state:

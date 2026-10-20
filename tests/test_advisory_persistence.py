@@ -61,7 +61,7 @@ class AdvisoryPersistenceTests(unittest.TestCase):
         self.brain.return_value.review.assert_called_once()
         self.ark.assert_not_called()
 
-    def test_process_interruption_keeps_unknown_budget_and_does_not_repeat_review(self):
+    def test_process_interruption_keeps_unknown_record_and_does_not_repeat_review(self):
         def interrupted_after_submit(*args):
             self.brain.return_value.before_submit()
             raise KeyboardInterrupt("synthetic process interruption after request began")
@@ -73,7 +73,8 @@ class AdvisoryPersistenceTests(unittest.TestCase):
         self.assertEqual(original["state"], "submitting")
         state = pipeline.run(self.root)
         self.assertEqual(state["status"], "review_required", state.get("last_error"))
-        self.assertEqual((state["jobs"][original["id"]]["accounting"], state["budget"]["unknown"]), ("unknown", 2))
+        self.assertEqual(state["jobs"][original["id"]]["accounting"], "unknown")
+        self.assertIsNone(state["budget"]["actual_cost"])
         self.assertTrue(state["episodes"][0]["shots"][0]["review"]["report_unavailable"])
         self.brain.return_value.review.assert_called_once()
         self.ark.assert_not_called()

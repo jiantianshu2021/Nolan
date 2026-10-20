@@ -28,8 +28,9 @@ class BrainTransportUncertaintyTests(unittest.TestCase):
         def invoke(args, **_kwargs):
             reserved = core.load_project(self.root)
             self.assertEqual(reserved["llm_calls"], 1)
-            self.assertEqual(reserved["budget"]["reserved"], 2)
             job = next(iter(reserved["jobs"].values()))
+            self.assertEqual(job["amount"], 0)
+            self.assertFalse(job["cost_track"])  # Subscription has no per-call invoice.
             self.assertEqual((job["state"], job["accounting"]), ("submitting", "reserved"))
             if output_text is not None:
                 Path(args[args.index("--output-last-message") + 1]).write_text(output_text)
@@ -44,7 +45,8 @@ class BrainTransportUncertaintyTests(unittest.TestCase):
             job = next(iter(first["jobs"].values()))
             self.assertEqual((job["state"], job["accounting"]), ("uncertain", "unknown"))
             self.assertTrue(job["failure"]["uncertain"])
-            self.assertEqual(first["budget"]["unknown"], 2)
+            self.assertEqual(first["budget"]["unknown"], 0)
+            self.assertIsNone(first["budget"]["actual_cost"])
             self.assertEqual(first["budget"]["spent"], 0)
             self.assertEqual(first["budget"]["reserved"], 0)
             self.assertEqual(len(core.blocking_unknown_jobs(first)), 1)
@@ -84,7 +86,9 @@ class BrainTransportUncertaintyTests(unittest.TestCase):
         self.assert_unknown_blocks_repeat(returncode=0, output_text="not a JSON model result")
 
     def test_reservation_refusal_prevents_both_cli_and_api_transports(self):
-        core.configure(self.root, limit=1)
+        core.configure(self.root, {"max_llm_calls": 1})
+        with core.transaction(self.root) as state:
+            state["llm_calls"] = 1
         before = core.load_project(self.root)
         reserve = core.reserve
         with patch.dict(os.environ, {"OPENAI_API_KEY": "SYNTHETIC-LOCAL-TEST-KEY"}), \
@@ -94,7 +98,7 @@ class BrainTransportUncertaintyTests(unittest.TestCase):
                 with self.subTest(provider=provider):
                     self.config.update(provider=provider, billing=billing)
                     with patch("norlan.pipeline.core.reserve", wraps=reserve) as reservation:
-                        with self.assertRaisesRegex(core.GateError, "预算不足"):
+                        with self.assertRaisesRegex(core.GateError, "调用次数"):
                             pipeline._brain(self.root, "refine_shot", self.shot, {}, [])
                         reservation.assert_called_once()
                     after = core.load_project(self.root)

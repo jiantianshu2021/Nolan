@@ -1,4 +1,4 @@
-"""Provider usage pricing and bill reconciliation, separate from budget caps.
+"""Provider usage pricing and bill reconciliation, separate from estimates.
 
 Public-price calculations are not account charges: discounts, credits and other
 bill adjustments are deliberately not inferred here. This module performs no IO.
@@ -125,10 +125,10 @@ def price_snapshot(config, kind, *, has_video_input=False):
 def estimate_reservation(config, duration, reference_duration=0):
     """Round a known no-video-input public estimate upward to CNY cents.
 
-    This is a budget estimate, never actual account cost. Official token formula:
+    This is a public-price estimate, never actual account cost. Official formula:
     (input-video seconds + output seconds) * width * height * 24 / 1024.
     Reference-video requests have an additional minimum-token schedule; without
-    a verified matching floor, return None and retain the configured budget cap.
+    a verified matching floor, return None and keep the price unknown.
     Unknown aliases, gateways, adaptive ratios and unsupported specs are unknown.
     """
     config = config if isinstance(config, Mapping) else {}
@@ -232,10 +232,13 @@ def usage_record(result, snapshot):
 
 
 def summarize_costs(jobs, currency):
-    """Summarize unique ledger entries without interpreting caps as paid costs.
+    """Summarize unique ledger entries without interpreting estimates as costs.
 
     A verified bill amount takes precedence over usage pricing for that job, even
     when the explicit amount is zero. Missing monetary evidence stays unknown.
+    New live paid calls explicitly opt into cost tracking even when no estimate
+    is available. Legacy positive estimates and billing evidence remain readable;
+    a zero estimate alone neither proves a charge nor establishes a free call.
     """
     jobs = jobs if isinstance(jobs, Mapping) else {}
     actual_total, usage_total = Decimal(0), Decimal(0)
@@ -244,11 +247,23 @@ def summarize_costs(jobs, currency):
         if not isinstance(job, Mapping):
             continue
         amount = _number(job.get("amount"))
-        if amount is None or amount <= 0 or job.get("accounting") not in {"spent", "unknown"}:
+        billing = job.get("billing")
+        billing = billing if isinstance(billing, Mapping) else {}
+        bill_reference = billing.get("bill_reference")
+        has_actual_evidence = (_number(billing.get("actual_cost")) is not None
+                               and isinstance(bill_reference, str) and bool(bill_reference.strip()))
+        usage = billing.get("usage")
+        has_usage_evidence = ((isinstance(usage, Mapping)
+                               and any(_integer(usage.get(field)) is not None for field in USAGE_FIELDS))
+                              or (billing.get("status") == "usage_priced"
+                                  and _number(billing.get("usage_cost")) is not None))
+        tracked = (job.get("cost_track") is True
+                   or amount is not None and amount > 0
+                   or has_actual_evidence or has_usage_evidence)
+        if not tracked or job.get("accounting") not in {"spent", "unknown"}:
             continue
         cost_jobs += 1
-        billing = job.get("billing")
-        if currency not in {"CNY", "USD"} or not isinstance(billing, Mapping) or billing.get("currency") != currency:
+        if currency not in {"CNY", "USD"} or billing.get("currency") != currency:
             continue
         actual = _number(billing.get("actual_cost"))
         reference = billing.get("bill_reference")

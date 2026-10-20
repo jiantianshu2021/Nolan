@@ -188,7 +188,7 @@ class MusicProvider:
                 raise ProviderError("每段音乐时长必须是 5–120 秒的整数。")
             checked.append({"Name": segment["Name"], "Duration": seconds})
         if sum(segment["Duration"] for segment in checked) != duration:
-            raise ProviderError("音乐分段时长之和必须等于已预算的生成时长。")
+            raise ProviderError("音乐分段时长之和必须等于本次请求的生成时长。")
         # Segments have higher duration priority than instructions inside Text.
         # This prevents a model-written prompt from silently increasing runtime.
         payload = {"Text": prompt.strip(), "Duration": duration, "Version": "v5.0",

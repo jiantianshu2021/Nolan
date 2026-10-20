@@ -98,16 +98,31 @@ class AssetModelsTests(unittest.TestCase):
         candidate = {"duration": 5, "reference_manifest": {"images": [], "audio": []}}
         self.assertEqual(asset_models.validate_selection(state, voice, candidate, FAST), FAST)
 
-    def test_unknown_image_model_requires_positive_operator_cap(self):
+    def test_unknown_image_model_does_not_require_a_monetary_cap(self):
         state = self.state(image_model="ep-synthetic-existing")
         for cap in (None, False, 0, -1, float("nan")):
             state["settings"]["caps"]["image"] = cap
-            with self.subTest(cap=cap), self.assertRaisesRegex(ValueError, "预算占用上限"):
-                asset_models.validate_choice(state, self.image(), "ep-synthetic-existing")
+            with self.subTest(cap=cap):
+                selected = asset_models.validate_choice(state, self.image(), "ep-synthetic-existing")
+                self.assertEqual(selected["image_model"], "ep-synthetic-existing")
+                self.assertEqual(asset_models.reserve_amount(state, self.image()), 0)
+                self.assertNotIn("rate", price_snapshot(selected, "image"))
+        state["settings"].pop("caps")
+        options = asset_models.options(state, self.image())
+        self.assertTrue(next(row for row in options if row["id"] == "ep-synthetic-existing")["available"])
+
+    def test_unknown_voice_model_keeps_unknown_price_without_requiring_a_cap(self):
+        state = self.state(video_model="ep-synthetic-voice")
+        state["settings"].pop("caps")
+        config = asset_models.validate_choice(state, self.voice(), "ep-synthetic-voice", duration=5)
+        self.assertEqual(asset_models.reserve_amount(state, self.voice(), duration=5), 0)
+        self.assertNotIn("rate", price_snapshot(config, "voice"))
+        with self.assertRaisesRegex(ValueError, "时长"):
+            asset_models.reserve_amount(state, self.voice(), duration=100)
 
     def test_reservation_uses_selected_model_and_actual_reference_inputs(self):
         state = self.state()
-        self.assertEqual(asset_models.reserve_amount(state, self.image(), IMAGE_MODEL), 0.15)
+        self.assertEqual(asset_models.reserve_amount(state, self.image(), IMAGE_MODEL), 0.12)
         self.assertEqual(asset_models.reserve_amount(state, self.image(4), PRO), 0.66)
         self.assertEqual(asset_models.reserve_amount(self.state(image_size="1.5K"), self.image(1), PRO), 0.30)
         self.assertEqual(asset_models.reserve_amount(state, self.image(), OLD), 0.25)
@@ -115,7 +130,9 @@ class AssetModelsTests(unittest.TestCase):
         standard = asset_models.reserve_amount(state, self.voice(), "doubao-seedance-2-0-260128", duration=5)
         self.assertGreater(standard, fast)
         state["settings"]["caps"]["image"] = 1
-        self.assertEqual(asset_models.reserve_amount(state, self.image(4), PRO), 1)
+        self.assertEqual(asset_models.reserve_amount(state, self.image(4), PRO), 0.66)
+        state["settings"]["caps"]["video_second"] = float("nan")
+        self.assertEqual(asset_models.reserve_amount(state, self.voice(), FAST, duration=5), fast)
 
 
 class AssetImageBillingTests(unittest.TestCase):

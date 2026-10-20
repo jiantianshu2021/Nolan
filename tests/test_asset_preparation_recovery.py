@@ -23,6 +23,8 @@ class AssetPreparationRecoveryTests(unittest.TestCase):
             asset = core._find(state, "asset", "hero")
             asset.update(status="generating", version=1, feedback="合成用户原始意见。")
             state.update(status="blocked", last_error="合成本机预算拒绝。")
+            # Explicitly model a pre-0.8.2 state, when a zero budget prevented POST.
+            state["budget"].pop("enforcement", None)
         self.before = self.state()
 
     def state(self):
@@ -62,7 +64,7 @@ class AssetPreparationRecoveryTests(unittest.TestCase):
         self.assertEqual(self.state()["events"], state["events"])
 
     def test_budget_must_be_strictly_never_approved_and_zero(self):
-        for updates in ({"approved": True}, {"approved": None}, {"approved": 0},
+        for updates in ({"enforcement": "disabled"}, {"approved": True}, {"approved": None}, {"approved": 0},
                         {"limit": 1}, {"limit": False}):
             with self.subTest(updates=updates):
                 self.restore()

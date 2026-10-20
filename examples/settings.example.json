@@ -11,11 +11,6 @@
     "image_size": "2K",
     "timeout": 120
   },
-  "caps": {
-    "image": 0,
-    "video_second": 0,
-    "llm": 0
-  },
   "max_attempts": 3,
   "max_llm_calls": 80,
   "batch_size": 3,
@@ -26,12 +21,10 @@
   "music": {
     "mode": "none",
     "action": "GenBGMForTime",
-    "call_cap": 0,
     "timeout": 90
   },
   "subtitles": {
     "mode": "none",
-    "call_cap": 0,
     "model": "whisper-1",
     "api_key_env": "OPENAI_API_KEY",
     "language": "zh",

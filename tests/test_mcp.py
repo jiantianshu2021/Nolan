@@ -144,7 +144,7 @@ class MCPTests(unittest.TestCase):
         self.assertFalse(self.root.exists())
         state = self.create()
         self.assertEqual(state["mode"], "live")
-        self.assertFalse(state["budget"]["approved"])
+        self.assertNotIn("approved", state["budget"])
         original = (self.root / "source/novel.txt").read_bytes()
         self.assertTrue(self.call("create_project", project=str(self.root), novel_text="覆盖")["isError"])
         self.assertEqual((self.root / "source/novel.txt").read_bytes(), original)
@@ -188,7 +188,7 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(state["plan"]["status"], "candidate")
         self.assertEqual(state["plan"]["version"], 1)
         self.assertEqual(state["episodes"][0]["shots"][0]["asset_ids"], ["hero", "station"])
-        self.assertFalse(state["budget"]["approved"])
+        self.assertNotIn("approved", state["budget"])
         self.assertEqual(core.load_project(self.root)["jobs"], {})
 
     def test_plan_voice_errors_are_actionable_and_do_not_change_project(self):
@@ -229,7 +229,7 @@ class MCPTests(unittest.TestCase):
         state = self.value(self.call("save_plan", project=str(self.root), plan=plan))
         self.assertEqual(state["plan"]["status"], "candidate")
         self.assertEqual(state["plan"]["version"], 1)
-        self.assertFalse(state["budget"]["approved"])
+        self.assertNotIn("approved", state["budget"])
         self.assertEqual(core.load_project(self.root)["jobs"], {})
 
     def test_plan_validation_never_echoes_submitted_values(self):
@@ -382,7 +382,7 @@ class MCPTests(unittest.TestCase):
         root = creative / "Nolan-制作"
         state = selected.call_tool("create_project", {"project": str(root), "source_path": str(script)})
         self.assertEqual(state["project"], str(root))
-        self.assertFalse(state["budget"]["approved"])
+        self.assertNotIn("approved", state["budget"])
         self.assertEqual(state["plan"]["status"], "pending")
         self.assertEqual(script.read_text(), "合成独立新项目剧本")
         self.assertFalse((creative / "project.json").exists())
@@ -437,6 +437,21 @@ class MCPTests(unittest.TestCase):
         self.assertEqual({item["project"] for item in listed["projects"]}, {str(self.root), str(unrelated)})
         self.assertEqual((self.root / "project.json").read_bytes(), before)
         self.assertTrue(self.root.exists())
+
+    def test_status_and_director_guidance_keep_costs_without_budget_setup(self):
+        self.create()
+        core.configure(self.root, limit=0)
+        state = self.value(self.call("project_status", project=str(self.root)))
+        for key in ("limit", "approved", "available", "spent", "reserved", "unknown"):
+            self.assertNotIn(key, state["budget"])
+        self.assertIn("actual_cost", state["budget"])
+        self.assertNotIn("budget", state["operator_actions"])
+        self.assertIn("已取消预算", state["operator_actions"]["costs"])
+        self.assertNotIn("--budget", json.dumps(state["operator_actions"]))
+        from norlan.interactive import _DIRECTOR_INSTRUCTIONS
+        self.assertIn("不要要求用户配置或确认预算", _DIRECTOR_INSTRUCTIONS)
+        self.assertNotIn("caps.llm", _DIRECTOR_INSTRUCTIONS)
+        self.assertNotIn("提高预算", _DIRECTOR_INSTRUCTIONS)
 
     def test_source_path_creation_preserves_original(self):
         source = self.workspace.parent / "original.txt"
@@ -649,7 +664,7 @@ class MCPTests(unittest.TestCase):
         self.assertTrue(state["paused"])
         self.assertEqual(state["settings"]["creative_brief"], "")
 
-    def test_background_production_cannot_reserve_beyond_user_budget(self):
+    def test_background_production_records_calls_without_legacy_budget_block(self):
         self.create()
         self.save_plan()
         core.approve(self.root, "plan", "plan", 1)
@@ -657,7 +672,7 @@ class MCPTests(unittest.TestCase):
 
         def attempt_paid_job(root):
             core.reserve(root, "test-not-submitted", "image", "hero", 1)
-            self.fail("budget must stop this before any paid submission")
+            raise core.GateError("合成测试只记录调用，不连接任何供应商")
 
         with patch.object(pipeline, "_assets", side_effect=attempt_paid_job):
             self.value(self.call("run_production", project=str(self.root)))
@@ -666,7 +681,7 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(state["status"], "blocked")
         self.assertEqual(state["budget"]["limit"], .5)
         self.assertEqual(state["budget"]["spent"], 0)
-        self.assertEqual(state["jobs"], {})
+        self.assertEqual(state["jobs"]["test-not-submitted"]["accounting"], "reserved")
 
     def test_open_review_reuses_local_server_and_close_stops_it(self):
         self.create()

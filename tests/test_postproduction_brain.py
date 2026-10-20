@@ -27,7 +27,7 @@ class PostproductionBrainTests(unittest.TestCase):
     def test_timing_feedback_is_passed_to_caption_route_without_model_timing_edits(self):
         feedback = "第一集前五条字幕出现太早，00:03 才开始说话，请重新对齐，不要重做视频。"
         command = {"action": "captions", "kind": "episode", "id": "E001", "feedback": feedback,
-                   "shot_ids": [], "limit": None, "reply": ""}
+                   "shot_ids": [], "reply": ""}
         with patch.object(Brain, "_codex", return_value=command) as model:
             self.assertEqual(Brain().command(feedback, {"items": [{"kind": "episode", "id": "E001"}]}), command)
         instruction = model.call_args.args[0]

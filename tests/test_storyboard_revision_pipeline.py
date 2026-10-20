@@ -68,7 +68,12 @@ class StoryboardRevisionPipelineTests(unittest.TestCase):
         self.fixture.api.submit_video.assert_called_once()
         self.assertEqual(self.fixture.api.submit_video.call_args.args[1], 10)
         job = core.load_project(self.root)["jobs"][self.shot()["job_id"]]
-        self.assertEqual((job["duration"], job["amount"]), (10, 10))
+        self.assertEqual(job["duration"], 10)
+        # This synthetic model has no public price: obsolete per-second caps
+        # must not become either a charge or a prerequisite for the redesign.
+        self.assertEqual(job["amount"], 0)
+        self.assertTrue(job["cost_track"])
+        self.assertIsNone(job.get("billing", {}).get("actual_cost"))
         self.assertEqual(core.load_project(self.root)["episodes"][0]["shots"][1], before["episodes"][0]["shots"][1])
         self.assertEqual(core.load_project(self.root)["assets"], before["assets"])
 

@@ -191,9 +191,9 @@ class ManualPromptPipelineTests(unittest.TestCase):
         self.api.submit_video.assert_called_once()
         self.brain.assert_not_called()
 
-    def test_manual_edit_keeps_budget_gate_before_any_paid_post(self):
+    def test_manual_edit_ignores_old_budget_limit_and_submits_exact_text_once(self):
         self.prepare()
-        raw = "人工已确认，仍受预算控制。"
+        raw = "人工已确认，按此原文生成。"
         self.edit(raw)
         approved = copy.deepcopy(self.shot()["prompt_candidate"])
         self.forbid_gpt()
@@ -203,17 +203,14 @@ class ManualPromptPipelineTests(unittest.TestCase):
         before_jobs = copy.deepcopy(core.load_project(self.root)["jobs"])
         before_llm_calls = core.load_project(self.root)["llm_calls"]
         for _ in range(3):
-            self.assertEqual(pipeline.run(self.root)["status"], "blocked")
+            self.assertEqual(pipeline.run(self.root)["status"], "review_required")
             current = self.shot()
             self.assertEqual(current["prompt_candidate"], approved)
-            self.assertEqual(current["status"], "prompt_approved")
-            self.assertEqual(current["version"], approved["version"] - 1)
+            self.assertEqual(current["status"], "review_required")
+            self.assertEqual(current["version"], approved["version"])
             self.assertEqual(core.load_project(self.root)["llm_calls"], before_llm_calls)
-        self.api.submit_video.assert_not_called()
         self.brain.assert_not_called()
-        self.assertEqual(core.load_project(self.root)["jobs"], before_jobs)
-        core.configure(self.root, limit=100)
-        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.assertEqual(len(core.load_project(self.root)["jobs"]), len(before_jobs) + 1)
         self.assertEqual(self.api.submit_video.call_args.args[0], raw)
         self.assertEqual(self.shot()["version"], approved["version"])
         self.api.submit_video.assert_called_once()

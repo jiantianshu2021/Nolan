@@ -8,7 +8,7 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   child folders and retain existing projects/media. Keep subscription/API homes
   separate, share login only through the existing auth link, and never inherit
   provider credentials into shell tools or import global hooks/MCP config.
-  Ordinary files can be edited with native tools; production approvals, budget,
+  Ordinary files can be edited with native tools; production approvals, cost records,
   provider submissions and ledger changes use Nolan's MCP flow. Never claim the
   desktop app's browser/plugins are automatically available in the CLI.
 - Ark credentials resolve from the explicitly selected environment variable,
@@ -30,7 +30,7 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   reports; enabling does not backfill skipped versions. Check the setting again
   at reservation, while allowing an already submitted review to finish.
 - Each next episode is blocked until the preceding final render is approved.
-- Importing a season preserves existing episodes, assets, budget, approvals and
+- Importing a season preserves existing episodes, assets, cost records, approvals and
   source/novel.txt. Store immutable per-episode source hashes and retain original
   episode numbers/durations when explicitly chosen. Plan only the next eligible
   episode from its source, a small asset catalog and the previous accepted ending.
@@ -43,18 +43,23 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   confirmation selects the per-request model and authorizes one generation.
   Asset-direction/description choices, asset-amendment approvals and Continue
   do not authorize media. Adopt manual prompt text exactly; never rewrite it.
-  Check budget, credentials and local voice transport before advancing version;
+  Check credentials and local voice transport before advancing version;
   a local refusal keeps the same consent. Recover submitted jobs by original
   ID/configuration; do not backfill consent for existing media.
 - Asset direction/input confirmation must preserve a blocked failure reason.
   Production failures keep bounded, sanitized phase/asset diagnostics separate
   from transient last_error. Clear the active error only on a real phase
   transition; display the actual server/terminal runtime version.
-  Never infer a new project budget from another project. Legacy asset version
+  Monetary budget limits/approval and configured per-call caps are retired for
+  all projects. Keep cost/usage/bill records, human approval, max_llm_calls and
+  unknown-outcome protections. Never ask users to set/confirm a budget.
+  Legacy asset version
   rollback requires the never-approved zero-budget proof, complete absence of
   media jobs/reservations/artifacts/consent and an audit event; it only returns
   to human prompt/model confirmation and never submits media.
-- Reserve cost before a paid POST. Unknown submission outcomes must not be
+- Journal each call before a paid POST. Legacy monetary reservation fields are
+  historical compatibility data, never evidence of actual charges or a spending
+  gate. Unknown submission outcomes must not be
   retried. Persist the provider ID before polling or downloading.
 - Do not claim sampled frames establish audio, lip-sync or full-motion quality.
 - Never replace actual references with prose while claiming references were sent.
@@ -80,7 +85,7 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
 - Prepare source-hash-bound transport copies without removing/reordering any
   references. Preserve source dimensions where possible, image alpha and audio
   duration/channels; never alter approved originals or official tail frames.
-  Validate exact encoded request size before reserving and verify the same
+  Validate exact encoded request size before recording the submission and verify the same
   payload digest immediately before POST. Keep only counts/digests/provenance,
   never base64 bodies or signed video URLs, in the ledger/UI.
   Proven pre-network local refusals release only their reservation. Legacy

@@ -47,8 +47,9 @@ class BrainSubmissionBoundaryTests(unittest.TestCase):
         def submit(_request, **_kwargs):
             state = core.load_project(self.root)
             self.assertEqual(state['llm_calls'], 1)
-            self.assertEqual(state['budget']['reserved'], 2)
             job = list(state['jobs'].values())[-1]
+            self.assertTrue(job['cost_track'])
+            self.assertEqual(job['amount'], 0)  # Price pending until usage/bill evidence.
             self.assertEqual((job['state'], job['accounting']), ('submitting', 'reserved'))
             return self.api_response(output)
         with patch('norlan.brain._api_open', side_effect=submit) as transport:
@@ -64,7 +65,8 @@ class BrainSubmissionBoundaryTests(unittest.TestCase):
             first = core.load_project(self.root)
             job = list(first['jobs'].values())[-1]
             self.assertEqual((job['state'], job['accounting']), ('uncertain', 'unknown'))
-            self.assertEqual(first['budget']['unknown'], 2)
+            self.assertEqual(first['budget']['cost_pending_jobs'], 1)
+            self.assertIsNone(first['budget']['actual_cost'])
             with self.assertRaisesRegex(core.GateError, '结果不明'):
                 pipeline._brain(self.root, 'refine_shot', self.shot, {}, [])
             self.assertEqual(transport.call_count, 1)
@@ -77,11 +79,13 @@ class BrainSubmissionBoundaryTests(unittest.TestCase):
         job = list(core.load_project(self.root)['jobs'].values())[-1]
         self.assertEqual((job['state'], job['accounting']), ('failed', 'spent'))
 
-    def test_budget_refusal_stops_before_any_model_post(self):
-        core.configure(self.root, limit=1)
+    def test_call_count_refusal_stops_before_any_model_post(self):
+        core.configure(self.root, {"max_llm_calls": 1})
+        with core.transaction(self.root) as state:
+            state["llm_calls"] = 1
         before = core.load_project(self.root)
         with patch('norlan.brain._api_open', side_effect=AssertionError('No model POST')):
-            with self.assertRaisesRegex(core.GateError, '预算不足'):
+            with self.assertRaisesRegex(core.GateError, '调用次数'):
                 pipeline._brain(self.root, 'refine_shot', self.shot, {}, [])
         after = core.load_project(self.root)
         self.assertEqual(after['jobs'], before['jobs'])

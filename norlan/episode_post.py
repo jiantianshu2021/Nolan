@@ -43,9 +43,8 @@ def music_configuration(state):
     config = state["settings"].get("music", {})
     if config.get("mode") == "library":
         return False, "使用本地曲库，无需音乐API凭据。请添加音乐到配置文件夹、扫描并试听确认。"
-    cap = config.get("call_cap", 0)
-    if config.get("mode") != "volc" or type(cap) not in {int, float} or not math.isfinite(cap) or cap <= 0:
-        return False, "自动生成音乐需配置火山纯音乐服务（独立AK/SK）及单次费用上限；也可直接导入本地音乐。"
+    if config.get("mode") != "volc":
+        return False, "自动生成音乐需配置火山纯音乐服务（独立AK/SK）；也可直接导入本地音乐。"
     try:
         MusicProvider(config)._credentials()
     except Exception:

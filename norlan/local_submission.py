@@ -158,10 +158,10 @@ def _restore(state, shot, job, candidate, root):
     prompt_gate._validate_inputs(root, validation_state, core._find(validation_state, "shot", shot["id"]), candidate)
     job.update(accounting="released", updated_at=stamp,
         local_submission_recovery={"policy": RECOVERY_POLICY, "status": "restored",
-            "reason": "请求在本机 64 MB 检查时被拒绝，未建立供应商请求；已释放预算，原文等待重新确认。",
+            "reason": "请求在本机 64 MB 检查时被拒绝，未建立供应商请求；原文等待重新确认。",
             "identity": original_identity, "restored_candidate_id": candidate["id"],
             "restored_version": candidate["version"], "restored_at": stamp,
-            "public_summary": "原请求未提交，已释放预算；已保留完整提示词，请确认后再生成。"})
+            "public_summary": "原请求未提交；已保留完整提示词，请确认后再生成。"})
     shot["local_submission_recovery"] = {"job_id": job["id"], "at": stamp,
         "candidate_id": candidate["id"], "public_summary": job["local_submission_recovery"]["public_summary"]}
     core.event(state, "local_video_submission_recovered", id=shot["id"], job_id=job["id"],

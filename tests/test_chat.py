@@ -45,25 +45,40 @@ class ChatTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             execute_intent(self.root, "规划通过", quick_command("规划通过", seen), seen)
 
-    def test_budget_must_appear_in_human_message(self):
+    def test_retired_budget_command_does_not_mutate_or_start_production(self):
         seen = context(self.state)
         cmd = quick_command("总预算设为 30 元", seen)
-        self.assertEqual(execute_intent(self.root, "总预算设为 30 元", cmd, seen)["budget"]["limit"], 30)
-        with self.assertRaises(ValueError):
-            execute_intent(self.root, "查看预算", {**cmd, "limit": 1000}, seen)
+        before = core.load_project(self.root)
+        with patch("norlan.chat.core.configure") as configure, redirect_stdout(io.StringIO()) as output:
+            execute_intent(self.root, "总预算设为 30 元", cmd, seen)
+        configure.assert_not_called()
+        self.assertIn("已取消预算设置", output.getvalue())
+        self.assertEqual(core.load_project(self.root), before)
 
     def test_help_never_calls_model(self):
         self.assertEqual(quick_command("查看进度", context(self.state))["action"], "status")
 
-    def test_budget_questions_and_currency_mismatch_cannot_change_cap(self):
+    def test_legacy_model_budget_intent_is_rejected_and_cost_context_is_minimal(self):
         seen = context(self.state)
-        cmd = _blank("budget", limit=30)
-        for message in ("预算还能 30 吗", "预算 30 元", "如果预算设为 30 元", "不要把预算设为 30 元", "预算设为 30 美元", "预算设为30元还是40元", "我说过预算设为30元"):
-            with self.subTest(message=message), self.assertRaises(ValueError):
-                execute_intent(self.root, message, cmd, seen)
-        self.assertEqual(core.load_project(self.root)["budget"]["limit"], 0)
-        self.assertIsNone(quick_command("预算 30 元", seen))
-        self.assertEqual(execute_intent(self.root, "请把预算上限调整到 30 元", cmd, seen)["budget"]["limit"], 30)
+        with self.assertRaisesRegex(ValueError, "已取消预算"):
+            execute_intent(self.root, "请把预算上限调整到 30 元", _blank("budget", limit=30), seen)
+        self.assertNotIn("budget", seen)
+        self.assertNotIn("limit", seen["costs"])
+        self.assertEqual(quick_command("查看费用", seen)["action"], "status")
+        self.assertEqual(quick_command("查看预算", seen)["action"], "status")
+
+    def test_configure_legacy_budget_flag_is_hidden_and_ignored(self):
+        before = core.load_project(self.root)
+        output, error = io.StringIO(), io.StringIO()
+        from contextlib import redirect_stderr
+        with patch("norlan.cli.remember"), redirect_stdout(output), redirect_stderr(error):
+            self.assertEqual(main(["configure", str(self.root), "--budget", "2000"]), 0)
+        self.assertIn("已废弃并忽略", error.getvalue())
+        self.assertEqual(core.load_project(self.root)["budget"], before["budget"])
+        self.assertNotIn("上限", output.getvalue())
+        with redirect_stdout(io.StringIO()) as help_output, self.assertRaises(SystemExit):
+            main(["configure", "--help"])
+        self.assertNotIn("--budget", help_output.getvalue())
 
     def test_run_and_resume_questions_do_not_unpause(self):
         core.set_paused(self.root, True)
@@ -97,7 +112,8 @@ class ChatTests(unittest.TestCase):
         with patch("builtins.input", side_effect=["/help", "状态", "/quit"]), patch("norlan.chat._new_from_message") as create, redirect_stdout(output):
             self.assertEqual(chat(), 0)
         create.assert_not_called()
-        self.assertIn("总预算设为", output.getvalue())
+        self.assertIn("查看费用", output.getvalue())
+        self.assertNotIn("总预算设为", output.getvalue())
         self.assertIn("尚未创建项目", output.getvalue())
 
     def test_offline_episode_preview_uses_context_order(self):

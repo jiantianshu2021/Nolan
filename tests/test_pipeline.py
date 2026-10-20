@@ -140,7 +140,7 @@ class PipelineTests(unittest.TestCase):
             core.approve(self.root, "asset", a["id"], a["version"])
 
     def live(self):
-        core.configure(self.root, {"caps": {"image": 1, "video_second": 1}, "max_poll_seconds": 1}, limit=100)
+        core.configure(self.root, {"max_poll_seconds": 1})
         with core.transaction(self.root) as state:
             state["mode"] = "live"
 
@@ -207,7 +207,12 @@ class PipelineTests(unittest.TestCase):
                 state = pipeline.run(self.root)
                 pipeline.run(self.root)
             self.assertEqual(api.submit_video.call_count, 1)
-            self.assertEqual(state["budget"]["unknown"], 4)
+            unknown = core.blocking_unknown_jobs(state)
+            self.assertEqual(len(unknown), 1)
+            self.assertEqual(unknown[0]["amount"], 0)
+            self.assertTrue(unknown[0]["cost_track"])
+            self.assertEqual(state["budget"]["cost_pending_jobs"], 1)
+            self.assertIsNone(state["budget"]["actual_cost"])
             self.assertEqual(state["status"], "blocked")
 
     def test_known_task_download_failure_recovers_same_id(self):
@@ -229,9 +234,13 @@ class PipelineTests(unittest.TestCase):
                 pipeline._video(self.root, "video", "E001-S001", output, 4, "prompt", [], old_job=job_id)
             self.assertEqual(api.submit_video.call_count, 1)
             self.assertEqual([c.args[0] for c in api.poll_video.call_args_list], ["provider-task", "provider-task"])
-            self.assertEqual(core.load_project(self.root)["budget"]["spent"], 4)
+            final = core.load_project(self.root)
+            self.assertEqual(final["jobs"][job_id]["accounting"], "spent")
+            self.assertTrue(final["jobs"][job_id]["cost_track"])
+            self.assertEqual(final["budget"]["cost_pending_jobs"], 1)
+            self.assertIsNone(final["budget"]["actual_cost"])
 
-    def test_missing_credentials_or_model_reserves_no_media_budget(self):
+    def test_missing_credentials_or_model_creates_no_submission(self):
         with fake_media():
             self.ready()
             self.live()
@@ -386,7 +395,11 @@ class PipelineTests(unittest.TestCase):
                 pipeline.run(self.root)
             self.assertEqual(api.submit_video.call_count, 2)
             self.assertEqual(state["status"], "generation_failed")
-            self.assertEqual(state["budget"]["spent"], 8)
+            calls = [job for job in state["jobs"].values() if job.get("cost_track") is True]
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(all(job["accounting"] == "spent" and job["state"] == "failed" for job in calls))
+            self.assertEqual(state["budget"]["cost_pending_jobs"], 2)
+            self.assertIsNone(state["budget"]["actual_cost"])
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires FFmpeg")
     def test_real_synthetic_media_end_to_end(self):

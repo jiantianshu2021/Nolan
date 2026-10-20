@@ -76,7 +76,7 @@ def production_connection_info(config: dict) -> dict:
             "model": model,
             "connection_conflict": direct and active == "subscription",
             "note": "项目固定 API 与订阅选择冲突，制作请求将停止。" if direct and active == "subscription" else
-                    "制作中的 API 调用需项目预算；自由对话费用独立于项目预算。" if direct or active == "api" else
+                    "制作调用费用记录在项目账本中；自由对话费用由 OpenAI 账户单独计费。" if direct or active == "api" else
                     "使用 ChatGPT 订阅账户额度。"}
 
 
@@ -123,7 +123,7 @@ def setup(provider: str | None = None, model: str | None = None) -> int:
     save_connection(selected)
     print(describe_connection())
     print("运行 nolan 开始对话。" if provider == "chatgpt" else
-          "运行 nolan 开始对话。自由对话的 API 费用由 OpenAI 账户计费，独立于漫剧项目预算。")
+          "运行 nolan 开始对话。自由对话的 API 费用由 OpenAI 账户单独计费。")
     return 0
 
 

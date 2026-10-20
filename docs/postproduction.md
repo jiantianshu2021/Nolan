@@ -23,10 +23,10 @@
 这是独立服务，不能使用方舟API Key，也不复用即梦网页会员。程序不会代替你购买套餐或开通付费服务。当前项目使用后付费 `GenBGMForTime`，预付费套餐不能自动抵扣后付费；参见[官方开通指南](https://docs.volcengine.com/docs/Audiovideounderstandingandprocessing/ConsoleServiceActivationGuide?lang=zh)和[产品计费](https://docs.volcengine.com/docs/Audiovideounderstandingandprocessing/Productbilling?lang=zh)。项目非秘密设置为：
 
 ```json
-{"music":{"mode":"volc","action":"GenBGMForTime","call_cap":1.0}}
+{"music":{"mode":"volc","action":"GenBGMForTime"}}
 ```
 
-`call_cap` 只是格式示例，并非官方价格；须根据账户服务费用设足额的单次上限，受现有总预算约束。只有点击“生成一首新音乐”才授权一个新候选。先记预算，再提交、保存供应商任务ID、查询和下载；结果不明不重发。当前音乐API适配器已做模拟协议测试，未用真实账户付费验证。
+无需配置 `call_cap` 或项目预算。只有点击“生成一首新音乐”才授权一个新候选。先登记调用，再提交、保存供应商任务ID、查询和下载；结果不明不重发。当前音乐API适配器已做模拟协议测试，未用真实账户付费验证。
 
 生成的候选按本集时长选择30–60秒；单次服务上限不限制整集长度。GPT可在130秒时间轴上显式安排多条音乐片段、留白和交叉淡化，每段都校验素材真实范围。不会拉伸音乐、隐式循环或缩短视频。编排只接收当前集的精简剧情/对白窗口、已批准音乐目录和上一集结尾少量cue。
 
