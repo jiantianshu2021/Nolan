@@ -21,7 +21,7 @@ def signature(shot):
 def blocked_state():
     shot = {"id": "S7", "status": "planned", "version": 0, "revision": 1, "duration": 12,
             "feedback": "系统任务框需要女性声音播报，保留原总时长。", "prompt": "合成测试原分镜。"}
-    shot["revision_analysis"] = {"signature": signature(shot), "summary": "原播报起点与台词时长可能冲突。",
+    shot["revision_analysis"] = {"signature": signature(shot), "planning_policy_version": 2, "summary": "原播报起点与台词时长可能冲突。",
         "blockers": ["保持原总时长和切点时，原定起点可能无法读完。token=PRIVATE-TOKEN https://private.invalid/task"],
         "raw_config": "PRIVATE-CONFIG"}
     return {"id": "synthetic", "mode": "live", "status": "blocked", "paused": False,

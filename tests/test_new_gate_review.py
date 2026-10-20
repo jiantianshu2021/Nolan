@@ -87,7 +87,9 @@ class NewGateReviewTests(unittest.TestCase):
         shot = state["episodes"][0]["shots"][0]
         shot.update(status="planned", version=0, feedback="增加系统播报", revision=0)
         signature = hashlib.sha256(json.dumps([0, shot["feedback"]], ensure_ascii=False).encode()).hexdigest()
-        shot["revision_analysis"] = {"signature": signature, "blockers": ["请确认播报起点"], "summary": "等待时间安排"}
+        shot["revision_analysis"] = {"signature": signature,
+            "blockers": ["人物原对白正常语速超过单次15秒上限，须先调整拆段规划。"],
+            "summary": "等待处理真实引擎时长限制。", "planning_policy_version": 2}
         return state
 
     def test_new_planning_conflict_opens_review_once(self):

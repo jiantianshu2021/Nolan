@@ -170,6 +170,13 @@ STORYBOARD_REVISION_SCHEMA = _object({
     "duration": {"type": "integer", "minimum": 4, "maximum": 15},
     "subshots": _array(SUBSHOT_SCHEMA, minItems=1, maxItems=3),
 })
+FUTURE_CONTINUITY_UPDATE_SCHEMA = _object({
+    "id": ID,
+    "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "prompt": STRING,
+    "continuity_notes": STRING,
+    "subshots": _array(SUBSHOT_SCHEMA, minItems=1, maxItems=3),
+})
 REVISION_SCHEMA = _object({
     "needs_assets": {"type": "boolean"},
     "additions": _array(REVISION_ASSET_SCHEMA, maxItems=20),
@@ -178,6 +185,7 @@ REVISION_SCHEMA = _object({
                                      "continuity_notes": STRING}), maxItems=100),
     "audio_policy": _object({"system_broadcast": SYSTEM_BROADCAST_SCHEMA}),
     "storyboard_revision": {"anyOf": [STORYBOARD_REVISION_SCHEMA, {"type": "null"}]},
+    "future_continuity_updates": _array(FUTURE_CONTINUITY_UPDATE_SCHEMA, maxItems=1),
     "summary": STRING, "blockers": _array(STRING, maxItems=30),
 })
 REVIEW_SCHEMA = _object({"verdict": {"type": "string", "enum": ["pass", "fail", "uncertain"]},
@@ -200,10 +208,10 @@ MUSIC_CUE_SCHEMA = _object({"summary": STRING, "cues": _array(_object({
 
 def _validate(value, schema: dict, path: str = "output") -> None:
     """Validate the small schema subset used here, even after structured output."""
-    # Wire responses must include the new nullable field. Older saved results
-    # and fixtures mean no storyboard change; keep their returned shape intact.
-    if schema is REVISION_SCHEMA and isinstance(value, dict) and "storyboard_revision" not in value:
-        value = {"storyboard_revision": None, **value}
+    # Wire responses include both revision fields. Older saved results and
+    # fixtures mean no additional draft; keep their returned shape intact.
+    if schema is REVISION_SCHEMA and isinstance(value, dict):
+        value = {"storyboard_revision": None, "future_continuity_updates": [], **value}
     if "anyOf" in schema:
         for variant in schema["anyOf"]:
             try:
@@ -549,6 +557,26 @@ def _previous_actual_task(previous):
     return summary
 
 
+def _next_continuity_task(shot, context, episodes):
+    """Expose one adjacent boundary without media history or execution records."""
+    from .future_continuity import eligible_next
+    editable = eligible_next(context, shot)
+    for episode in episodes:
+        shots = episode.get("shots", [])
+        for index, candidate in enumerate(shots):
+            if not isinstance(candidate, dict) or candidate.get("id") != shot.get("id"):
+                continue
+            if index + 1 >= len(shots) or not isinstance(shots[index + 1], dict):
+                return None, None
+            following = shots[index + 1]
+            selected = {**_shot_creative(following),
+                        **_task_fields(following, ("feedback", "status", "version"))}
+            if editable is not None and editable.get("id") == following.get("id"):
+                return selected, None
+            return None, selected
+    return None, None
+
+
 def revision_task_context(shot, context):
     """Select dependencies for the model; keep the full context for local checks.
 
@@ -595,6 +623,20 @@ def revision_task_context(shot, context):
             item["related_future_shots"] = selected
             selected_episodes.append(item)
     summary["episodes"] = selected_episodes
+    summary["future_continuity_policy"] = {
+        "scope": "same_episode_immediate_next_only",
+        "preserve": ["id", "scene_id", "duration", "dialogue", "asset_ids", "subshot_count", "cut_times"],
+        "latest_feedback_priority": True,
+        "prompt_approval_required": True,
+    }
+    eligible, fixed = _next_continuity_task(shot, context, episodes)
+    if eligible is not None:
+        summary["eligible_next_shot"] = eligible
+    elif fixed is not None:
+        summary["fixed_next_shot"] = fixed
+    if isinstance(context.get("blocker_repair"), dict):
+        summary["blocker_repair"] = _task_fields(context["blocker_repair"],
+            ("summary", "blockers", "planning_policy_version"))
     if "previous_actual" in context:
         summary["previous_actual"] = _previous_actual_task(context["previous_actual"])
     return _editorial_audio_policy_context(summary, context)
@@ -865,11 +907,11 @@ voice.audition_speaker（非空时）是原文的说话归属，例如“系统�
 同一个 feedback 是唯一入口，按完整语义自主判断普通内容修改、局部重新分镜、资产增补或组合需求，不靠固定关键词决定路线，不要求用户换表单。
 storyboard_revision=null 表示保留当前内部镜头结构与时长；普通构图、表演、运镜或声音细化不构成新增切镜授权。
 当意见要求调整当前片段内部镜头数量、摄影切点、各镜头叙事内容或片段时长时，先重新分镜，输出 storyboard_revision={{summary,duration,subshots:[{{start,end,prompt}}]}}。
-只重设计当前 shot 的内部镜头，保持该片段 id、scene_id、人物 canonical dialogue、其他片段及其已有成片不变。
+重新分镜只重设计当前 shot 的内部镜头，保持该片段 id、scene_id、人物 canonical dialogue 和其他已有成片不变；紧邻下一段若尚未开始，可按下述 future_continuity_updates 规则协调必要接续。
 本次需要局部重新分镜时，用户已授权 GPT 按反馈、自然对白和动作节奏自主确定当前片段合理时长，不必保留旧 duration，也不再要求用户确认秒数。
 duration 必须是视频引擎单次支持的4–15秒整数；新 subshots 为1–3个镜头，从0开始无间隙、无重叠覆盖本次 duration。
 如正常对白与必要动作确实超过15秒，写入 blockers 说明需另行拆段，不把 duration 假写15来掩盖超时，不加速、删改对白或隐式新增视频 API 任务。
-整集总时长随目标片段的新时长相应变化，其他片段不变；不得为凑回旧130秒而裁短别段、加速或重分集。
+整集总时长随目标片段的新时长相应变化，其他片段时长不变；不得为凑回旧130秒而裁短别段、加速或重分集。
 每个 prompt 具体写景别、运镜、人物方位、动作起止、所属原对白和切镜承接；不得用“同上”代替完整可执行内容。
 这是同一个视频 API 任务的内部时间表，不拆成多个生成任务，不宣称只修某一镜就能保留其他镜成片。
 storyboard_revision.summary 说明镜头数量、时长、内容与切点如何回应本次意见，明确新分镜和后续完整提示词均尚未批准。
@@ -881,6 +923,14 @@ context.assets 是当前引用的真实资产定义；asset_catalog 是本机已
 目录不是画面或试听证据，不能假称已观察；复用的真实定义由本地解析、校验，仍须满足其当前审批状态。
 episodes 仅给既定总时长、完整顺序时长约束和相关尚未生成片段；当前完整片段在 shot，不重复列入 related_future_shots。
 未给出的历史报告、无关场景或后段不属于本次修改范围，不要求补齐它们，也不据此编造内容。
+future_continuity_policy 说明相邻接续边界，eligible_next_shot 是本机确认尚未开始且允许协调的唯一同集紧邻下一段；fixed_next_shot 若存在则为固定边界，不得修改。
+最新用户明确的动作和结尾优先于 eligible_next_shot 中尚未生成的旧开头。若当前新结尾已完成下一段旧开头动作，自主安排下一段从该新结尾接续，消除重演、倒退或互相冲突的姿态，不把旧草稿当作不可改的人工要求。
+确需协调时填写 future_continuity_updates=[{{id,summary,prompt,continuity_notes,subshots}}]，最多一项，id 只能是 eligible_next_shot.id；不需协调或没有 eligible_next_shot 时填 []。
+这是未生成的接续草稿，不是重做下一段视频。仅调整衔接必需的画面动作，保留下一段核心剧情、后续发展和已有明确要求；保留 id、scene_id、duration、dialogue、asset_ids、子镜数量和每个 start/end。
+subshots 仍逐镜写完整可执行内容，开头从当前拟定新结尾继续，后续剧情保持。summary 说明删去何种重复或修正何种姿态以及保留了什么，明确下一段仍需单独确认完整提示词后才生成。
+future_continuity_updates 不得携带时长、对白、资产、审批、任务或版本字段；不能跨集、跳过下一段、修改已开始或已有提示词候选的片段，不因当前返修要求自动重做其他已生成素材。
+若只是当前段与 eligible_next_shot 旧开头相冲突，应提交协调草稿且 blockers=[]，不要再次要求用户确认是否允许协调、补充相同意见或选择秒数。
+blocker_repair 若存在仅为旧规划问题的参考摘要，表示应按现行规则重新求解；旧 blockers 不是新的人工限制，已经有可执行方案的旧冲突不得照抄为阻塞。
 只有意见明确引入缺失的人物、声源、场景或道具才新增。不能把“加女声播报”当成修改或重做现有男主声线。
 仅画外的系统/任务框女播报员建立 kind=character、voice_only=true 的逻辑声源，无人物形象、无需图片；
 再建 kind=voice、character_id 绑定该声源，voice_only=false。其他资产 voice_only=false。
@@ -894,7 +944,7 @@ additions 每项含 id、kind、name、prompt、character_id、voice_only、audi
 如果没有合格原句则保留空 text/source、reason 说明缺口，同时在 blockers 写明须补充或选择原文，不能先提交生成。
 shot_updates 仅使用 {{id,add_asset_ids,prompt,dialogue,continuity_notes}}，只添加实际需要的引用，保留原有全部引用。
 当前片段及其后尚未生成的相关片段可更新；已有成片的其他片段不变，也不安排它们重新生成。
-严格保留其他片段 duration 和全部片段 scene_id；除本次明确需要重设计的当前片段外，保留 subshots 的数量、顺序、start/end 和既有画面动作。
+严格保留其他片段 duration 和全部片段 scene_id；除本次明确需要重设计的当前片段外，保留 subshots 的数量、顺序和 start/end。其他片段既有画面动作原则上保留，唯一例外是 future_continuity_updates 中同集紧邻未生成下一段的必要接续协调。
 当前片段只有通过非 null storyboard_revision 才能提出新的摄影时间表和镜头内容，shot_updates 不携带 subshots、duration、scene_id 等结构字段。
 本次明确要求并已由 storyboard_revision 提出的新时长与切点属于授权规划范围，下文声音规则中的“原时长、原切点”对此指新时间表；不能把用户要求的局部重新分镜本身再次列为阻塞。
 旧子镜中声音/UI的起止文字可在同段内提出合理替代草稿，以便完整自然播报，摄影切点与动作因果不变。
@@ -903,7 +953,7 @@ shot_updates 仅使用 {{id,add_asset_ids,prompt,dialogue,continuity_notes}}，�
 以最新明确的人工意见为准；旧 revision_analysis 或其历史只是先前诊断，不是新的人工要求，
 不能把已采用资产方案中的历史反馈再次当作新增资产授权，也不能把“增强科技感”推断为同意提前播音已经执行；同段内合理草稿仍可先准备待审。
 新规划每集约60秒的默认值不适用于本次返修，不能据此重新分集或压缩对白；
-新增声音或资产本身不是裁短旧集、删剧情或加速台词的理由。本次明确重分镜时，整集仅按目标片段的新时长增减，其他段不变。
+新增声音或资产本身不是裁短旧集、删剧情或加速台词的理由。本次明确重分镜时，整集仅按目标片段的新时长增减，其他段时长与核心剧情不变。
 prompt 写清新声源仅画外、系统原文与其在既有动作中的位置，去掉旧 prompt 中“系统无配音/不念任务框”等与用户要求相冲突的限制。
 continuity_notes 注明新播报规则覆盖旧内部镜头里相冲突的无配音文字，但原切点和动作不变。
 人物原对白逐字保留，不能为省时删减、改写或加速；系统短播的内容取舍按以上项目专项规则由 GPT 决定，无须再次征求逐句/秒数选择。
@@ -1089,6 +1139,11 @@ blockers=[] 表示没有已知规划阻塞，不表示批准。needs_assets 必�
             raise BrainError("未启用的系统播报规则不能携带声源或执行要求。")
         if not set(additions).issubset(referenced):
             raise BrainError("返修规划创建了没有实际引用用途的多余资产。")
+        from .future_continuity import validate_updates
+        try:
+            validate_updates(context, shot, result.get("future_continuity_updates", []))
+        except ValueError as exc:
+            raise BrainError(str(exc)) from None
         result["blockers"] = list(dict.fromkeys(result["blockers"]))
         return result
 

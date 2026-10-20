@@ -37,7 +37,7 @@ class HumanReviewPipelineTests(unittest.TestCase):
         self.enterContext(patch.object(pipeline, "_ark", return_value=self.api))
         self.brain = self.enterContext(patch.object(pipeline, "_brain", side_effect=self.fake_brain))
 
-    def fake_brain(self, root, method, *args):
+    def fake_brain(self, root, method, *args, **kwargs):
         if method == "plan_revision":
             return {"needs_assets": False, "additions": [], "shot_updates": [],
                     "summary": "合成普通返修", "blockers": []}

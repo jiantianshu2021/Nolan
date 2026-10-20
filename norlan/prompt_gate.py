@@ -232,6 +232,11 @@ def specification(state, shot, prompt, manifest, refined=None):
         raise core.GateError(str(exc)) from None
     if redesign is not None:
         specification["storyboard_revision"] = redesign
+    from .future_continuity import public_updates
+    updates = public_updates(state, shot, strict=True)
+    if updates:
+        specification["future_continuity_updates"] = updates
+        specification["future_continuity_binding"] = copy.deepcopy(shot["future_continuity_binding"])
     proposal = validate_timing_proposal(shot, refined or {})
     if proposal is not None:
         specification["timing_proposal"] = proposal
@@ -291,6 +296,9 @@ def _validate_inputs(root, state, shot, candidate):
             or candidate.get("version") != shot.get("version", 0) + 1):
         raise core.GateError("提示词候选已过期，请重新准备。")
     _validate_candidate_timing(shot, candidate)
+    from .future_continuity import public_updates
+    if candidate.get("future_continuity_updates", []) != public_updates(state, shot, strict=True):
+        raise core.GateError("后续接续调整说明已改变，请重新准备并确认完整提示词。")
     for identifier in shot["asset_ids"]:
         core._check_artifact(root, core._find(state, "asset", identifier))
     manifest = candidate["reference_manifest"]
@@ -334,6 +342,10 @@ def prepare(root, shot_id, refined, prompt, manifest):
             raise core.GateError(str(exc)) from None
         if redesign is not None:
             candidate["storyboard_revision"] = redesign
+        from .future_continuity import public_updates
+        updates = public_updates(state, shot, strict=True)
+        if updates:
+            candidate["future_continuity_updates"] = updates
         proposal = validate_timing_proposal(shot, refined)
         broadcast = validate_broadcast_proposal(shot, refined, state)
         if broadcast is not None:
@@ -384,7 +396,7 @@ def reject(root, shot_id, candidate_id, request_hash, feedback):
         shot.pop("prompt_candidate", None)
         shot.pop("prompt_approval", None)
         from .storyboard_revision import discard
-        discard(shot, reason=feedback.strip(), stamp=core.now())
+        discard(shot, reason=feedback.strip(), stamp=core.now(), state=state)
         shot["feedback"] = (shot.get("feedback", "") + "\n提示词修改意见：" + feedback.strip()).strip()
         shot.update(status="planned", revision=shot.get("revision", 0) + 1)
         analysis = shot.pop("revision_analysis", None)

@@ -797,7 +797,7 @@ def approve(root, kind, item_id, version):
     return load_project(root)
 
 
-def _invalidate_shot(shot, reason, *, increment_revision=True):
+def _invalidate_shot(shot, reason, *, increment_revision=True, state=None):
     from . import storyboard_revision
     if shot.get("file"):
         shot.setdefault("history", []).append({k: copy.deepcopy(shot[k]) for k in
@@ -811,7 +811,7 @@ def _invalidate_shot(shot, reason, *, increment_revision=True):
     if shot.get("revision_analysis"):
         shot.setdefault("revision_analysis_history", []).append({**copy.deepcopy(shot["revision_analysis"]),
             "superseded_at": now(), "resolution": "human_revision"})
-    storyboard_revision.discard(shot, reason=reason, stamp=now())
+    storyboard_revision.discard(shot, reason=reason, stamp=now(), state=state)
     shot.update(status="planned", revision=shot.get("revision", 0) + int(increment_revision), feedback=reason)
     for key in ("file", "sha256", "evidence", "review", "job_id", "refined_prompt", "approved_at", "approved_sha256", "approved_version", "generation_error",
                 "prompt_candidate", "prompt_approval", "revision_analysis"):
@@ -836,7 +836,7 @@ def _request_shot_revision(state, shot, feedback):
     owner = next(ep for ep in state["episodes"] if any(sh is shot for sh in ep["shots"]))
     episode_index, shot_index = state["episodes"].index(owner), owner["shots"].index(shot)
     _shot_decision(shot, "revision_requested", feedback)
-    _invalidate_shot(shot, feedback)
+    _invalidate_shot(shot, feedback, state=state)
     _invalidate_render(owner, feedback)
     for index, ep in enumerate(state["episodes"][episode_index:], start=episode_index):
         affected = []
@@ -889,7 +889,7 @@ def can_edit_shot_revision(state, shot):
                for attempt in shot.get("attempts", []) if isinstance(attempt, dict))
 
 
-def _invalidate_episode(ep, reason, shot_ids=None):
+def _invalidate_episode(ep, reason, shot_ids=None, *, state=None):
     if ep.get("file"):
         ep["history"].append({k: ep[k] for k in ("file", "sha256", "version") if k in ep})
     selected = set(shot_ids or [sh["id"] for sh in ep["shots"]])
@@ -897,7 +897,7 @@ def _invalidate_episode(ep, reason, shot_ids=None):
     for shot in ep["shots"]:
         if shot["id"] in selected or shot["scene_id"] in changed_scenes:
             changed_scenes.add(shot["scene_id"])
-            _invalidate_shot(shot, reason)
+            _invalidate_shot(shot, reason, state=state)
     ep.update(status="revision_requested", feedback=reason)
     for key in ("file", "sha256", "approved_at", "approved_sha256", "verified_subtitles", "render_manifest",
                 "progress_stage", "progress_started_at"):
@@ -946,7 +946,7 @@ def reject(root, kind, item_id, version, feedback, shot_ids=None):
             for ep in s["episodes"]:
                 selected = [sh["id"] for sh in ep["shots"] if item_id in sh["asset_ids"]]
                 if selected or affected:
-                    _invalidate_episode(ep, "资产变更：" + feedback, None if affected else selected)
+                    _invalidate_episode(ep, "资产变更：" + feedback, None if affected else selected, state=s)
                     affected = True
         elif kind == "episode":
             if item["status"] not in {"awaiting_review", "approved", "revision_requested"}:
@@ -968,7 +968,7 @@ def reject(root, kind, item_id, version, feedback, shot_ids=None):
                 if shot.get("status") == "planned" and not shot.get("file") and not shot.get("job_id"):
                     # Supplemental episode feedback edits the already queued
                     # attempt; it does not create another generation authority.
-                    _invalidate_shot(shot, feedback, increment_revision=False)
+                    _invalidate_shot(shot, feedback, increment_revision=False, state=s)
                 else:
                     _request_shot_revision(s, shot, feedback)
             _invalidate_render(item, feedback)
@@ -1401,6 +1401,12 @@ def activate_asset_amendment(root, amendment_id):
         from . import storyboard_revision
         cached_analysis = copy.deepcopy(target.get("revision_analysis", {}))
         cached_redesign = cached_analysis.get("storyboard_revision")
+        from . import future_continuity
+        cached_future = copy.deepcopy(cached_analysis.get("future_continuity_updates", []))
+        if cached_future:
+            checked = future_continuity.validate_updates(state, target, [item["update"] for item in cached_future])
+            if checked != cached_future:
+                raise GateError("资产增补绑定的后段接续草稿已过期，请重新准备。")
         if cached_redesign is not None:
             if (cached_analysis.get("signature") != storyboard_revision.feedback_signature(target)
                     or cached_analysis.get("storyboard_baseline") != storyboard_revision.baseline(target)):
@@ -1452,6 +1458,11 @@ def activate_asset_amendment(root, amendment_id):
                                                         ensure_ascii=False).encode()).hexdigest(),
                 "amendment_id": amendment_id, "blockers": [],
                 "summary": "资产与片段更新方案已获人工确认，沿用已批准素材准备提示词，仍须确认后才生成。"}
+            if shot is target:
+                shot["revision_analysis"]["planning_policy_version"] = future_continuity.PLANNING_POLICY_VERSION
+                if cached_future:
+                    shot["revision_analysis"]["future_continuity_updates"] = future_continuity.validate_updates(
+                        state, target, [item["update"] for item in cached_future])
             if shot is target and cached_redesign is not None:
                 shot["revision_analysis"].update(storyboard_revision=cached_redesign,
                     storyboard_baseline=storyboard_revision.baseline(shot))
@@ -1511,7 +1522,10 @@ def submit_planning_feedback(root, shot_id, feedback, expected_version, analysis
                 or analysis.get("signature") != current_signature or not isinstance(blockers, list)
                 or not blockers or any(not isinstance(item, str) or not item.strip() for item in blockers)):
             raise GateError("规划问题已更新或已解决，请刷新后针对当前问题填写意见")
-        combined = (old_feedback + "\n\n用户对规划阻塞的补充意见：" + feedback).strip()
+        from .future_continuity import FEEDBACK_SEPARATOR
+        if feedback in [part.strip() for part in old_feedback.split(FEEDBACK_SEPARATOR)]:
+            raise GateError("这条修改意见已经保存，无需重复提交。请继续准备提示词；如确有新要求，再填写新增内容。")
+        combined = (old_feedback + FEEDBACK_SEPARATOR + feedback).strip()
         if len(combined) > 100000:
             raise ValueError("累计规划调整意见超过 100000 字，请精简后再提交")
         stamp = now()
@@ -1526,7 +1540,7 @@ def submit_planning_feedback(root, shot_id, feedback, expected_version, analysis
         for key in ("revision_analysis", "prompt_approval", "refined_prompt"):
             shot.pop(key, None)
         from .storyboard_revision import discard
-        discard(shot, reason=feedback, stamp=stamp)
+        discard(shot, reason=feedback, stamp=stamp, state=state)
         shot.update(status="planned", revision=revision + 1, feedback=combined)
         state.update(status="paused" if state["paused"] else "ready", last_error=None)
         event(state, "human_planning_feedback", id=shot_id, version=expected_version, revision=shot["revision"],

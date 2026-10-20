@@ -61,6 +61,14 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   accordingly rather than silently retiming other segments.
   Finish any asset approval first, then require the complete final prompt's
   existing human approval before submitting the new video version.
+- When a new ending conflicts with the immediate next unstarted plan, let GPT
+  draft the minimum continuity edit instead of repeatedly requesting the same
+  human feedback. Preserve the next segment's duration, cuts, dialogue, scene
+  and assets. Never modify another started segment, prompt candidate or human
+  instruction. Bind both drafts atomically; rejecting the source prompt rolls
+  back only untouched neighbor drafts. Each segment keeps its own prompt gate.
+  Migrate old planning blockers once per policy version and cache completed
+  revision results; unknown outcomes never authorize resubmission.
 - Synthetic tests are visibly marked as such. Do not contact paid providers in CI.
 
 Run `python3 -m unittest discover -s tests -v` (FFmpeg integration tests require

@@ -10,7 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import broadcast, core, media, official, prompt_gate, storyboard_revision
+from . import broadcast, core, future_continuity, media, official, prompt_gate, storyboard_revision
 from .brain import task_asset_summary, task_context_summary, task_shot_summary
 from .billing import price_snapshot
 from .failures import exception_failure, sanitize_failure
@@ -67,7 +67,7 @@ def _brain(root, method, *args, **kwargs):
     from .connection import production_brain_config
     cache_key = kwargs.pop("_cache_key", None)
     s = _gate(root)
-    if cache_key and method in {"proofread_subtitles", "arrange_music", "plan_episode"}:
+    if cache_key and method in {"proofread_subtitles", "arrange_music", "plan_episode", "plan_revision"}:
         for old in reversed(list(s["jobs"].values())):
             if (old.get("item_id") == method and old.get("state") == "completed"
                     and old.get("post_cache_key") == cache_key):
@@ -103,7 +103,7 @@ def _brain(root, method, *args, **kwargs):
             # report when there are no frames. It consumes no model request.
             return result
         cached = {"review_result": copy.deepcopy(result), "review_result_hash": core._json_digest(result)} if method == "review" else {}
-        if cache_key and method in {"proofread_subtitles", "arrange_music", "plan_episode"}:
+        if cache_key and method in {"proofread_subtitles", "arrange_music", "plan_episode", "plan_revision"}:
             cached.update(post_cache_key=cache_key, post_result=copy.deepcopy(result), post_result_hash=core._json_digest(result))
         core.update_job(root, job_id, state="completed", accounting="spent", **cached)
         return result
@@ -894,7 +894,12 @@ def _revision_analysis(root, shot):
     # requests such as "让另一个女人说这些" or "换到沙漠里".
     signature = hashlib.sha256(json.dumps([shot.get("revision", 0), shot["feedback"]], ensure_ascii=False).encode()).hexdigest()
     old = shot.get("revision_analysis", {})
-    if old.get("signature") == signature:
+    state = _gate(root)
+    old_matches = old.get("signature") == signature
+    recovery = future_continuity.planning_recovery_available(state, shot)
+    changed_dependency = (old_matches and old.get("blockers") and old.get("continuity_dependency")
+                          and old["continuity_dependency"] != future_continuity.dependency(state, shot))
+    if old_matches and not recovery and not changed_dependency:
         if old.get("amendment_id"):
             amendment = next((a for a in core.load_project(root).get("asset_amendments", [])
                               if a.get("id") == old["amendment_id"]), {})
@@ -908,7 +913,6 @@ def _revision_analysis(root, shot):
             raise core.GateError("；".join(old["blockers"]))
         storyboard_revision.apply(root, shot["id"], old)
         return True
-    state = _gate(root)
     if state["mode"] == "demo":
         return True
     from .season_sources import source_text
@@ -917,6 +921,18 @@ def _revision_analysis(root, shot):
     context = task_context_summary({"assets": state["assets"], "episodes": [current_episode],
                "novel": source,
                "audio_policy": state.get("audio_policy", {})})
+    # Only safety sentinels are added to the local projection. Histories, prior
+    # manifests and provider records never enter the planner's model context.
+    originals = {item["id"]: item for item in current_episode["shots"]}
+    for item in context["episodes"][0]["shots"]:
+        original = originals[item["id"]]
+        for key in ("attempts", "prompt_candidate", "prompt_approval", "pending_asset_amendment",
+                    "storyboard_revision_binding", "continuity_revision"):
+            if original.get(key):
+                item[key] = True
+    if old_matches and old.get("blockers"):
+        context["blocker_repair"] = {"summary": old.get("summary", ""), "blockers": old["blockers"],
+            "planning_policy_version": future_continuity.PLANNING_POLICY_VERSION}
     ordered = [item for episode in state["episodes"] for item in episode["shots"]]
     target_index = next((index for index, item in enumerate(ordered) if item["id"] == shot["id"]), None)
     if target_index is not None and target_index > 0:
@@ -924,12 +940,24 @@ def _revision_analysis(root, shot):
         if previous.get("status") == "accepted" and core.human_approved_shot(previous):
             core._check_artifact(root, previous)
             context["previous_actual"] = _previous_actual_context(previous, shot)
-    result = _brain(root, "plan_revision", task_shot_summary(shot), context, shot["feedback"])
+    cache_key = core._json_digest({"method": "plan_revision", "policy": future_continuity.PLANNING_POLICY_VERSION,
+        "signature": signature, "target": storyboard_revision.baseline(shot),
+        "dependency": future_continuity.dependency(state, shot),
+        "previous_actual": context.get("previous_actual"),
+        "assets": [{k: asset.get(k) for k in ("id", "version", "sha256", "audio_sha256", "status")} for asset in state["assets"]]})
+    model_shot = task_shot_summary(shot)
+    model_shot["feedback"] = future_continuity.feedback_text(shot)
+    result = _brain(root, "plan_revision", model_shot, context, model_shot["feedback"], _cache_key=cache_key)
     if not isinstance(result, dict) or type(result.get("needs_assets")) is not bool:
         raise core.GateError("返修需求分析结果不完整，尚未提交视频。")
-    record = {"signature": signature, "blockers": result.get("blockers", []), "summary": result.get("summary", "")}
+    record = {"signature": signature, "blockers": result.get("blockers", []), "summary": result.get("summary", ""),
+        "planning_policy_version": future_continuity.PLANNING_POLICY_VERSION,
+        "continuity_dependency": future_continuity.dependency(state, shot)}
     try:
         redesign = storyboard_revision.validate_plan(shot, result.get("storyboard_revision"))
+        updates = future_continuity.validate_updates(state, shot, result.get("future_continuity_updates", []))
+        if updates:
+            record["future_continuity_updates"] = updates
     except ValueError as exc:
         record["blockers"] = [str(exc)]
         _save_revision_analysis(root, shot["id"], record)

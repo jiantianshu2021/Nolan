@@ -89,7 +89,7 @@ class SubshotPipelineTests(unittest.TestCase):
         self.brain = self.enterContext(patch.object(pipeline, "_brain", side_effect=self.fake_brain))
         self.evidence = self.enterContext(patch.object(pipeline.media, "extract_evidence", side_effect=self.fake_evidence))
 
-    def fake_brain(self, root, method, *args):
+    def fake_brain(self, root, method, *args, **kwargs):
         if method == "plan_revision":
             return {"needs_assets": False, "additions": [], "shot_updates": [],
                     "summary": "合成普通动作修正，复用既有资产。", "blockers": []}

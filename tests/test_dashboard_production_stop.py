@@ -78,7 +78,7 @@ class ProductionStopProjectionTests(unittest.TestCase):
         shot = self.state["episodes"][0]["shots"][7]
         shot.update(revision=1, feedback="保留原总时长，需要明确播报起点。")
         shot["revision_analysis"] = {"signature": hashlib.sha256(json.dumps([1, shot["feedback"]], ensure_ascii=False).encode()).hexdigest(),
-            "summary": "播报时间需要确认。", "blockers": ["请明确播报起点。"]}
+            "planning_policy_version": 2, "summary": "播报时间需要确认。", "blockers": ["请明确播报起点。"]}
         public = dashboard.public_state(self.state)
         self.assertNotIn("production_stop", public)
         self.assertIn("planning_block", public["episodes"][0]["shots"][7])

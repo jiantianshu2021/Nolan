@@ -51,12 +51,15 @@ def validate_plan(shot, proposal):
     return copy.deepcopy(proposal)
 
 
-def discard(shot, *, reason, stamp):
+def discard(shot, *, reason, stamp, state=None):
     """Retire current metadata; undo a draft only if it was never submitted.
 
     Generated/failed versions keep the camera definition they actually used.
     A rejected *prompt* returns to its exact preceding definition for replanning.
     """
+    if state is not None:
+        from . import future_continuity
+        future_continuity.discard(state, shot, reason=reason, stamp=stamp)
     public = shot.pop("storyboard_revision", None)
     binding = shot.pop("storyboard_revision_binding", None)
     if not public and not binding:
@@ -82,7 +85,21 @@ def apply(root, shot_id, record):
     from . import core
     proposal = record.get("storyboard_revision")
     if proposal is None:
-        return False
+        if not record.get("future_continuity_updates"):
+            return False
+        with core.transaction(root) as state:
+            from . import future_continuity
+            shot = core._find(state, "shot", shot_id)
+            if shot.get("future_continuity_binding"):
+                return future_continuity.apply(state, shot, record)
+            if (shot.get("status") != "planned" or shot.get("file") or shot.get("job_id")
+                    or shot.get("prompt_candidate") or shot.get("prompt_approval")
+                    or shot.get("pending_asset_amendment")
+                    or any(item.get("status") in {"candidate", "awaiting_assets"} for item in state.get("asset_amendments", []))
+                    or any(core.execution_unsettled(job) for job in state["jobs"].values())
+                    or any(not core.asset_ready(asset) for asset in state["assets"])):
+                raise core.GateError("请先完成原任务及资产审批，再准备接续草稿。")
+            return future_continuity.apply(state, shot, record)
     with core.transaction(root) as state:
         shot = core._find(state, "shot", shot_id)
         proposal = validate_plan(shot, proposal)
@@ -97,6 +114,8 @@ def apply(root, shot_id, record):
             if (shot.get("storyboard_revision") != expected or shot.get("subshots") != proposal["subshots"]
                     or shot.get("duration") != proposal["duration"] or existing.get("plan_hash") != _hash(proposal)):
                 raise core.GateError("已保存的局部分镜草稿发生变化，请提交新的返修意见。")
+            from . import future_continuity
+            future_continuity.apply(state, shot, record)
             return False
         if (shot.get("status") != "planned" or shot.get("file") or shot.get("job_id")
                 or shot.get("prompt_candidate") or shot.get("prompt_approval")
@@ -121,6 +140,8 @@ def apply(root, shot_id, record):
             "revision": shot.get("revision", 0), "before_count": before_count,
             "before": before, "plan_hash": _hash(proposal), "applied_at": core.now()}
         shot.pop("refined_prompt", None)
+        from . import future_continuity
+        future_continuity.apply(state, shot, record)
         owner = next(ep for ep in state["episodes"] if any(item is shot for item in ep["shots"]))
         core._invalidate_render(owner, "局部分镜或时长已调整，须按新视频重做拼接和后期。")
         core.event(state, "storyboard_revision_drafted", id=shot_id, signature=signature,

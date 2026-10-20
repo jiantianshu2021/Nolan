@@ -98,7 +98,8 @@ class RevisionAnalysisHistoryTests(unittest.TestCase):
 
     def test_same_blocker_is_cached_new_human_feedback_replans_once_and_preserves_the_old_report(self):
         old_feedback = "合成历史资产修改意见。"
-        old = {"signature": self.signature(0, old_feedback), "blockers": ["后5秒播报时窗不足。"], "summary": "需要选择。"}
+        old = {"signature": self.signature(0, old_feedback), "blockers": ["全部片段可用播报时窗不足。"],
+               "summary": "真实容量冲突，需调整规划。", "planning_policy_version": 2}
         with core.transaction(self.root) as state:
             current = core._find(state, "shot", self.id)
             current.update(feedback=old_feedback, revision_analysis=copy.deepcopy(old))

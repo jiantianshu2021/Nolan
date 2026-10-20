@@ -126,7 +126,7 @@ class EpisodeDurationPolicyTests(unittest.TestCase):
         self.assertEqual((shot, context), before)
         self.assertEqual(result["storyboard_revision"], draft)
         self.assertIn("不必保留旧 duration", instruction)
-        self.assertIn("整集总时长随目标片段的新时长相应变化，其他片段不变", instruction)
+        self.assertIn("整集总时长随目标片段的新时长相应变化，其他片段时长不变", instruction)
         self.assertIn("不得为凑回旧130秒而裁短别段、加速或重分集", instruction)
         self.assertIn("人物原对白逐字保留", instruction)
         self.assertEqual(context["episodes"][0]["shots"][1:], before[1]["episodes"][0]["shots"][1:])

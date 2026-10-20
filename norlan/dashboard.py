@@ -476,8 +476,12 @@ def _public_review_skipped(record):
     return _pick(value, ("reason", "version", "sha256", "at"))
 
 
-def _public_planning_block(shot):
+def _public_planning_block(shot, state=None):
     """Only show cached blockers still bound to this exact human revision."""
+    if state is not None:
+        from .future_continuity import planning_recovery_available
+        if planning_recovery_available(state, shot):
+            return None
     if shot.get("status") != "planned" or shot.get("file") or shot.get("job_id"):
         return None
     analysis = shot.get("revision_analysis")
@@ -518,8 +522,8 @@ def _public_planning_block(shot):
     return result
 
 
-def _current_planning_block(state):
-    """Future cached conflicts cannot prevent work on the current earlier clip."""
+def _current_planning_shot(state):
+    """Find the eligible current clip, without borrowing a future clip's question."""
     from .core import asset_ready, human_approved_shot
     if (state.get("plan", {}).get("status") != "approved"
             or any(not asset_ready(asset) for asset in state.get("assets", []))
@@ -530,13 +534,34 @@ def _current_planning_block(state):
         if episode.get("status") == "approved":
             continue
         shot = next((value for value in episode.get("shots", []) if not human_approved_shot(value)), None)
-        return _public_planning_block(shot) if shot else None
+        return shot
+    return None
+
+
+def _current_planning_block(state):
+    """Future cached conflicts cannot prevent work on the current earlier clip."""
+    shot = _current_planning_shot(state)
+    return _public_planning_block(shot, state) if shot else None
+
+
+def _current_planning_recovery(state):
+    """Offer recovery of an old creative question without hiding unsettled work."""
+    from .core import execution_unsettled
+    from .future_continuity import planning_recovery_available
+    shot = _current_planning_shot(state)
+    if (shot and planning_recovery_available(state, shot)
+            and not any(episode.get("segment_proposal", {}).get("status") == "candidate"
+                        for episode in state.get("episodes", []))
+            and not any(execution_unsettled(job) for job in state.get("jobs", {}).values()
+                        if isinstance(job, dict))):
+        return shot
     return None
 
 
 def _public_production_stop(state):
     """Explain the current stopped phase without borrowing an earlier shot hint."""
     if (state.get("status") != "blocked" or _current_planning_block(state)
+            or _current_planning_recovery(state)
             or any(episode.get("segment_proposal", {}).get("status") == "candidate"
                    for episode in state.get("episodes", []))):
         return None
@@ -594,6 +619,31 @@ def _public_production_stop(state):
                 result.update(stage="shot_review", stage_label="核对已生成视频")
         return result
     return result
+
+
+def _public_latest_episode_feedback(state, episode):
+    """Use the append-only human decisions, not a stale episode-wide copy."""
+    shots = {shot.get("id"): shot for shot in episode.get("shots", []) if isinstance(shot, dict)}
+    for record in reversed(state.get("events", [])):
+        if not isinstance(record, dict):
+            continue
+        action, identifier = record.get("action"), record.get("id")
+        direct = identifier in shots
+        relevant = ((action in {"human_planning_feedback", "human_rejected_prompt"} and direct)
+                    or (action == "human_rejected" and ((record.get("kind") == "shot" and direct)
+                        or (record.get("kind") == "episode" and identifier == episode.get("id")))))
+        if not relevant:
+            continue
+        feedback = record.get("feedback")
+        if action == "human_rejected_prompt" and not isinstance(feedback, str):
+            # Older prompt decisions saved their actual text on the shot only.
+            feedback = shots[identifier].get("feedback")
+        if isinstance(feedback, str) and feedback.strip():
+            return feedback
+        # A later relevant decision with missing text must not promote old text
+        # as the newest decision; fall back to the existing episode label.
+        return None
+    return None
 
 
 def _public_shot_history(shot):
@@ -1123,6 +1173,9 @@ def _public_episode_navigation(episodes: list[dict], season_source: dict | None 
 def public_state(state: dict) -> dict:
     """Keep credentials, source novel, provider responses and settings off the UI API."""
     result = _pick(state, ("id", "title", "mode", "status", "paused", "created_at", "updated_at"))
+    planning_recovery = _current_planning_recovery(state)
+    if planning_recovery and result.get("status") == "blocked" and not state.get("paused"):
+        result["status"] = "ready"
     from .core import video_review_enabled
     result["video_review"] = {"enabled": video_review_enabled(state)}
     from .core import is_nonblocking_advisory_unknown
@@ -1132,7 +1185,7 @@ def public_state(state: dict) -> dict:
                                          if result["pending_advisory_count"] else "")
     result["plan"] = _pick(state.get("plan", {}), ("status", "version", "style", "ratio", "feedback"))
     result["music_library"] = _public_music_library(state)
-    if state.get("last_error"):
+    if state.get("last_error") and not planning_recovery:
         from .failures import sanitize_failure
         result["last_error"] = sanitize_failure({"provider_message": state["last_error"]}).get(
             "provider_message", "制作已停止，未记录到可安全展示的具体原因。")
@@ -1184,6 +1237,9 @@ def public_state(state: dict) -> dict:
     navigation = _public_episode_navigation(raw_episodes, state.get("season_source"))
     for episode_index, episode in enumerate(raw_episodes):
         item = _pick(episode, ("id", "title", "summary", "status", "version", "file", "feedback", "subtitle_status", "music_status", "subtitles_burned", "render_warnings", "review_note", "subtitle_file"))
+        latest_feedback = _public_latest_episode_feedback(state, episode)
+        if latest_feedback:
+            item["latest_feedback"] = latest_feedback
         item.update(_public_episode_duration(episode))
         source_duration = episode.get("source_duration")
         if type(source_duration) in {int, float} and math.isfinite(source_duration) and 0 < source_duration <= 3600:
@@ -1251,6 +1307,9 @@ def public_state(state: dict) -> dict:
                 label=f"片段 {production_stop['shot_index']}/{len(episode.get('shots', []))} 准备提示词失败，制作已停止",
                 current_shot=production_stop["shot_id"], current_shot_index=production_stop["shot_index"],
                 elapsed_seconds=None, is_working=False, waiting_for_human=True)
+        if planning_recovery and any(shot.get("id") == planning_recovery.get("id") for shot in episode.get("shots", [])):
+            item["progress"].update(stage="planning_recovery", label="已保留修改意见，可继续准备完整提示词",
+                elapsed_seconds=None, is_working=False, waiting_for_human=False)
         item["rough_cuts"] = _public_rough_cuts(episode)
         item["postproduction"] = _public_postproduction(state, episode)
         proposal = episode.get("segment_proposal")
@@ -1276,6 +1335,8 @@ def public_state(state: dict) -> dict:
             entry["can_edit_revision"] = bool(callable(editor) and editor(state, shot))
             if planning_block and planning_block["shot_id"] == shot.get("id"):
                 entry["planning_block"] = dict(planning_block)
+            if planning_recovery and planning_recovery.get("id") == shot.get("id"):
+                entry["planning_recovery"] = {"message": "已保留修改意见，继续制作将自动协调未生成片段并准备完整提示词。"}
             amendment_id = shot.get("pending_asset_amendment")
             if amendment_id and any(value.get("id") == amendment_id and value.get("status") in {"candidate", "awaiting_assets"}
                                     for value in state.get("asset_amendments", []) if isinstance(value, dict)):
@@ -1284,6 +1345,13 @@ def public_state(state: dict) -> dict:
                 candidate = _public_prompt_candidate(shot.get("prompt_candidate"), shot)
                 if candidate:
                     entry["prompt_candidate"] = candidate
+            from .future_continuity import public_updates
+            continuity_updates = public_updates(state, shot)
+            if continuity_updates:
+                entry["future_continuity_updates"] = continuity_updates
+                if (entry.get("prompt_candidate")
+                        and shot.get("prompt_candidate", {}).get("future_continuity_updates") == continuity_updates):
+                    entry["prompt_candidate"]["future_continuity_updates"] = continuity_updates
             entry.update(_public_shot_failures(state, shot))
             entry.update(_public_shot_continuity(state, episode, shot))
             if shot.get("continuity_review"):
@@ -1307,6 +1375,9 @@ def public_state(state: dict) -> dict:
             if entry.get("planning_block") and entry["progress"]["stage"] not in {"failed", "unknown"}:
                 entry["progress"].update(stage="planning_blocked", label="等待你调整制作要求，尚未提交生成",
                                           waiting_for_human=True, is_working=False)
+            if entry.get("planning_recovery") and entry["progress"]["stage"] not in {"failed", "unknown"}:
+                entry["progress"].update(stage="planning_recovery", label="已保留修改意见，可继续准备完整提示词",
+                    elapsed_seconds=None, stage_elapsed_seconds=None, waiting_for_human=False, is_working=False)
             if entry["progress"]["stage"] == "failed":
                 entry["status"] = "generation_failed"
             entry["history"] = _public_shot_history(shot)
