@@ -106,6 +106,24 @@ class ProductionStopProjectionTests(unittest.TestCase):
         self.assertEqual(public["production_stop"]["stage"], "shot_review")
         self.assertNotIn("preparation_failure", public["episodes"][0]["shots"][7])
 
+    def test_missing_old_asset_error_explains_unconfigured_project_budget(self):
+        self.state.update(last_error=None, assets=[{"id": "hero", "kind": "character", "status": "generating"}])
+        self.state["budget"].update(approved=False, limit=0)
+        public = dashboard.public_state(self.state)
+        self.assertEqual(public["production_stop"]["stage"], "assets")
+        self.assertIn("本项目", public["production_stop"]["message"])
+        self.assertIn("0 元", public["production_stop"]["message"])
+        from norlan import __version__
+        self.assertEqual(public["app_version"], __version__)
+
+    def test_persisted_failure_survives_legacy_last_error_clear_without_exposing_secrets(self):
+        self.state.update(last_error=None, production_failure={"schema": 1,
+            "message": "图片模型未配置。 token=PRIVATE-RECORDED-TOKEN https://private.invalid"})
+        public = dashboard.public_state(self.state)
+        self.assertIn("图片模型未配置", public["production_stop"]["message"])
+        self.assertNotIn("PRIVATE-RECORDED", json.dumps(public))
+        self.assertNotIn("https://private.invalid", json.dumps(public))
+
 
 class ProductionStopRetryHttpTests(unittest.TestCase):
     def test_explicit_retry_runs_once_and_does_not_authorize_a_video(self):

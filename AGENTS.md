@@ -46,6 +46,14 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   Check budget, credentials and local voice transport before advancing version;
   a local refusal keeps the same consent. Recover submitted jobs by original
   ID/configuration; do not backfill consent for existing media.
+- Asset direction/input confirmation must preserve a blocked failure reason.
+  Production failures keep bounded, sanitized phase/asset diagnostics separate
+  from transient last_error. Clear the active error only on a real phase
+  transition; display the actual server/terminal runtime version.
+  Never infer a new project budget from another project. Legacy asset version
+  rollback requires the never-approved zero-budget proof, complete absence of
+  media jobs/reservations/artifacts/consent and an audit event; it only returns
+  to human prompt/model confirmation and never submits media.
 - Reserve cost before a paid POST. Unknown submission outcomes must not be
   retried. Persist the provider ID before polling or downloading.
 - Do not claim sampled frames establish audio, lip-sync or full-motion quality.

@@ -17,6 +17,7 @@ import tomllib
 
 from .brain import BrainError, INTERNAL_VOICE_SOURCE_RULES, NEW_EPISODE_DURATION_RULES, resolve_codex
 from .segments import SEGMENT_PLAN_RULES
+from . import __version__
 
 
 _MARKER = ".norlan-managed"
@@ -425,7 +426,7 @@ def launch(project: str | Path | None = None, *, resume: bool = False,
         if current not in {Path.home().resolve(), Path("/")} and not current.is_relative_to(data):
             workdir = current
     argv, env = prepare_launch(project, resume=resume, prompt=prompt, connection=connection, workdir=workdir)
-    print("Nolan · 支持原生文件、终端和代码工具；制作审批仍在审片室。/resume 恢复对话，Ctrl+C 可中断。", flush=True)
+    print(f"Nolan {__version__} · 支持原生文件、终端和代码工具；制作审批仍在审片室。/resume 恢复对话，Ctrl+C 可中断。", flush=True)
     print("工作目录：" + argv[argv.index("--cd") + 1], flush=True)
     try:
         return subprocess.call(argv, env=env, cwd=argv[argv.index("--cd") + 1])

@@ -593,6 +593,9 @@ def _public_production_stop(state):
     from .core import asset_ready, blocking_unknown_jobs, execution_unsettled, human_approved_shot
     from .failures import sanitize_failure
     raw = state.get("last_error")
+    if not isinstance(raw, str) or not raw.strip():
+        failure = state.get("production_failure", {})
+        raw = failure.get("message") if isinstance(failure, dict) else None
     message = sanitize_failure({"provider_message": raw}).get("provider_message", "")
     result = {"message": message or "制作已停止，未记录到可安全展示的具体原因。",
               "stage": "production", "stage_label": "制作流程", "can_retry": False}
@@ -606,6 +609,10 @@ def _public_production_stop(state):
             any(value.get("status") in {"candidate", "awaiting_assets"}
                 for value in state.get("asset_amendments", []) if isinstance(value, dict))):
         result.update(stage="assets", stage_label="准备或核对资产")
+        if not message and state.get("budget", {}).get("approved") is False:
+            result["message"] = "本项目尚未确认制作预算（当前预算上限为 0 元）；旧项目的预算不会自动转入新项目。请先检查资产提示词，再由你在本机为这个项目设置预算；尚未提交新的生成。"
+        elif not message:
+            result["message"] = "旧版未保留这次资产准备失败的具体原因。请用新版继续，仅重新检查本机配置并准备提示词；不会自动提交新资产生成。"
         return result
     for episode_index, episode in enumerate(state.get("episodes", []), 1):
         if episode.get("status") == "approved":
@@ -1287,6 +1294,8 @@ def _public_episode_navigation(episodes: list[dict], season_source: dict | None 
 def public_state(state: dict) -> dict:
     """Keep credentials, source novel, provider responses and settings off the UI API."""
     result = _pick(state, ("id", "title", "mode", "status", "paused", "created_at", "updated_at"))
+    from . import __version__
+    result["app_version"] = __version__
     planning_recovery = _current_planning_recovery(state)
     if planning_recovery and result.get("status") == "blocked" and not state.get("paused"):
         result["status"] = "ready"

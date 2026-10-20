@@ -1718,9 +1718,11 @@ def run(root):
             from .local_submission import recover_oversized_requests
             if recover_oversized_requests(root, already_locked=True):
                 return core.load_project(root)
+            from .asset_preparation_recovery import recover as recover_asset_preparations
+            recover_asset_preparations(root, already_locked=True)
             recovered = _recover(root)
             s = _gate(root)
-            _set(root, last_error=None)
+            _set(root, status="ready", last_error=None)
             if recovered["shots"] or recovered["rough_cuts"]:
                 _set(root, status="review_required")
                 return core.load_project(root)
@@ -1764,9 +1766,11 @@ def run(root):
             return core.load_project(root)
         current = core.load_project(root)
         status = "paused" if current["paused"] else "awaiting_segment_plan" if _pending_segment_plan(current) else "blocked"
-        _set(root, status=status, last_error=str(exc))
+        from .production_errors import record
+        record(root, str(exc), status=status)
     except Exception as exc:
         # Adapters sanitize provider errors; avoid leaking credentials in reprs.
         message = str(exc) if getattr(exc, "safe_message", False) or isinstance(exc, (ValueError, FileNotFoundError)) else type(exc).__name__ + "：执行失败，请检查配置和本地文件"
-        _set(root, status="blocked", last_error=message)
+        from .production_errors import record
+        record(root, message)
     return core.load_project(root)

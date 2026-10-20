@@ -557,7 +557,10 @@ def set_remaining_asset_inputs_gpt(root, plan_version):
         if selected:
             event(state, "human_remaining_asset_inputs_confirmed", plan_version=plan_version,
                   mode="gpt", assets=selected)
-            state["last_error"] = None
+            # Input choices do not establish that an existing production
+            # blocker is resolved. The pipeline clears it at the next gate.
+            if state.get("status") != "blocked":
+                state["last_error"] = None
     return load_project(root)
 
 
@@ -587,7 +590,9 @@ def set_asset_input(root, asset_id, asset_version, input_revision, mode, descrip
         event(state, "human_asset_input_confirmed", id=asset_id, asset_version=asset_version,
               input_revision=data["revision"], mode=mode,
               reference_hashes=[ref["sha256"] for ref in references])
-        state["last_error"] = None
+        # Retain the stopped phase's reason until production actually advances.
+        if state.get("status") != "blocked":
+            state["last_error"] = None
     return load_project(root)
 
 
