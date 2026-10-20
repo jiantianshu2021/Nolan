@@ -182,6 +182,14 @@ class ArkProvider:
             raise ProviderError("未知的 Ark 请求种类。")
         self._key()
         self._model(kind)
+        if kind == "video":
+            self._video_watermark()
+
+    def _video_watermark(self) -> bool:
+        value = self.config.get("video_watermark", False)
+        if type(value) is not bool:
+            raise ProviderError("视频水印开关 video_watermark 必须为布尔值。")
+        return value
 
     def _key(self) -> str:
         key = os.environ.get(str(self.config.get("api_key_env", "ARK_API_KEY")), "")
@@ -357,6 +365,7 @@ class ArkProvider:
     def submit_video(self, prompt: str, duration: float, references: list[Path],
                      previous_video: Path | str | None = None,
                      audio_references: list[Path] | None = None) -> dict:
+        watermark = self._video_watermark()
         refs, audio = list(references), list(audio_references or [])
         if not prompt.strip():
             raise ProviderError("视频提示词不能为空。")
@@ -397,7 +406,7 @@ class ArkProvider:
                         "role": "reference_audio"} for p in audio)
         payload = {"model": self._model("video"), "content": content, "duration": int(duration),
                    "ratio": self.config.get("ratio", "16:9"), "resolution": self.config.get("resolution", "720p"),
-                   "generate_audio": bool(self.config.get("generate_audio", True)), "watermark": True,
+                   "generate_audio": bool(self.config.get("generate_audio", True)), "watermark": watermark,
                    "return_last_frame": True}
         result, request_id = self._request("POST", "/contents/generations/tasks", payload)
         if not isinstance(result.get("id"), str) or not result["id"]:

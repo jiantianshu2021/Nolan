@@ -146,6 +146,7 @@ nolan configure ./my-drama --file ./settings.json --budget 30
 | `brain.provider: "codex"` | 跟随 `nolan setup` 选定的订阅/API 登录。订阅记录调用次数；API 还须设置 `caps.llm` 和项目预算。 |
 | `brain.provider: "openai"` | 可选的直接 Responses API 适配器；需 `OPENAI_API_KEY` 和明确的 `brain.model`。若当前选择订阅，程序会提示连接冲突并停止，不会静默付费。通常保留 `codex` 并用 `nolan setup` 切换即可。 |
 | `ark.image_model` / `ark.video_model` | 填写你在火山 Ark 实际开通的模型或接入点 ID，不由程序猜测。 |
+| `ark.video_watermark` | 默认 `false`，新视频请求关闭右下角可见水印；旧项目未填写也默认关闭。可明确设为布尔值 `true` 开启。已有视频与已提交任务保留原结果。 |
 | `caps.image` | 每次图片生成的保守费用上限。 |
 | `caps.video_second` | 每秒视频生成的保守费用上限；也用于声音试片。 |
 | `caps.llm` | 每次 GPT API 调用的保守费用上限；Codex 订阅方式可设为 0。 |

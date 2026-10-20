@@ -58,6 +58,30 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual([x.get("role") for x in payload["content"]], [None, "reference_image", "reference_audio"])
         self.assertTrue(payload["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
         self.assertNotIn("seed", payload)
+        self.assertIs(payload["watermark"], False)
+        self.assertIs(payload["return_last_frame"], True)
+
+    def test_video_watermark_is_default_off_and_explicit_boolean_override(self):
+        # Synthetic transport only; no actual generation or provider charge.
+        for config, expected in (({}, False), ({"video_watermark": False}, False),
+                                 ({"video_watermark": True}, True)):
+            with self.subTest(config=config):
+                api = ArkProvider({"video_model": "seedance-test", **config})
+                with patch("norlan.providers._api_open", return_value=Response({"id": "synthetic-task"})) as http:
+                    api.submit_video("合成请求参数测试", 5, [])
+                self.assertIs(json.loads(http.call_args.args[0].data)["watermark"], expected)
+                self.assertEqual(http.call_count, 1)
+
+    def test_invalid_video_watermark_is_rejected_before_submission(self):
+        for value in ("false", "true", 0, 1, None, []):
+            with self.subTest(value=value):
+                api = ArkProvider({"video_model": "seedance-test", "video_watermark": value})
+                with patch("norlan.providers._api_open") as http:
+                    with self.assertRaisesRegex(ProviderError, "video_watermark"):
+                        api.preflight("video")
+                    with self.assertRaisesRegex(ProviderError, "video_watermark"):
+                        api.submit_video("合成请求参数测试", 5, [])
+                    http.assert_not_called()
 
     def test_submit_timeout_is_uncertain_and_never_retried(self):
         with patch("norlan.providers._api_open", side_effect=TimeoutError("super-secret")) as http:

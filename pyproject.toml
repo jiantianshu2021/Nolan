@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "norlan-agent"
-version = "0.6.6"
+version = "0.6.7"
 description = "A local, supervised AI animation production agent"
 readme = "README.md"
 requires-python = ">=3.11"

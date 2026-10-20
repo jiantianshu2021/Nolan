@@ -223,6 +223,7 @@ def specification(state, shot, prompt, manifest, refined=None):
             "references": copy.deepcopy(manifest), "assets": bindings,
             "audio_policy": copy.deepcopy(state.get("audio_policy", {})),
             "provider": {"mode": state["mode"], "ratio": state["plan"].get("ratio", "16:9"),
+                         "video_watermark": ark.get("video_watermark", False),
                          **{key: ark.get(key) for key in ("provider", "base_url", "video_model", "resolution", "generate_audio")}}}
     from .storyboard_revision import public
     try:

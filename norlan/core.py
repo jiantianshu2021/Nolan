@@ -205,7 +205,7 @@ def create_project(root, novel: str, mode="demo", title="Nolan 漫剧"):
         "mode": mode, "created_at": now(), "status": "initialized", "paused": False,
         "plan": {"status": "pending", "version": 0}, "assets": [], "episodes": [],
         "settings": {
-            "brain": {"provider": "codex"}, "ark": {},
+            "brain": {"provider": "codex"}, "ark": {"video_watermark": False},
             "caps": {"image": 0, "video_second": 0, "llm": 0},
             "max_attempts": 3, "max_llm_calls": 80, "batch_size": 3,
             "poll_seconds": 10, "max_poll_seconds": 1800,
@@ -1546,6 +1546,8 @@ def configure(root, settings=None, limit=None, currency=None):
                     raise ValueError("调用价格上限必须为非负有限数字")
             if type(s["settings"]["postproduction"].get("enabled")) is not bool:
                 raise ValueError("本集后期开关必须为布尔值")
+            if type(s["settings"]["ark"].get("video_watermark", False)) is not bool:
+                raise ValueError("视频水印开关 video_watermark 必须为布尔值")
         _totals(s)
         if currency:
             if currency not in {"CNY", "USD"}:

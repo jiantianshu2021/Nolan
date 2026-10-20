@@ -7,6 +7,7 @@
   "ark": {
     "image_model": "",
     "video_model": "",
+    "video_watermark": false,
     "image_size": "2K",
     "timeout": 120
   },

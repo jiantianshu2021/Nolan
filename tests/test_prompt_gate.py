@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from norlan import core, pipeline
+from norlan import core, pipeline, prompt_gate
 from test_pipeline import choose_gpt_assets, fake_media, write
 
 
@@ -113,6 +113,49 @@ class PromptGateTests(unittest.TestCase):
         self.assertNotIn("prompt_approval", self.shot())
         self.assertEqual(pipeline.run(self.root)["status"], "awaiting_prompt_approval")
         self.api.submit_video.assert_not_called()
+
+    def test_missing_and_explicit_false_watermark_bind_the_same_request(self):
+        pipeline.run(self.root)
+        state = core.load_project(self.root)
+        shot = state["episodes"][0]["shots"][0]
+        candidate = shot["prompt_candidate"]
+        state["settings"]["ark"].pop("video_watermark", None)
+        implicit = prompt_gate.specification(state, shot, candidate["prompt"],
+                                             candidate["reference_manifest"], candidate["refined"])
+        state["settings"]["ark"]["video_watermark"] = False
+        explicit = prompt_gate.specification(state, shot, candidate["prompt"],
+                                             candidate["reference_manifest"], candidate["refined"])
+        self.assertIs(implicit["provider"]["video_watermark"], False)
+        self.assertEqual(prompt_gate._hash(implicit), prompt_gate._hash(explicit))
+        self.api.submit_video.assert_not_called()
+
+    def test_changed_watermark_cannot_use_an_unsubmitted_confirmation(self):
+        pipeline.run(self.root)
+        self.confirm()
+        core.configure(self.root, {"ark": {"video_watermark": True}})
+        self.assertEqual(pipeline.run(self.root)["status"], "blocked")
+        self.api.submit_video.assert_not_called()
+        self.assertEqual(self.shot()["status"], "planned")
+        self.assertNotIn("prompt_approval", self.shot())
+        self.assertEqual(pipeline.run(self.root)["status"], "awaiting_prompt_approval")
+        self.api.submit_video.assert_not_called()
+
+    def test_changed_watermark_recovers_submitted_task_without_another_post(self):
+        pipeline.run(self.root)
+        self.confirm()
+        with patch.object(pipeline, "_poll_video", side_effect=core.GateError("合成测试：稍后查询原任务")):
+            self.assertEqual(pipeline.run(self.root)["status"], "blocked")
+        submitted = self.shot()
+        job = core.load_project(self.root)["jobs"][submitted["job_id"]]
+        self.assertEqual(job["state"], "submitted")
+        self.assertEqual(job["task_id"], "synthetic-1")
+        self.api.submit_video.assert_called_once()
+        core.configure(self.root, {"ark": {"video_watermark": True}})
+        self.assertEqual(pipeline.run(self.root)["status"], "review_required")
+        self.api.submit_video.assert_called_once()
+        self.api.poll_video.assert_called_once_with("synthetic-1")
+        self.assertEqual(self.shot()["version"], submitted["version"])
+        self.assertEqual(self.shot()["job_id"], submitted["job_id"])
 
     def test_prompt_rewrite_requires_a_new_human_confirmation(self):
         pipeline.run(self.root)
