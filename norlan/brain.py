@@ -132,6 +132,12 @@ PLAN_SCHEMA = _object({"title": STRING, "style": STRING,
                        "episodes": _array(_object({"id": ID, "title": STRING, "summary": STRING,
                                                    "music_prompt": STRING,
                                                    "shots": _array(SHOT_SCHEMA, minItems=1, maxItems=30)}), minItems=1, maxItems=100)})
+# A continuation plans one imported episode, never rewrites the season or the
+# definitions of existing assets. Empty additions mean reuse of the catalog.
+EPISODE_PLAN_SCHEMA = _object({
+    "episode": copy.deepcopy(PLAN_SCHEMA["properties"]["episodes"]["items"]),
+    "new_assets": _array(ASSET_SCHEMA, maxItems=30),
+})
 REFINE_SCHEMA = _object({"prompt": STRING, "dialogue": STRING, "continuity_notes": STRING})
 TIMING_PROPOSAL_SCHEMA = _object({
     "subshots": _array(SUBSHOT_SCHEMA, minItems=1, maxItems=3),
@@ -763,6 +769,59 @@ voice.audition_speaker 填原文实际归属，如“系统”，非 voice 为�
 每集 music_prompt 单独写无歌词配乐的情绪、乐器、节拍、起承转折与淡入淡出，音乐最终统一混合。
 可见人物、场景、声音等实际资产只提出待审批候选，不得宣称已批准；内部画外声源由后台登记，不单独请求审批。输出完整计划。""", {"novel": novel}, PLAN_SCHEMA)
         return validate_plan(result)
+
+    def plan_episode(self, script: str, context: dict) -> dict:
+        """Prepare an imported episode using only its source and a small catalog."""
+        if not isinstance(script, str) or not script.strip():
+            raise BrainError("本集原剧本为空，不能准备分镜。")
+        if not isinstance(context, dict) or not isinstance(context.get("episode"), dict):
+            raise BrainError("缺少当前分集的来源和身份，不能准备分镜。")
+        # Keep the boundary small even if a caller mistakenly passes runtime
+        # records: no media manifests, reports, history or other episode text.
+        compact = _task_fields(context, ("style", "ratio", "audio_policy", "feedback"))
+        compact["episode"] = _task_fields(context["episode"], ("id", "title", "expected_duration"))
+        previous = context.get("previous_episode")
+        compact["previous_episode"] = (_task_fields(previous, ("id", "title", "summary", "ending_dialogue",
+            "continuity_notes", "observed_end_state")) if isinstance(previous, dict) else None)
+        compact["existing_assets"] = [_task_fields(asset, ("id", "kind", "name", "character_id", "voice_only"))
+            for asset in context.get("existing_assets", []) if isinstance(asset, dict)]
+        if "proposal_to_repair" in context:
+            _validate(context["proposal_to_repair"], EPISODE_PLAN_SCHEMA)
+            technical_feedback = context.get("technical_feedback")
+            if not isinstance(technical_feedback, str) or not technical_feedback.strip() or len(technical_feedback) > 4000:
+                raise BrainError("程序结构校正缺少明确的有限范围说明。")
+            compact["proposal_to_repair"] = copy.deepcopy(context["proposal_to_repair"])
+            compact["technical_feedback"] = technical_feedback
+        result = self._call(f"""只为给定的一集原剧本准备待人工审批的分镜方案，禁止改编其他集或改写既有成片。
+episode.id 和 title 必须与 context.episode 完全相同，保留原集顺序和原稿剧情、人物对白、因果及悬念。
+用户已选择沿用原分集和原稿时长；expected_duration 有值时所有 shots.duration 之和必须等于该时长。
+不要套用默认一分钟规则、自动拆成新集、删剧情或加速台词以缩短原稿。
+style 用于沿用视觉风格；其中旧集时长或旧声音约束不覆盖当前 expected_duration 和 audio_policy。
+当前 audio_policy 中已启用的系统女声及关键播报规则优先于旧 style 中“只做字幕、不另加旁白”等旧文字。
+旧 style 中第一集专用的剧情、时长、结尾约10秒慢动作等叙事安排不适用于后续集，除非本集原稿明确要求。
+{SEGMENT_PLAN_RULES}
+context.existing_assets 仅是可复用的现有资产目录，不能臆造已看过或听过素材，也不能改写这些定义。
+直接在 asset_ids 中复用现有 ID；new_assets 只列当前集确实需要且目录中不存在的新资产，没有新增时返回空列表。
+不得把同一角色、场景、道具或声音换 ID 重建；不得在 new_assets 中重新提交现有 ID。
+每条生成片段必须有全项目唯一 ASCII ID，scene_id 指向实际 location 资产，所需人物/声音/场景引用齐全。
+每片段最多8项视觉资产（character/location/prop，不含voice_only内部声源），为官方衔接尾帧另预留1个图像位置；最多3项voice声音。
+只引用本片段实际需要的参考，不要将全部背景人物或道具塞进每一段。确有更多人物道具时应合理重新分配镜头节拍和片段，
+保持本集原稿内容和总时长，不能静默删掉真实参考、把资产变成文字代替素材，或声称未发送的参考已发送。
+分镜引用 voice 必须同时引用绑定的 character，声音和人物只能来自现有目录或本次 new_assets。
+新声音仅定义稳定声线属性。{VOICE_PLAN_RULES}
+{INTERNAL_VOICE_SOURCE_RULES}
+所有新资产均填写 voice_only 与 audition_speaker；新声音试音只取本集 script 的连续原文，无法选句就按规则留空说明。
+previous_episode 只有人工已批准前集的最小结尾文字摘要；保持人物、场景、动作、情绪和声音承接，不能声称看过原视频。
+镜头 prompt 写构图、站位、轴线、动作起止、运镜、精确对白和环境声，不生成额外对白字幕、不生成配乐。
+系统任务框属于剧情内界面，完整详细规则原文保留在画面；初始 dialogue 保留完整系统文字以绑定来源。
+{SYSTEM_BROADCAST_EDITORIAL_RULES}
+music_prompt 写整集后期无歌词配乐的情绪、乐器、起承转折与留白，之后统一混音。
+若 context.proposal_to_repair 存在，它是尚未获批的原始方案；仅按 technical_feedback 校正结构，仍以本集原稿为剧情依据。
+程序校正不是用户提出的新创作要求、不是人工批准，不扩写其他集，不把原稿没有的上一集慢动作结尾延续过来。
+本次仅提出方案，不批准方案或资产，不提交任何媒体生成；完整片段提示词仍须人工确认。""",
+                            {"script": script, "context": compact}, EPISODE_PLAN_SCHEMA)
+        _validate(result, EPISODE_PLAN_SCHEMA)
+        return result
 
     def select_voice_audition(self, novel: str, asset: dict, character: dict) -> dict:
         """Select an attributed original passage; production validates it again."""

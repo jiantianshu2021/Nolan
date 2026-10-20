@@ -25,7 +25,7 @@ _MARKER_VALUE = "norlan-native-v1\n"
 _CONFIG_HEADER = "# Managed by Norlan native conversation v1\n"
 _PROVIDERS = {"chatgpt", "openai"}
 _MCP_TOOLS = (
-    "project_status", "list_projects", "read_novel", "create_project", "save_plan",
+    "project_status", "list_projects", "read_novel", "create_project", "save_plan", "import_season",
     "run_production", "pause_production", "request_revision", "correct_captions",
     "set_voice_audition", "get_costs",
     "open_review", "set_creative_brief", "propose_segments", "propose_asset_amendment",
@@ -54,6 +54,10 @@ save_plan 保存待用户审批的完整分集、资产、分镜与声画方案�
 以实际上一镜头尾帧与动作状态续接，维护空间、服装、道具、对白、环境声和配乐衔接。
 恢复旧项目先调用 project_status，保留所有已生成或已提交片段。若有 submitted/仍在生成的原任务，
 先按原任务恢复查询和下载，不能重新提交、重跑资产或用 save_plan/install_plan 替换原计划。
+用户明确提供后续分集剧本文件夹并选择沿用原分集时，用 import_season 登记原集号与原稿时长，
+保留已有成片、资产、审批与预算，不能用 save_plan 覆盖。随后 run_production 只策划首个可制作集，
+候选在该集网页等待用户批准；不一次性读整季或创建全季资产。approved 后仍走资产和提示词人工关卡。
+分集总览列出所有已导入剧集；已批准一集后继续制作进入下一集，后面各集须等前集最终通过。
 只有已暂停且没有在途任务时，才用 propose_segments 提出尚未启动连续尾部的重分组，等待用户在网页确认。
 groups 必须按原顺序完整覆盖该尾部的全部 ID；保留不适合合并的项时也须使用单项组，不能漏项或跳序。
 只合并同 scene_id、动作与对白连贯的相邻片段，总时长10–15秒且总内部镜头不超过3个；

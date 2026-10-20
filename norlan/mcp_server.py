@@ -143,6 +143,8 @@ TOOLS = [
            "source_path": PATH, "title": {"type": "string", "minLength": 1, "maxLength": 300},
            "brief": TEXT, "mode": {"type": "string", "enum": ["live", "demo"], "default": "live"}}, ["project"]),
     _tool("save_plan", "保存候选分集/资产/生成片段规划并等待人工审批。" + NEW_EPISODE_DURATION_RULES + SEGMENT_PLAN_RULES + INTERNAL_VOICE_SOURCE_RULES + "voice 必须绑定已定义角色，非 voice 的 character_id 省略或为空；生成片段引用声音须同时引用其角色，画外声在 prompt 标明不入画。" + VOICE_PLAN_RULES + "校验失败返回字段路径和修复建议，不修改项目。不能写 approved、file、settings 或预算。", {"project": PATH, "plan": PLAN}),
+    _tool("import_season", "将用户明确提供的分集剧本文件夹导入已有项目。沿用原集号和原稿预计时长；保留已有资产、成片、审批和费用。只登记原文与待分镜剧集，不调用模型或生成素材。随后run_production只准备首个未完成集的分镜候选，须人工网页批准，不可用save_plan覆盖已有项目。",
+          {"project": PATH, "source_folder": PATH}),
     _tool("propose_asset_amendment", "在分镜或返修阶段提出新增声音/人物/场景等资产，或复用已有资产及声音规则的关联片段更新，打开网页供用户确认。只创建候选，不覆盖save_plan、不修改旧资产或已有媒体、不批准、不生成。additions可为空，此时必须实际追加已有资产引用或改变audio_policy，不能提交空方案。用户采用方案后，只需选择、试听和审批真正的声音等实际资产，全部通过后才应用片段修改并等待生成确认；复用已批准资产不重新制作。仅更新目标及后续未启动片段；系统女播音可后台新增voice_only=true的character内部声源与绑定voice，不把内部定义单独交给用户审批。" + INTERNAL_VOICE_SOURCE_RULES + "用audition_speaker标明原文说话人。试音必须来自原文，不得编造。audio_policy可要求以后任务框统一播报。不得自己批准提案或实际资产。",
           {"project": PATH, "shot_id": IDENTIFIER, "version": VERSION, "feedback": NONEMPTY,
            "additions": {"type": "array", "items": ASSET, "minItems": 0, "maxItems": 30},
@@ -352,6 +354,12 @@ class MCPServer:
                 if asset.get("audition_selection_error"):
                     public["audition_selection_error"] = _diagnostic(asset["audition_selection_error"])["message"]
         for public, episode in zip(result["episodes"], state["episodes"]):
+            if isinstance(public.get("planning"), dict):
+                candidate = public["planning"]
+                public["planning"] = {key: candidate[key] for key in
+                    ("status", "revision", "signature", "summary", "error") if key in candidate}
+                public["planning"]["shot_count"] = len(candidate.get("episode", {}).get("shots", []))
+                public["planning"]["new_asset_count"] = len(candidate.get("new_assets", []))
             # The browser gets the complete editor; the conversational agent
             # only needs the gate and counts, not another full transcript.
             post = public.get("postproduction", {})
@@ -382,6 +390,11 @@ class MCPServer:
     def _review_gate_key(state):
         """Identify a saved human decision, excluding feedback and provider text."""
         status = state.get("status")
+        if status == "awaiting_episode_plan":
+            candidates = [(ep.get("id"), ep.get("planning", {}).get("revision"), ep.get("planning", {}).get("signature"))
+                          for ep in state.get("episodes", []) if ep.get("planning", {}).get("status") == "candidate"]
+            if candidates:
+                return ("episode_plan", json.dumps(candidates, sort_keys=True))
         if status == "awaiting_postproduction":
             waiting = [(ep.get("id"), ep.get("postproduction", {}).get("status"),
                         ep.get("postproduction", {}).get("revision", 0))
@@ -562,6 +575,9 @@ class MCPServer:
                 if destination.exists() or destination.is_symlink():
                     raise ToolError("下一规划版本的存档路径已存在，请检查项目文件，不能覆盖旧文件或符号链接。")
                 core.install_plan(root, arguments["plan"])
+        elif name == "import_season":
+            from .season_sources import import_season
+            import_season(root, _absolute(arguments["source_folder"]))
         elif name == "propose_segments":
             from .regroup import propose_segments
             propose_segments(root, arguments["episode_id"], arguments["groups"])

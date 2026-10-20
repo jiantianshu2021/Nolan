@@ -7,6 +7,14 @@ Use Chinese for user-facing copy. Keep provider/model choices explicit.
   user's decision. Only explicit human rework requests authorize another video
   submission; resuming a task or a failed report never does.
 - Each next episode is blocked until the preceding final render is approved.
+- Importing a season preserves existing episodes, assets, budget, approvals and
+  source/novel.txt. Store immutable per-episode source hashes and retain original
+  episode numbers/durations when explicitly chosen. Plan only the next eligible
+  episode from its source, a small asset catalog and the previous accepted ending.
+- A new episode storyboard is a version/hash-bound human candidate, not permission
+  to generate media. Existing asset-direction, asset and video-prompt approvals
+  still apply. Reuse completed planning caches after interruption; unknown calls
+  never authorize a repeat. Episode navigation must not approve or regenerate.
 - Reserve cost before a paid POST. Unknown submission outcomes must not be
   retried. Persist the provider ID before polling or downloading.
 - Do not claim sampled frames establish audio, lip-sync or full-motion quality.

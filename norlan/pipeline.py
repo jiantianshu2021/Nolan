@@ -67,7 +67,7 @@ def _brain(root, method, *args, **kwargs):
     from .connection import production_brain_config
     cache_key = kwargs.pop("_cache_key", None)
     s = _gate(root)
-    if cache_key and method in {"proofread_subtitles", "arrange_music"}:
+    if cache_key and method in {"proofread_subtitles", "arrange_music", "plan_episode"}:
         for old in reversed(list(s["jobs"].values())):
             if (old.get("item_id") == method and old.get("state") == "completed"
                     and old.get("post_cache_key") == cache_key):
@@ -102,7 +102,7 @@ def _brain(root, method, *args, **kwargs):
             # report when there are no frames. It consumes no model request.
             return result
         cached = {"review_result": copy.deepcopy(result), "review_result_hash": core._json_digest(result)} if method == "review" else {}
-        if cache_key and method in {"proofread_subtitles", "arrange_music"}:
+        if cache_key and method in {"proofread_subtitles", "arrange_music", "plan_episode"}:
             cached.update(post_cache_key=cache_key, post_result=copy.deepcopy(result), post_result_hash=core._json_digest(result))
         core.update_job(root, job_id, state="completed", accounting="spent", **cached)
         return result
@@ -536,9 +536,10 @@ def _video(root, kind, item_id, output, duration, prompt, references, audio_refe
 
 def _select_audition(root, asset, character):
     """Select a sourced excerpt once per voice/feedback/source change."""
-    novel = (Path(root) / "source/novel.txt").read_text(encoding="utf-8")
+    from .season_sources import source_text
+    novel, source_hash = source_text(root, asset=asset)
     speaker = asset.get("audition_speaker") or character.get("audition_speaker") or character["name"]
-    signature = audition_selection_key(asset, speaker, core.digest(Path(root) / "source/novel.txt"))
+    signature = audition_selection_key(asset, speaker, source_hash)
     if asset.get("audition_selection_key") == signature and asset.get("audition_selection_error"):
         raise core.GateError(asset["audition_selection_error"])
 
@@ -872,8 +873,11 @@ def _revision_analysis(root, shot):
     state = _gate(root)
     if state["mode"] == "demo":
         return True
-    context = task_context_summary({"assets": state["assets"], "episodes": state["episodes"],
-               "novel": (Path(root) / "source/novel.txt").read_text(encoding="utf-8"),
+    from .season_sources import source_text
+    source, _ = source_text(root, state=state, shot_id=shot["id"])
+    current_episode = next(ep for ep in state["episodes"] if any(sh["id"] == shot["id"] for sh in ep["shots"]))
+    context = task_context_summary({"assets": state["assets"], "episodes": [current_episode],
+               "novel": source,
                "audio_policy": state.get("audio_policy", {})})
     ordered = [item for episode in state["episodes"] for item in episode["shots"]]
     target_index = next((index for index, item in enumerate(ordered) if item["id"] == shot["id"]), None)
@@ -1481,6 +1485,11 @@ def run(root):
                 return core.load_project(root)
             if s["plan"]["status"] != "approved":
                 _set(root, status="awaiting_plan")
+                return core.load_project(root)
+            target = next((ep for ep in s["episodes"] if ep.get("status") != "approved"), None)
+            if target is not None and not target.get("shots") and target.get("source_file"):
+                from .episode_planning import prepare_episode
+                prepare_episode(root, target["id"], already_locked=True)
                 return core.load_project(root)
             if not _assets(root):
                 return core.load_project(root)

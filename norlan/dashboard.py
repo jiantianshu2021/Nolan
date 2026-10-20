@@ -1019,6 +1019,93 @@ def _public_postproduction(state: dict, episode: dict) -> dict:
     return result
 
 
+def _public_episode_duration(episode: dict) -> dict:
+    """Use saved media measurements before the planned shot total; do no I/O."""
+    def valid(value):
+        return type(value) in {int, float} and math.isfinite(value) and 0 < value <= 3600
+
+    post = episode.get("postproduction", {})
+    post = post if isinstance(post, dict) else {}
+    if episode.get("file") and valid(episode.get("duration")):
+        return {"duration": episode["duration"], "duration_source": "measured"}
+    if post.get("dry_file") and valid(post.get("duration")):
+        return {"duration": post["duration"], "duration_source": "measured"}
+    planned = sum(shot["duration"] for shot in episode.get("shots", [])
+                  if isinstance(shot, dict) and valid(shot.get("duration")))
+    if not planned and valid(episode.get("source_duration")):
+        planned = episode["source_duration"]
+    return {"duration": planned if planned else None,
+            "duration_source": "planned" if planned else "unknown"}
+
+
+def _public_episode_planning(episode: dict) -> dict | None:
+    """Publish the editable planning proposal without script files or context."""
+    value = episode.get("planning")
+    if not isinstance(value, dict):
+        return None
+    result = {}
+    if type(value.get("revision")) is int and value["revision"] >= 0:
+        result["revision"] = value["revision"]
+    if _valid_sha(value.get("signature")):
+        result["signature"] = value["signature"]
+    if isinstance(value.get("summary"), str):
+        result["summary"] = value["summary"]
+    status = value.get("status")
+    if isinstance(status, str) and status in {"preparing", "candidate", "rejected", "approved", "failed", "uncertain"}:
+        result["status"] = status
+    if _valid_sha(value.get("source_sha256")):
+        result["source_sha256"] = value["source_sha256"]
+    source_duration = value.get("source_duration")
+    if type(source_duration) in {int, float} and math.isfinite(source_duration) and 0 < source_duration <= 3600:
+        result["source_duration"] = source_duration
+    candidate = value.get("episode")
+    if isinstance(candidate, dict):
+        projected = _pick(candidate, ("id", "title", "summary", "music_prompt"))
+        projected["shots"] = []
+        for shot in candidate.get("shots", []):
+            if not isinstance(shot, dict):
+                continue
+            row = _pick(shot, ("id", "duration", "prompt", "dialogue", "asset_ids", "scene_id", "continuity_notes"))
+            if isinstance(shot.get("subshots"), list):
+                row["subshots"] = [_pick(subshot, ("start", "end", "prompt"))
+                                   for subshot in shot["subshots"] if isinstance(subshot, dict)]
+            projected["shots"].append(row)
+        result["episode"] = projected
+    if isinstance(value.get("new_assets"), list):
+        result["new_assets"] = [_pick(asset, ("id", "kind", "name", "character_id", "voice_only", "prompt"))
+                                for asset in value["new_assets"] if isinstance(asset, dict)]
+    if value.get("error"):
+        from .failures import sanitize_failure
+        error = value["error"]
+        safe = sanitize_failure(error if isinstance(error, dict) else {"message": str(error)})
+        result["error"] = safe["message"]
+    return result
+
+
+def _public_episode_navigation(episodes: list[dict], season_source: dict | None = None) -> dict:
+    """Describe existing episode routes, never invent or start another episode."""
+    active = next((index for index, episode in enumerate(episodes)
+                   if episode.get("status") != "approved"), None)
+    total = len(episodes)
+    all_complete = bool(total) and active is None
+    declared_total = season_source.get("episode_count") if isinstance(season_source, dict) else None
+    season_complete = all_complete and type(declared_total) is int and declared_total == total
+    if season_complete:
+        reason = f"本季 {total} 集已全部完成并通过审批。"
+    elif all_complete:
+        reason = f"全部已规划集已完成，尚未规划第 {total + 1} 集。"
+    elif active is None:
+        reason = "尚未规划剧集，请先提供小说并完成分集策划。"
+    else:
+        reason = f"当前制作第 {active + 1} 集，后续集须等待前集成片通过审批。"
+    return {"total": total,
+            "approved_count": sum(episode.get("status") == "approved" for episode in episodes),
+            "active_episode_id": episodes[active].get("id") if active is not None else None,
+            "next_episode_number": total + 1 if all_complete and not season_complete else None,
+            "all_planned_complete": all_complete, "reason": reason,
+            **({"season_complete": True} if season_complete else {})}
+
+
 def public_state(state: dict) -> dict:
     """Keep credentials, source novel, provider responses and settings off the UI API."""
     result = _pick(state, ("id", "title", "mode", "status", "paused", "created_at", "updated_at"))
@@ -1077,8 +1164,44 @@ def public_state(state: dict) -> dict:
             and not any(episode.get("segment_proposal", {}).get("status") == "candidate"
                         for episode in state.get("episodes", [])))
     stamp = now()
-    for episode in state.get("episodes", []):
+    raw_episodes = state.get("episodes", [])
+    navigation = _public_episode_navigation(raw_episodes, state.get("season_source"))
+    for episode_index, episode in enumerate(raw_episodes):
         item = _pick(episode, ("id", "title", "summary", "status", "version", "file", "feedback", "subtitle_status", "music_status", "subtitles_burned", "render_warnings", "review_note", "subtitle_file"))
+        item.update(_public_episode_duration(episode))
+        source_duration = episode.get("source_duration")
+        if type(source_duration) in {int, float} and math.isfinite(source_duration) and 0 < source_duration <= 3600:
+            item["source_duration"] = source_duration
+        episode_planning = _public_episode_planning(episode)
+        if episode_planning is not None:
+            if episode_planning.get("status") == "preparing" and _valid_sha(episode_planning.get("signature")):
+                # Publish only eligibility, never the cached model result or
+                # job payload. Match the backend's newest completed record.
+                signature = episode_planning["signature"]
+                cached = next((job for job in reversed(list(state.get("jobs", {}).values()))
+                               if isinstance(job, dict) and job.get("state") == "completed"
+                               and job.get("item_id") == "plan_episode"
+                               and job.get("post_cache_key") == signature), None)
+                if cached is not None and "post_result" in cached and _valid_sha(cached.get("post_result_hash")):
+                    try:
+                        from .core import _json_digest
+                        if _json_digest(cached["post_result"]) == cached["post_result_hash"]:
+                            episode_planning["recoverable"] = True
+                    except (TypeError, ValueError):
+                        pass
+            item["planning"] = episode_planning
+        # This is route eligibility only; production keeps every existing
+        # plan, asset, prompt, budget and final-approval gate.
+        can_produce = (episode.get("status") != "approved"
+                       and all(previous.get("status") == "approved"
+                               for previous in raw_episodes[:episode_index]))
+        item["navigation"] = {
+            "index": episode_index + 1,
+            "previous_episode_id": raw_episodes[episode_index - 1].get("id") if episode_index else None,
+            "can_produce": can_produce,
+            "locked_reason": ("" if can_produce else "本集已通过审批，可查看已保存的成片。"
+                              if episode.get("status") == "approved" else "请先完成并批准前面的剧集。"),
+        }
         if episode.get("file"):
             report = _public_shot_report(episode, _version(episode.get("version")))
             if report:
@@ -1087,6 +1210,24 @@ def public_state(state: dict) -> dict:
         if episode.get("preview_error"):
             item["preview_error"] = "累计拼接预览暂未生成成功；片段已保留，可以重试本地拼接后再决定。"
         item["progress"] = episode_progress(state, episode, now=stamp)
+        if (can_produce and state.get("plan", {}).get("status") == "approved"
+                and not state.get("paused") and state.get("status") != "paused"
+                and not episode.get("shots")
+                and episode.get("status") in {"awaiting_episode_plan", "episode_plan_failed"}):
+            planning_status = (episode_planning or {}).get("status")
+            stage, label, working = "awaiting_episode_plan", "等待根据本集原稿策划分镜", False
+            if planning_status == "candidate":
+                stage, label = "awaiting_episode_plan_approval", "等待你审批本集分镜与新增资产方案"
+            elif planning_status == "preparing":
+                if episode_planning.get("recoverable"):
+                    stage, label = "preparing_episode_plan", "本集分镜结果已保存，点击继续恢复审批方案"
+                else:
+                    stage, label, working = "preparing_episode_plan", "GPT 正在根据本集原稿策划分镜", True
+            elif planning_status in {"failed", "uncertain"} or episode.get("status") == "episode_plan_failed":
+                stage, label = "episode_plan_failed", "本集分镜策划已停止，请查看具体原因后处理"
+            elif planning_status == "rejected":
+                label = "等待根据你的修改意见重新策划本集分镜"
+            item["progress"].update(stage=stage, label=label, is_working=working, waiting_for_human=not working)
         preparation_failed = bool(production_stop and production_stop.get("stage") == "shot_preparation"
                                   and production_stop.get("episode_id") == episode.get("id"))
         if preparation_failed:
@@ -1151,6 +1292,7 @@ def public_state(state: dict) -> dict:
             item["shots"].append(entry)
         episodes.append(item)
     result["episodes"] = episodes
+    result["episode_navigation"] = navigation
     if result.get("status") in {"review_required", "generation_failed"} and any(
             episode["progress"]["stage"] == "failed" for episode in episodes):
         result["status"] = "generation_failed"
@@ -1594,6 +1736,24 @@ class _Handler(BaseHTTPRequestHandler):
                             or type(approve) is not bool):
                         raise ValueError
                     decide_segments(context.project_dir, item_id, proposal_id, approve)
+                    return self._json(200, context.state())
+                if action == "episode_plan_decide":
+                    item_id, revision, signature, decision = (data.get(key) for key in ("id", "revision", "signature", "decision"))
+                    feedback = data.get("feedback", "")
+                    if (set(data) - {"action", "id", "revision", "signature", "decision", "feedback"}
+                            or not isinstance(item_id, str) or not 0 < len(item_id) <= 64
+                            or type(revision) is not int or revision < 1 or not _valid_sha(signature)
+                            or decision not in {"approve", "reject"} or not isinstance(feedback, str)
+                            or len(feedback) > 12000 or (decision == "reject" and not feedback.strip())):
+                        raise ValueError
+                    if context.running or context.external_run_active():
+                        return self._error(409, "分镜方案正在准备，请等待当前任务结束后再审批。")
+                    from .episode_planning import decide_episode_plan
+                    try:
+                        decide_episode_plan(context.project_dir, item_id, revision, signature, decision, feedback)
+                    except _core().GateError as exc:
+                        from .failures import sanitize_failure
+                        return self._error(409, sanitize_failure({"message": str(exc)})["message"])
                     return self._json(200, context.state())
                 if action in {"approve_prompt", "reject_prompt"}:
                     item_id, candidate_id, request_hash = data.get("id"), data.get("candidate_id"), data.get("request_hash")

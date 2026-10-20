@@ -1266,7 +1266,8 @@ def _validate_amendment(state, root, shot_id, version, feedback, additions, shot
                    "episodes": [{"id": ep_id, "title": "局部增补校验", "shots": updates}]})
     from .voice import AuditionSelectionError, validate_audition
     characters = {asset["id"]: asset["name"] for asset in state["assets"] + additions if asset["kind"] == "character"}
-    novel = safe_path(root, "source/novel.txt").read_text(encoding="utf-8")
+    from .season_sources import source_text
+    novel, _ = source_text(root, state=state, shot_id=shot_id)
     for asset in additions:
         if asset["kind"] == "voice" and asset.get("audition_text", "").strip():
             try:
@@ -1349,6 +1350,10 @@ def apply_asset_amendment(root, amendment_id, decision):
             for definition in amendment["additions"]:
                 asset = {"character_id": "", **copy.deepcopy(definition), "status": "planned", "version": 0,
                          "history": [], "feedback": "", "creation_input": empty_input(), "amendment_id": amendment_id}
+                episode = next(ep for ep in state["episodes"] if any(shot["id"] == target["id"] for shot in ep["shots"]))
+                if episode.get("source_file"):
+                    asset.update(source_episode_id=episode["id"], source_file=episode["source_file"],
+                                 source_sha256=episode["source_sha256"])
                 if is_internal_voice_source(asset):
                     _register_voice_source(asset)
                 state["assets"].append(asset)
@@ -1763,8 +1768,8 @@ def set_voice_audition(root, asset_id, text, source, reason):
         character = _find(state, "asset", asset.get("character_id"))
         if character.get("kind") != "character":
             raise GateError("声音试音必须绑定一个有效角色，不能猜测说话人。")
-        novel_path = safe_path(root, "source/novel.txt")
-        novel = novel_path.read_text(encoding="utf-8")
+        from .season_sources import source_text
+        novel, source_hash = source_text(root, state=state, asset=asset)
         candidate = {**asset, **values}
         try:
             speaker = asset.get("audition_speaker", "").strip() or character["name"]
@@ -1772,7 +1777,7 @@ def set_voice_audition(root, asset_id, text, source, reason):
         except AuditionSelectionError as exc:
             raise GateError(str(exc)) from None
         asset.update(values)
-        asset["audition_selection_key"] = audition_selection_key(asset, speaker, digest(novel_path))
+        asset["audition_selection_key"] = audition_selection_key(asset, speaker, source_hash)
         asset.pop("audition_selection_error", None)
         event(state, "voice_audition_selected", id=asset_id)
     return load_project(root)

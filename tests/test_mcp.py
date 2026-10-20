@@ -48,7 +48,8 @@ class MCPTests(unittest.TestCase):
             self.assertEqual(self.initialize(protocol)["result"]["protocolVersion"], protocol)
         self.assertEqual(self.initialize("future")["result"]["protocolVersion"], "2025-06-18")
         tools = self.server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})["result"]["tools"]
-        self.assertEqual(len(tools), 15)
+        self.assertEqual(len(tools), 16)
+        self.assertIn("import_season", {tool["name"] for tool in tools})
         self.assertTrue(all(t["inputSchema"]["additionalProperties"] is False for t in tools))
         self.assertEqual(self.server.handle({"jsonrpc": "2.0", "id": 4, "method": "ping"})["result"], {})
         self.assertIsNone(self.server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
@@ -86,7 +87,7 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         responses = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([response["id"] for response in responses], [1, 2])
-        self.assertEqual(len(responses[1]["result"]["tools"]), 15)
+        self.assertEqual(len(responses[1]["result"]["tools"]), 16)
         self.assertEqual(result.stderr, "")
 
     def test_unknown_and_privileged_tools_are_not_exposed(self):
@@ -96,6 +97,28 @@ class MCPTests(unittest.TestCase):
             self.assertNotIn(name, mcp_server.TOOL_MAP)
             self.assertTrue(self.call(name, project=str(self.root))["isError"])
         self.assertEqual((self.root / "project.json").read_bytes(), before)
+
+    def test_import_season_registers_sources_without_approval_or_model_calls(self):
+        self.create()
+        plan = pipeline.demo_plan()
+        plan["episodes"] = [plan["episodes"][0]]
+        plan["episodes"][0].update(id="ep01", title="合成第一集")
+        core.install_plan(self.root, plan)
+        core.approve(self.root, "plan", "plan", 1)
+        before = core.load_project(self.root)
+        folder = Path(self.temp.name) / "provided-scripts"
+        folder.mkdir()
+        (folder / "synthetic.md").write_text("## 第01集 合成第一集\n预计时长：约120秒\n合成正文。\n"
+            "## 第02集 合成第二集\n预计时长：约135秒\n合成后续正文。\n", encoding="utf-8")
+        with patch.object(pipeline, "_brain", side_effect=AssertionError("import must not call model")):
+            result = self.call("import_season", project=str(self.root), source_folder=str(folder))
+        self.assertFalse(result["isError"])
+        state = core.load_project(self.root)
+        self.assertEqual(state["episodes"][0], before["episodes"][0])
+        self.assertEqual(state["assets"], before["assets"])
+        self.assertEqual(state["jobs"], before["jobs"])
+        self.assertEqual(state["episodes"][1]["status"], "awaiting_episode_plan")
+        self.assertEqual(state["episodes"][1]["source_duration"], 135)
 
     def test_create_requires_exactly_one_source_and_refuses_overwrite(self):
         for extra in ({}, {"novel_text": "正文", "source_path": "/a.txt"}):

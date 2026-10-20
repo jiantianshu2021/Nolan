@@ -31,6 +31,7 @@ def last_project():
 
 
 STATUS = {"initialized": "等待策划", "awaiting_plan": "等待批准分集规划", "awaiting_assets": "等待资产审批",
+    "preparing_episode_plan": "正在准备本集分镜", "awaiting_episode_plan": "等待确认本集分镜", "episode_plan_failed": "本集分镜准备停止",
     "awaiting_prompt_approval": "等待检查提示词并点击生成", "prompt_approved": "提示词已确认，等待提交",
     "awaiting_asset_amendment": "等待确认新增资产方案",
     "asset_generation_failed": "资产生成失败，等待处理",
@@ -205,6 +206,9 @@ def main(argv=None):
     p = sub.add_parser("import-plan")
     p.add_argument("project", type=Path)
     p.add_argument("file", type=Path)
+    p = sub.add_parser("import-season", help="导入原分集剧本，保留已有成片；每集按原稿时长独立准备分镜")
+    p.add_argument("project", type=Path)
+    p.add_argument("folder", type=Path)
     p = sub.add_parser("captions", help="只更正本集实际字幕，不重生成视频镜头")
     p.add_argument("project", type=Path)
     p.add_argument("id")
@@ -317,6 +321,9 @@ def main(argv=None):
             state = core.reconcile(root, args.job, args.outcome, args.note, args.task_id)
         elif args.command == "import-plan":
             state = core.install_plan(root, json.loads(args.file.read_text(encoding="utf-8")))
+        elif args.command == "import-season":
+            from .season_sources import import_season
+            state = import_season(root, args.folder)
         elif args.command == "captions":
             state = core.request_caption_fix(root, args.id, args.version, args.correction)
             core.set_paused(root, False)
@@ -334,7 +341,7 @@ def main(argv=None):
         else:
             print(summary(state))
         if args.command in {"run", "resume"} and state["status"] in {
-                "awaiting_asset_input", "awaiting_prompt_approval", "awaiting_asset_amendment", "asset_generation_failed"}:
+                "awaiting_asset_input", "awaiting_prompt_approval", "awaiting_asset_amendment", "asset_generation_failed", "awaiting_episode_plan"}:
             from .dashboard import serve
             serve(root, port=0, open_browser=True)
         return 1 if state["status"] == "blocked" else 0
